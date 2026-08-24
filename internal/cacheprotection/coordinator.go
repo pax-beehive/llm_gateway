@@ -227,10 +227,10 @@ func (c *Coordinator) CustomerRequest(ctx context.Context, anchor provider.Cache
 }
 
 type MemoryIntentRepository struct {
-	mu             sync.Mutex
-	intents        map[string]Intent
-	unique         map[string]string
-	sessionBudgets map[string]string
+	mu                  sync.Mutex
+	intents             map[string]Intent
+	unique              map[string]string
+	continuationBudgets map[string]string
 }
 
 func (r *MemoryIntentRepository) CurrentLease(_ context.Context, tenantID, leaseID string) (Lease, bool, error) {
@@ -260,7 +260,7 @@ func (r *MemoryIntentRepository) CurrentLease(_ context.Context, tenantID, lease
 
 func NewMemoryIntentRepository() *MemoryIntentRepository {
 	return &MemoryIntentRepository{
-		intents: make(map[string]Intent), unique: make(map[string]string), sessionBudgets: make(map[string]string),
+		intents: make(map[string]Intent), unique: make(map[string]string), continuationBudgets: make(map[string]string),
 	}
 }
 
@@ -271,12 +271,12 @@ func (r *MemoryIntentRepository) Reserve(_ context.Context, intent Intent) (Inte
 	if existingID := r.unique[key]; existingID != "" {
 		return r.intents[existingID], false, nil
 	}
-	if budgetKey, enforce := refreshSessionBudgetKey(intent); enforce {
-		if r.sessionBudgets[budgetKey] != "" {
+	if budgetKey, enforce := refreshContinuationBudgetKey(intent); enforce {
+		if r.continuationBudgets[budgetKey] != "" {
 			intent.Status = IntentRejected
-			intent.Error = "session_refresh_limit_reached"
+			intent.Error = "continuation_refresh_limit_reached"
 		} else {
-			r.sessionBudgets[budgetKey] = intent.ID
+			r.continuationBudgets[budgetKey] = intent.ID
 		}
 	}
 	r.unique[key] = intent.ID
@@ -295,12 +295,12 @@ func (r *MemoryIntentRepository) Update(_ context.Context, intent Intent, status
 		return Intent{}, errors.New("cache refresh intent fencing conflict")
 	}
 	if status == IntentPlanned {
-		if budgetKey, enforce := refreshSessionBudgetKey(intent); enforce {
-			if owner := r.sessionBudgets[budgetKey]; owner != "" && owner != intent.ID {
+		if budgetKey, enforce := refreshContinuationBudgetKey(intent); enforce {
+			if owner := r.continuationBudgets[budgetKey]; owner != "" && owner != intent.ID {
 				status = IntentRejected
-				intent.Error = "session_refresh_limit_reached"
+				intent.Error = "continuation_refresh_limit_reached"
 			} else {
-				r.sessionBudgets[budgetKey] = intent.ID
+				r.continuationBudgets[budgetKey] = intent.ID
 			}
 		}
 	}
@@ -312,13 +312,13 @@ func (r *MemoryIntentRepository) Update(_ context.Context, intent Intent, status
 	return intent, nil
 }
 
-func refreshSessionBudgetKey(intent Intent) (string, bool) {
+func refreshContinuationBudgetKey(intent Intent) (string, bool) {
 	candidate := intent.Candidate
 	if candidate.Policy.ShadowMode || candidate.HoldoutCohort != "treatment" ||
-		candidate.RefreshBudgetRevision == "" || candidate.SessionIdentity == "" {
+		candidate.RefreshBudgetRevision == "" || candidate.ContinuationIdentity == "" {
 		return "", false
 	}
-	return intent.TenantID + "\x00" + candidate.RefreshBudgetRevision + "\x00" + candidate.SessionIdentity, true
+	return intent.TenantID + "\x00" + candidate.RefreshBudgetRevision + "\x00" + candidate.ContinuationIdentity, true
 }
 
 func (r *MemoryIntentRepository) CustomerRequest(_ context.Context, anchor provider.CacheAnchor, requestedAt time.Time) (CustomerRequestResult, error) {

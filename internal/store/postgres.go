@@ -43,8 +43,8 @@ var globalQuotaMigration string
 //go:embed migrations/000010_experiment_evidence.sql
 var experimentEvidenceMigration string
 
-//go:embed migrations/000011_cache_refresh_session_budget.sql
-var cacheRefreshSessionBudgetMigration string
+//go:embed migrations/000011_cache_refresh_continuation_budget.sql
+var cacheRefreshContinuationBudgetMigration string
 
 type PostgresResponseStore struct {
 	db *sql.DB
@@ -85,8 +85,8 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, experimentEvidenceMigration); err != nil {
 		return fmt.Errorf("migrate experiment evidence: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, cacheRefreshSessionBudgetMigration); err != nil {
-		return fmt.Errorf("migrate cache refresh session budget: %w", err)
+	if _, err := s.db.ExecContext(ctx, cacheRefreshContinuationBudgetMigration); err != nil {
+		return fmt.Errorf("migrate cache refresh continuation budget: %w", err)
 	}
 	return nil
 }

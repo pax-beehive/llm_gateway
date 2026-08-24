@@ -105,13 +105,13 @@ func (r *PostgresIntentRepository) Reserve(ctx context.Context, intent Intent) (
 		}
 		return existing, false, nil
 	}
-	budgetReserved, err := reserveRefreshSessionBudget(ctx, tx, intent)
+	budgetReserved, err := reserveRefreshContinuationBudget(ctx, tx, intent)
 	if err != nil {
 		return Intent{}, false, err
 	}
 	if !budgetReserved {
 		intent.Status = IntentRejected
-		intent.Error = "session_refresh_limit_reached"
+		intent.Error = "continuation_refresh_limit_reached"
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE cache_refresh_intents
 			SET status = 'rejected', error = $3, updated_at = now()
@@ -137,13 +137,13 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 	}
 	defer func() { _ = tx.Rollback() }()
 	if status == IntentPlanned {
-		budgetReserved, reserveErr := reserveRefreshSessionBudget(ctx, tx, intent)
+		budgetReserved, reserveErr := reserveRefreshContinuationBudget(ctx, tx, intent)
 		if reserveErr != nil {
 			return Intent{}, reserveErr
 		}
 		if !budgetReserved {
 			status = IntentRejected
-			intent.Error = "session_refresh_limit_reached"
+			intent.Error = "continuation_refresh_limit_reached"
 		}
 	}
 	result, err := tx.ExecContext(ctx, `
@@ -234,18 +234,18 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 	return intent, nil
 }
 
-func reserveRefreshSessionBudget(ctx context.Context, tx *sql.Tx, intent Intent) (bool, error) {
+func reserveRefreshContinuationBudget(ctx context.Context, tx *sql.Tx, intent Intent) (bool, error) {
 	candidate := intent.Candidate
 	if candidate.Policy.ShadowMode || candidate.HoldoutCohort != "treatment" ||
-		candidate.RefreshBudgetRevision == "" || candidate.SessionIdentity == "" {
+		candidate.RefreshBudgetRevision == "" || candidate.ContinuationIdentity == "" {
 		return true, nil
 	}
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO cache_refresh_session_budgets (
-			tenant_id, budget_revision, session_identity, refresh_intent_id
+		INSERT INTO cache_refresh_continuation_budgets (
+			tenant_id, budget_revision, continuation_identity, refresh_intent_id
 		) VALUES ($1,$2,$3,$4)
-		ON CONFLICT (tenant_id, budget_revision, session_identity) DO NOTHING`,
-		intent.TenantID, candidate.RefreshBudgetRevision, candidate.SessionIdentity, intent.ID,
+		ON CONFLICT (tenant_id, budget_revision, continuation_identity) DO NOTHING`,
+		intent.TenantID, candidate.RefreshBudgetRevision, candidate.ContinuationIdentity, intent.ID,
 	)
 	if err != nil {
 		return false, err

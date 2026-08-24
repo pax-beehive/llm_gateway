@@ -644,7 +644,7 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 		HoldoutCohort:         holdoutCohort,
 		ExperimentRevision:    r.experimentRevision(route),
 		RefreshBudgetRevision: r.refreshBudgetRevision(),
-		SessionIdentity:       request.ExperimentIdentity,
+		ContinuationIdentity:  request.ExperimentIdentity,
 	}
 	intent, err := r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
 	status := string(intent.Status)

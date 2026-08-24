@@ -54,7 +54,7 @@ type Candidate struct {
 	HoldoutCohort         string
 	ExperimentRevision    string
 	RefreshBudgetRevision string
-	SessionIdentity       string
+	ContinuationIdentity  string
 }
 
 type Decision struct {
