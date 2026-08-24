@@ -74,6 +74,9 @@ func (a *Adapter) Execute(ctx context.Context, request core.Request) (provider.E
 	if err != nil {
 		return nil, err
 	}
+	if request.EndUserID != "" {
+		payload["metadata"] = map[string]any{"user_id": request.EndUserID}
+	}
 	if request.Temperature != nil {
 		payload["temperature"] = *request.Temperature
 	}

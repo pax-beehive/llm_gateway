@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -41,6 +42,9 @@ type Config struct {
 	Authenticator         Authenticator
 	TenantHomeRegions     map[string]string
 	TenantExecutionEpochs map[string]int64
+	LocalRegion           string
+	HomeRegionURLs        map[string]string
+	ForwardClient         *http.Client
 }
 
 type Server struct {
@@ -48,13 +52,23 @@ type Server struct {
 	authenticator   Authenticator
 	homeRegions     map[string]string
 	executionEpochs map[string]int64
+	localRegion     string
+	homeRegionURLs  map[string]string
+	forwardClient   *http.Client
 	mux             *http.ServeMux
 }
 
 func New(config Config) http.Handler {
+	if config.LocalRegion == "" {
+		config.LocalRegion = "local"
+	}
+	if config.ForwardClient == nil {
+		config.ForwardClient = http.DefaultClient
+	}
 	server := &Server{
 		runtime: config.Runtime, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
-		executionEpochs: config.TenantExecutionEpochs, mux: http.NewServeMux(),
+		executionEpochs: config.TenantExecutionEpochs, localRegion: config.LocalRegion,
+		homeRegionURLs: config.HomeRegionURLs, forwardClient: config.ForwardClient, mux: http.NewServeMux(),
 	}
 	server.mux.HandleFunc("POST /v1/responses", server.createResponse)
 	server.mux.HandleFunc("GET /v1/responses/{response_id}", server.getResponse)
@@ -80,8 +94,43 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 		writeError(responseWriter, http.StatusUnauthorized, "authentication_error", err.Error(), "")
 		return
 	}
+	if request.Method == http.MethodPost || request.Method == http.MethodDelete {
+		homeRegion := s.homeRegions[tenantID]
+		if homeRegion != "" && homeRegion != s.localRegion {
+			s.forwardToHomeRegion(responseWriter, request, homeRegion)
+			return
+		}
+	}
 	request.Header.Set("X-Authenticated-Tenant-ID", tenantID)
 	s.mux.ServeHTTP(responseWriter, request)
+}
+
+func (s *Server) forwardToHomeRegion(responseWriter http.ResponseWriter, request *http.Request, homeRegion string) {
+	base, err := url.Parse(s.homeRegionURLs[homeRegion])
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		writeError(responseWriter, http.StatusMisdirectedRequest, "home_region_unavailable", "stateful write must execute in Home Region "+homeRegion, "")
+		return
+	}
+	forwarded := request.Clone(request.Context())
+	forwarded.URL.Scheme = base.Scheme
+	forwarded.URL.Host = base.Host
+	forwarded.URL.Path = strings.TrimRight(base.Path, "/") + request.URL.Path
+	forwarded.Host = base.Host
+	forwarded.RequestURI = ""
+	forwarded.Header.Del("X-Authenticated-Tenant-ID")
+	response, err := s.forwardClient.Do(forwarded)
+	if err != nil {
+		writeError(responseWriter, http.StatusBadGateway, "home_region_unavailable", err.Error(), "")
+		return
+	}
+	defer response.Body.Close()
+	for key, values := range response.Header {
+		for _, value := range values {
+			responseWriter.Header().Add(key, value)
+		}
+	}
+	responseWriter.WriteHeader(response.StatusCode)
+	_, _ = io.Copy(responseWriter, response.Body)
 }
 
 type createResponseRequest struct {
@@ -160,6 +209,9 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 	}
 	if payload.Temperature != nil || payload.TopP != nil || payload.MaxOutputTokens != nil || hasJSONValue(payload.Stop) {
 		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "sampling")
+	}
+	if payload.User != "" {
+		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "end_user_id")
 	}
 	if err := validateCacheProtection(payload.CacheProtection); err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
@@ -267,7 +319,7 @@ func (s *Server) getResponse(responseWriter http.ResponseWriter, request *http.R
 
 func (s *Server) deleteResponse(responseWriter http.ResponseWriter, request *http.Request) {
 	responseID := request.PathValue("response_id")
-	if err := s.runtime.Delete(request.Context(), tenantID(request), responseID); err != nil {
+	if err := s.runtime.Delete(request.Context(), tenantID(request), responseID, s.homeRegion(request), s.executionEpoch(request)); err != nil {
 		writeStoreError(responseWriter, err)
 		return
 	}
@@ -275,7 +327,9 @@ func (s *Server) deleteResponse(responseWriter http.ResponseWriter, request *htt
 }
 
 func (s *Server) cancelResponse(responseWriter http.ResponseWriter, request *http.Request) {
-	result, err := s.runtime.Cancel(request.Context(), tenantID(request), request.PathValue("response_id"))
+	result, err := s.runtime.Cancel(
+		request.Context(), tenantID(request), request.PathValue("response_id"), s.homeRegion(request), s.executionEpoch(request),
+	)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeStoreError(responseWriter, err)
@@ -353,7 +407,8 @@ func (s *Server) appendConversationItems(responseWriter http.ResponseWriter, req
 		return
 	}
 	conversation, err := s.runtime.AppendConversationItems(
-		request.Context(), tenantID(request), request.PathValue("conversation_id"), payload.Items, payload.ExpectedRevision,
+		request.Context(), tenantID(request), request.PathValue("conversation_id"), s.homeRegion(request), s.executionEpoch(request),
+		payload.Items, payload.ExpectedRevision,
 	)
 	if err != nil {
 		writeStoreError(responseWriter, err)
@@ -379,7 +434,9 @@ func (s *Server) deleteConversation(responseWriter http.ResponseWriter, request 
 		writeStoreError(responseWriter, err)
 		return
 	}
-	if err := s.runtime.DeleteConversation(request.Context(), tenantID(request), conversation.ID, conversation.Revision); err != nil {
+	if err := s.runtime.DeleteConversation(
+		request.Context(), tenantID(request), conversation.ID, s.homeRegion(request), s.executionEpoch(request), conversation.Revision,
+	); err != nil {
 		writeStoreError(responseWriter, err)
 		return
 	}
@@ -453,6 +510,9 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 	}
 	if payload.Temperature != nil || payload.TopP != nil || payload.MaxTokens != nil || payload.MaxCompletionTokens != nil || hasJSONValue(payload.Stop) {
 		features = append(features, "sampling")
+	}
+	if payload.User != "" {
+		features = append(features, "end_user_id")
 	}
 	maxOutputTokens := payload.MaxCompletionTokens
 	if maxOutputTokens == nil {
@@ -760,8 +820,11 @@ func validateItems(items []core.Item) error {
 					return errors.New("input_image content requires image_url or file_id")
 				}
 			case "input_file":
-				if content.FileID == "" && content.FileData == "" {
-					return errors.New("input_file content requires file_id or file_data")
+				if content.FileData != "" {
+					return errors.New("inline file_data is not accepted; upload to regional object storage and use an immutable file_id")
+				}
+				if content.FileID == "" {
+					return errors.New("input_file content requires an immutable file_id")
 				}
 			default:
 				return fmt.Errorf("unsupported content type %q", content.Type)
@@ -773,19 +836,24 @@ func validateItems(items []core.Item) error {
 
 func requestedFeatures(items []core.Item) []string {
 	features := []string{"text"}
-	multimodal, reasoning := false, false
+	multimodal, files, reasoning := false, false, false
 	for _, item := range items {
 		if item.Type == "reasoning" || len(item.Summary) > 0 || item.EncryptedContent != "" || len(item.ProviderMetadata) > 0 {
 			reasoning = true
 		}
 		for _, content := range item.Content {
-			if content.Type == "input_image" || content.Type == "input_file" {
+			if content.Type == "input_image" {
 				multimodal = true
+			} else if content.Type == "input_file" {
+				files = true
 			}
 		}
 	}
 	if multimodal {
 		features = append(features, "multimodal")
+	}
+	if files {
+		features = append(features, "files")
 	}
 	if reasoning {
 		features = append(features, "reasoning")

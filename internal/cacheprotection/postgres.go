@@ -383,6 +383,8 @@ func validTransition(from, to IntentStatus) bool {
 		return to == IntentRunning || to == IntentCancelled || to == IntentShadow
 	case IntentRunning:
 		return to == IntentSucceeded || to == IntentRejected || to == IntentUncertain
+	case IntentShadow:
+		return to == IntentPlanned
 	default:
 		return false
 	}

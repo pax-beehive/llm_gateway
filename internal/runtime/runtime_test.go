@@ -183,6 +183,28 @@ func TestTenantPolicyRejectsDisallowedCacheContentInspection(t *testing.T) {
 	}
 }
 
+func TestStaleExecutionEpochCannotCancelOrDeletePromotedResponse(t *testing.T) {
+	t.Parallel()
+	responseStore := store.NewMemoryResponseStore()
+	response := core.Response{
+		ID: "resp-promoted", Object: "response", Status: core.ResponseStatusInProgress,
+		HomeRegion: "us-west", ExecutionEpoch: 2, Revision: 1, RetainContent: true,
+	}
+	if err := responseStore.Create(context.Background(), "tenant-a", response); err != nil {
+		t.Fatal(err)
+	}
+	engine := gatewayruntime.New(responseStore, provider.NewStaticRouter(provider.NewEchoExecutor()))
+	if _, err := engine.Cancel(context.Background(), "tenant-a", response.ID, "us-west", 1); err == nil {
+		t.Fatal("stale execution epoch cancelled promoted Response")
+	}
+	if err := engine.Delete(context.Background(), "tenant-a", response.ID, "us-west", 1); err == nil {
+		t.Fatal("stale execution epoch deleted promoted Response")
+	}
+	if _, err := engine.Get(context.Background(), "tenant-a", response.ID); err != nil {
+		t.Fatalf("promoted Response disappeared: %v", err)
+	}
+}
+
 func TestResponseFinalizationRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -261,7 +283,7 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(route), gatewayruntime.Options{
 		CacheCoordinator: coordinator, CacheProtectionMode: gatewayruntime.CacheProtectionAnthropicCanaryMode,
 	})
-	_, err := engine.Execute(context.Background(), core.Request{
+	response, err := engine.Execute(context.Background(), core.Request{
 		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
 		CacheProtection: &core.CacheProtectionPolicy{
 			Enabled: true, MaxSpendMicros: 1_000_000, MaxRefreshes: 1,
@@ -270,6 +292,10 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	usageRecords := responseStore.UsageRecords("tenant-a", response.ID)
+	if len(usageRecords) != 1 || usageRecords[0].HoldoutCohort != "treatment" {
+		t.Fatalf("treatment usage cohort = %#v", usageRecords)
 	}
 	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(4*time.Minute + 55*time.Second) })
 	completed, err := worker.RunDue(context.Background(), 10, func(provider.CacheAnchor) provider.CacheProtector { return adapter })

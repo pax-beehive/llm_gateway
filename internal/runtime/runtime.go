@@ -64,7 +64,7 @@ const (
 
 var ErrProviderIdleTimeout = errors.New("provider stream idle timeout")
 
-var ErrQuotaExceeded = errors.New("tenant concurrent Response quota exceeded")
+var ErrQuotaExceeded = store.ErrQuotaExceeded
 
 func New(responseStore store.ResponseStore, router provider.Router) *Runtime {
 	return NewWithOptions(responseStore, router, Options{})
@@ -123,10 +123,11 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	if request.TenantID == "" || request.Model == "" {
 		return core.Response{}, errors.New("tenant and model are required")
 	}
-	if err := r.admit(request); err != nil {
+	release, err := r.admit(ctx, request)
+	if err != nil {
 		return core.Response{}, err
 	}
-	defer r.release(request.TenantID)
+	defer release()
 	if request.CompatibilityMode == "" {
 		request.CompatibilityMode = core.CompatibilityStrict
 	}
@@ -183,6 +184,10 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		Input: responseInput, Output: []core.Item{}, Metadata: request.Metadata,
 		HomeRegion: request.HomeRegion, Revision: 1,
 		ExecutionEpoch: request.ExecutionEpoch, RetainContent: request.Store,
+	}
+	if policy, exists := r.tenantPolicies[request.TenantID]; request.Store && exists && policy.RetentionSeconds > 0 {
+		expiresAt := now.Add(time.Duration(policy.RetentionSeconds) * time.Second).Unix()
+		response.ContentExpiresAt = &expiresAt
 	}
 	responseSpan.SetAttributes(attribute.String("gateway.response.id", response.ID))
 	if request.IdempotencyKey != "" {
@@ -359,6 +364,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			ProviderUsage: providerUsage, Usage: response.Usage,
 			AmountMicros: calculateUsageAmount(response.Usage, route.PriceSnapshot), Currency: route.PriceSnapshot.Currency,
 			CacheUsageReliable: route.CacheUsageReliable, CreatedAt: completed,
+			HoldoutCohort: r.experimentCohort(request, route),
 		}
 		if protectedHit != nil && route.CacheUsageReliable && response.Usage.CachedInputTokens > 0 {
 			usageRecord.ProtectedHit = protectedHit
@@ -410,42 +416,71 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "provider_unavailable", lastErr)
 }
 
-func (r *Runtime) admit(request core.Request) error {
+func (r *Runtime) admit(ctx context.Context, request core.Request) (func(), error) {
 	policy, configured := r.tenantPolicies[request.TenantID]
 	if configured {
 		if policy.MaxInputItems > 0 && len(request.Input) > policy.MaxInputItems {
-			return fmt.Errorf("tenant input-item quota exceeded: maximum is %d", policy.MaxInputItems)
+			return nil, fmt.Errorf("tenant input-item quota exceeded: maximum is %d", policy.MaxInputItems)
 		}
 		if request.Store && policy.AllowStoredResponses != nil && !*policy.AllowStoredResponses {
-			return errors.New("tenant policy forbids stored Responses")
+			return nil, errors.New("tenant policy forbids stored Responses")
 		}
 		if request.CacheProtection != nil && request.CacheProtection.Enabled {
 			if policy.AllowCacheProtection != nil && !*policy.AllowCacheProtection {
-				return errors.New("tenant policy forbids Cache Protection")
+				return nil, errors.New("tenant policy forbids Cache Protection")
 			}
 			if request.CacheProtection.AllowContentInspection &&
 				(policy.AllowContentInspection == nil || !*policy.AllowContentInspection) {
-				return errors.New("tenant policy forbids Cache Protection content inspection")
+				return nil, errors.New("tenant policy forbids Cache Protection content inspection")
 			}
 		}
 	}
+	if !configured || policy.MaxConcurrentResponses <= 0 {
+		return func() {}, nil
+	}
+	if global, ok := r.store.(store.GlobalQuotaStore); ok {
+		leaseID := newID("quota")
+		const leaseTTL = 5 * time.Minute
+		if err := global.AcquireResponseSlot(ctx, request.TenantID, leaseID, policy.MaxConcurrentResponses, r.now().UTC().Add(leaseTTL)); err != nil {
+			return nil, err
+		}
+		renewCtx, stopRenewal := context.WithCancel(context.Background())
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-renewCtx.Done():
+					return
+				case <-ticker.C:
+					renewalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = global.RenewResponseSlot(renewalCtx, request.TenantID, leaseID, r.now().UTC().Add(leaseTTL))
+					cancel()
+				}
+			}
+		}()
+		return func() {
+			stopRenewal()
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = global.ReleaseResponseSlot(releaseCtx, request.TenantID, leaseID)
+		}, nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if configured && policy.MaxConcurrentResponses > 0 && r.inflight[request.TenantID] >= policy.MaxConcurrentResponses {
-		return ErrQuotaExceeded
+	if r.inflight[request.TenantID] >= policy.MaxConcurrentResponses {
+		return nil, ErrQuotaExceeded
 	}
 	r.inflight[request.TenantID]++
-	return nil
-}
-
-func (r *Runtime) release(tenantID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.inflight[tenantID] <= 1 {
-		delete(r.inflight, tenantID)
-		return
-	}
-	r.inflight[tenantID]--
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.inflight[request.TenantID] <= 1 {
+			delete(r.inflight, request.TenantID)
+			return
+		}
+		r.inflight[request.TenantID]--
+	}, nil
 }
 
 func cloneTenantPolicies(policies map[string]core.TenantPolicy) map[string]core.TenantPolicy {
@@ -552,7 +587,7 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 	leaseID := cacheLeaseID(observation.Anchor)
 	if r.cacheProtectionMode == CacheProtectionAnthropicCanaryMode {
 		maxRefreshes = min(maxRefreshes, 1)
-		if stableCohortBucket(leaseID) < r.cacheHoldoutPercent {
+		if r.experimentCohort(request, route) == "holdout" {
 			holdoutCohort = "holdout"
 		} else {
 			holdoutCohort = "treatment"
@@ -593,6 +628,28 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 	if err != nil && r.cacheError != nil {
 		r.cacheError(err)
 	}
+}
+
+func (r *Runtime) experimentCohort(request core.Request, route provider.Route) string {
+	if r.cacheProtectionMode != CacheProtectionAnthropicCanaryMode || request.CacheProtection == nil ||
+		!request.CacheProtection.Enabled || route.CacheAnchorBuilder == nil || route.CacheProtector == nil {
+		return ""
+	}
+	identity := request.TenantID + "\x1f" + route.ID + "\x1f"
+	switch {
+	case request.ConversationID != "":
+		identity += "conversation:" + request.ConversationID
+	case request.PreviousResponseID != "":
+		identity += "chain:" + request.PreviousResponseID
+	default:
+		encoded, _ := json.Marshal(request.Input)
+		digest := sha256.Sum256(encoded)
+		identity += "stateless:" + hex.EncodeToString(digest[:])
+	}
+	if stableCohortBucket(identity) < r.cacheHoldoutPercent {
+		return "holdout"
+	}
+	return "treatment"
 }
 
 func stableCohortBucket(identity string) int {
@@ -766,34 +823,54 @@ func (r *Runtime) GetConversation(ctx context.Context, tenantID, conversationID 
 	return conversationStore.GetConversation(ctx, tenantID, conversationID)
 }
 
-func (r *Runtime) AppendConversationItems(ctx context.Context, tenantID, conversationID string, items []core.Item, expectedRevision int64) (core.Conversation, error) {
+func (r *Runtime) AppendConversationItems(ctx context.Context, tenantID, conversationID, homeRegion string, executionEpoch int64, items []core.Item, expectedRevision int64) (core.Conversation, error) {
 	conversationStore, ok := r.store.(store.ConversationStore)
 	if !ok {
 		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
 	}
+	conversation, err := conversationStore.GetConversation(ctx, tenantID, conversationID)
+	if err != nil {
+		return core.Conversation{}, err
+	}
+	if conversation.HomeRegion != homeRegion || conversation.ExecutionEpoch != executionEpoch {
+		return core.Conversation{}, errors.New("Conversation belongs to a different Home Region or execution epoch")
+	}
 	return conversationStore.AppendConversationItems(ctx, tenantID, conversationID, prepareItems(items), expectedRevision)
 }
 
-func (r *Runtime) DeleteConversation(ctx context.Context, tenantID, conversationID string, expectedRevision int64) error {
+func (r *Runtime) DeleteConversation(ctx context.Context, tenantID, conversationID, homeRegion string, executionEpoch, expectedRevision int64) error {
 	conversationStore, ok := r.store.(store.ConversationStore)
 	if !ok {
 		return errors.New("configured Response Store does not support Conversations")
 	}
+	conversation, err := conversationStore.GetConversation(ctx, tenantID, conversationID)
+	if err != nil {
+		return err
+	}
+	if conversation.HomeRegion != homeRegion || conversation.ExecutionEpoch != executionEpoch {
+		return errors.New("Conversation belongs to a different Home Region or execution epoch")
+	}
 	return conversationStore.DeleteConversation(ctx, tenantID, conversationID, expectedRevision)
 }
 
-func (r *Runtime) Delete(ctx context.Context, tenantID, responseID string) error {
+func (r *Runtime) Delete(ctx context.Context, tenantID, responseID, homeRegion string, executionEpoch int64) error {
 	response, err := r.store.Get(ctx, tenantID, responseID)
 	if err != nil {
 		return err
 	}
+	if response.HomeRegion != homeRegion || response.ExecutionEpoch != executionEpoch {
+		return errors.New("Response belongs to a different Home Region or execution epoch")
+	}
 	return r.store.Delete(ctx, tenantID, responseID, response.Revision)
 }
 
-func (r *Runtime) Cancel(ctx context.Context, tenantID, responseID string) (core.Response, error) {
+func (r *Runtime) Cancel(ctx context.Context, tenantID, responseID, homeRegion string, executionEpoch int64) (core.Response, error) {
 	response, err := r.store.Get(ctx, tenantID, responseID)
 	if err != nil {
 		return core.Response{}, err
+	}
+	if response.HomeRegion != homeRegion || response.ExecutionEpoch != executionEpoch {
+		return core.Response{}, errors.New("Response belongs to a different Home Region or execution epoch")
 	}
 	if response.Status != core.ResponseStatusInProgress && response.Status != core.ResponseStatusQueued {
 		return core.Response{}, errors.New("response is not cancellable")

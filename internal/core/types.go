@@ -107,6 +107,7 @@ type TenantPolicy struct {
 	AllowStoredResponses   *bool `json:"allow_stored_responses,omitempty"`
 	AllowCacheProtection   *bool `json:"allow_cache_protection,omitempty"`
 	AllowContentInspection *bool `json:"allow_content_inspection,omitempty"`
+	RetentionSeconds       int64 `json:"retention_seconds,omitempty"`
 }
 
 type Attempt struct {
@@ -141,6 +142,7 @@ type Response struct {
 	ExecutionEpoch     int64             `json:"execution_epoch,omitempty"`
 	Revision           int64             `json:"revision"`
 	RetainContent      bool              `json:"-"`
+	ContentExpiresAt   *int64            `json:"content_expires_at,omitempty"`
 }
 
 type Conversation struct {
@@ -206,6 +208,7 @@ type UsageRecord struct {
 	AmountMicros       int64
 	Currency           string
 	CacheUsageReliable bool
+	HoldoutCohort      string
 	ProtectedHit       *ProtectedHitEvidence
 	CreatedAt          time.Time
 }

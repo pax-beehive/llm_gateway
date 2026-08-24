@@ -91,6 +91,125 @@ func TestPostgresExecutionEpochFencesStaleWriter(t *testing.T) {
 	}
 }
 
+func TestPostgresConcurrentResponseQuotaIsGlobalAndLeased(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("global-quota-%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region) VALUES ($1, 'local')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	expiresAt := time.Now().Add(time.Minute)
+	if err := responseStore.AcquireResponseSlot(ctx, tenantID, "lease-1", 1, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := responseStore.AcquireResponseSlot(ctx, tenantID, "lease-2", 1, expiresAt); !errors.Is(err, store.ErrQuotaExceeded) {
+		t.Fatalf("second slot error = %v, want quota exceeded", err)
+	}
+	if err := responseStore.ReleaseResponseSlot(ctx, tenantID, "lease-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := responseStore.AcquireResponseSlot(ctx, tenantID, "lease-2", 1, expiresAt); err != nil {
+		t.Fatalf("slot after release: %v", err)
+	}
+}
+
+func TestPostgresPersistsExperimentallyValidatedSavingFromStableCohorts(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("experiment-%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region) VALUES ($1, 'local')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	now := time.Now().UTC().Truncate(time.Second)
+	price := core.PriceSnapshot{
+		ID: "price-" + tenantID, Provider: "provider", Model: "model", Region: "local", Currency: "USD",
+		InputPerMillionMicros: 1_000_000, EffectiveAt: now.Unix(), Source: "experiment-test",
+	}
+	for index, sample := range []struct {
+		cohort string
+		tokens int64
+	}{{"holdout", 1_000_000}, {"treatment", 500_000}} {
+		response := core.Response{
+			ID: fmt.Sprintf("resp-%d", index), Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
+			Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{},
+		}
+		if err := responseStore.Create(ctx, tenantID, response); err != nil {
+			t.Fatal(err)
+		}
+		response.Status = core.ResponseStatusCompleted
+		usage := core.UsageRecord{
+			ID: fmt.Sprintf("usage-%d", index), TenantID: tenantID, ResponseID: response.ID,
+			AttemptID: fmt.Sprintf("attempt-%d", index), PriceSnapshot: price,
+			ProviderUsage: []byte(`{}`), Usage: core.Usage{InputTokens: sample.tokens},
+			AmountMicros: sample.tokens, Currency: "USD", HoldoutCohort: sample.cohort, CreatedAt: now,
+		}
+		if err := responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, usage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var net int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT net_saving::bigint FROM savings_ledger
+		WHERE tenant_id = $1 AND measure = 'experimentally_validated_saving'`, tenantID).Scan(&net); err != nil {
+		t.Fatal(err)
+	}
+	if net != 500_000 {
+		t.Fatalf("experiment net saving = %d, want 500000", net)
+	}
+}
+
+func TestPostgresRetentionExpiryScrubsResponseAndOutboxContent(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("retention-%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region) VALUES ($1, 'local')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	const secret = "expired-content-secret"
+	expired := time.Now().Add(-time.Second).Unix()
+	response := core.Response{
+		ID: "resp-expired", Object: "response", CreatedAt: time.Now().Unix(), Status: core.ResponseStatusCompleted,
+		Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true,
+		Input:            []core.Item{{Type: "message", Content: []core.Content{{Type: "input_text", Text: secret}}}},
+		Output:           []core.Item{{Type: "message", Content: []core.Content{{Type: "output_text", Text: secret}}}},
+		ContentExpiresAt: &expired,
+	}
+	if err := responseStore.Create(ctx, tenantID, response); err != nil {
+		t.Fatal(err)
+	}
+	got, err := responseStore.Get(ctx, tenantID, response.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Input) != 0 || len(got.Output) != 0 || got.Revision != 2 {
+		t.Fatalf("expired Response retained content: %#v", got)
+	}
+	var retained bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM responses WHERE tenant_id = $1 AND payload::text LIKE '%' || $2 || '%'
+			UNION ALL
+			SELECT 1 FROM transactional_outbox WHERE tenant_id = $1 AND payload::text LIKE '%' || $2 || '%'
+		)`, tenantID, secret).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained {
+		t.Fatal("expired content remained in PostgreSQL payloads")
+	}
+}
+
 func TestPostgresConversationAndResponseCommitTogether(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -235,6 +354,7 @@ func cleanupTenant(t *testing.T, db *sql.DB, tenantID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, statement := range []string{
+		`DELETE FROM tenant_response_slots WHERE tenant_id = $1`,
 		`DELETE FROM transactional_outbox WHERE tenant_id = $1`,
 		`DELETE FROM savings_ledger WHERE tenant_id = $1`,
 		`DELETE FROM usage_ledger WHERE tenant_id = $1`,

@@ -122,6 +122,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("GATEWAY_TENANT_POLICIES_JSON: %w", err)
 	}
+	homeRegionURLs, err := parseStringMapEnv("GATEWAY_HOME_REGION_URLS_JSON")
+	if err != nil {
+		return fmt.Errorf("GATEWAY_HOME_REGION_URLS_JSON: %w", err)
+	}
+	localRegion := envOr("GATEWAY_LOCAL_REGION", "local")
 
 	responseStore, database, cleanup, err := configureStore(apiKeys, homeRegions, executionEpochs, tenantPolicies)
 	if err != nil {
@@ -156,7 +161,7 @@ func run() error {
 	go runCacheWorker(ctx, cacheCoordinator, router)
 	handler := httpapi.New(httpapi.Config{
 		Runtime: engine, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
-		TenantExecutionEpochs: executionEpochs,
+		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
 	})
 
 	address := envOr("GATEWAY_ADDR", ":8080")
@@ -511,8 +516,8 @@ func parseTenantPoliciesEnv(name string) (map[string]core.TenantPolicy, error) {
 			policy.Revision = 1
 			result[tenantID] = policy
 		}
-		if tenantID == "" || policy.Revision < 1 || policy.MaxConcurrentResponses < 0 || policy.MaxInputItems < 0 {
-			return nil, errors.New("tenant IDs must be non-empty, policy revisions positive, and quotas non-negative")
+		if tenantID == "" || policy.Revision < 1 || policy.MaxConcurrentResponses < 0 || policy.MaxInputItems < 0 || policy.RetentionSeconds < 0 {
+			return nil, errors.New("tenant IDs must be non-empty, policy revisions positive, and quotas and retention non-negative")
 		}
 	}
 	return result, nil

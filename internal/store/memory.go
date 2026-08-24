@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 )
@@ -13,6 +14,7 @@ var (
 	ErrConflict            = errors.New("response revision conflict")
 	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 	ErrConversationBusy    = errors.New("conversation already has an active response")
+	ErrQuotaExceeded       = errors.New("tenant concurrent Response quota exceeded")
 )
 
 type ResponseStore interface {
@@ -36,6 +38,12 @@ type ConversationStore interface {
 
 type FinancialResponseFinalizer interface {
 	FinalizeWithUsage(context.Context, string, core.Response, int64, core.UsageRecord) error
+}
+
+type GlobalQuotaStore interface {
+	AcquireResponseSlot(context.Context, string, string, int, time.Time) error
+	RenewResponseSlot(context.Context, string, string, time.Time) error
+	ReleaseResponseSlot(context.Context, string, string) error
 }
 
 type idempotencyRecord struct {
@@ -205,11 +213,16 @@ func (s *MemoryResponseStore) Create(_ context.Context, tenantID string, respons
 }
 
 func (s *MemoryResponseStore) Get(_ context.Context, tenantID, responseID string) (core.Response, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	response, exists := s.responses[tenantID][responseID]
 	if !exists || response.Status == core.ResponseStatusDeleted {
 		return core.Response{}, ErrNotFound
+	}
+	if isTerminal(response.Status) && response.ContentExpiresAt != nil && time.Now().Unix() >= *response.ContentExpiresAt {
+		response = redactResponseContent(response)
+		response.Revision++
+		s.responses[tenantID][responseID] = response
 	}
 	return cloneResponse(response), nil
 }
@@ -268,6 +281,23 @@ func cloneResponse(response core.Response) core.Response {
 		response.Metadata = make(map[string]string, len(response.Metadata))
 		for key, value := range response.Metadata {
 			response.Metadata[key] = value
+		}
+	}
+	return response
+}
+
+func redactResponseContent(response core.Response) core.Response {
+	response.Input = nil
+	response.Output = nil
+	response.Metadata = nil
+	if response.Error != nil {
+		response.Error = &core.Error{Code: response.Error.Code, Type: response.Error.Type, Param: response.Error.Param, Message: "redacted after retention expiry"}
+	}
+	response.Attempts = append([]core.Attempt(nil), response.Attempts...)
+	for index := range response.Attempts {
+		if response.Attempts[index].Error != nil {
+			errorValue := response.Attempts[index].Error
+			response.Attempts[index].Error = &core.Error{Code: errorValue.Code, Type: errorValue.Type, Param: errorValue.Param, Message: "redacted after retention expiry"}
 		}
 	}
 	return response

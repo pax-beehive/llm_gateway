@@ -29,7 +29,7 @@ func TestAdapterSharesExactSerializationAcrossStreamingAndCacheRefresh(t *testin
 		t.Fatal(err)
 	}
 	request := core.Request{
-		TenantID: "tenant-a", ContextItemCount: 1,
+		TenantID: "tenant-a", EndUserID: "customer-user-42", ContextItemCount: 1,
 		Input: []core.Item{
 			{Type: "message", Role: "system", Content: []core.Content{{Type: "input_text", Text: "stable system"}}},
 			{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "question"}}},
@@ -80,6 +80,9 @@ func TestAdapterSharesExactSerializationAcrossStreamingAndCacheRefresh(t *testin
 	}
 	if !strings.Contains(string(transport.requests[0]), `"cache_control"`) || !strings.Contains(string(transport.requests[1]), `"cache_control"`) {
 		t.Fatal("live and refresh payloads must share explicit cache breakpoints")
+	}
+	if !strings.Contains(string(transport.requests[0]), `"metadata":{"user_id":"customer-user-42"}`) {
+		t.Fatalf("live request dropped end-user identity: %s", transport.requests[0])
 	}
 }
 

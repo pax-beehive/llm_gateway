@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 )
@@ -35,6 +36,9 @@ var retentionAndEpochMigration string
 
 //go:embed migrations/000008_refresh_financial_evidence.sql
 var refreshFinancialEvidenceMigration string
+
+//go:embed migrations/000009_global_quota.sql
+var globalQuotaMigration string
 
 type PostgresResponseStore struct {
 	db *sql.DB
@@ -69,7 +73,62 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, refreshFinancialEvidenceMigration); err != nil {
 		return fmt.Errorf("migrate refresh financial evidence: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, globalQuotaMigration); err != nil {
+		return fmt.Errorf("migrate global quota leases: %w", err)
+	}
 	return nil
+}
+
+func (s *PostgresResponseStore) AcquireResponseSlot(ctx context.Context, tenantID, leaseID string, limit int, expiresAt time.Time) error {
+	if limit <= 0 || leaseID == "" {
+		return errors.New("global quota requires a positive limit and lease identity")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "response-quota\x1f"+tenantID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_response_slots WHERE tenant_id = $1 AND expires_at <= now()`, tenantID); err != nil {
+		return err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM tenant_response_slots WHERE tenant_id = $1`, tenantID).Scan(&count); err != nil {
+		return err
+	}
+	if count >= limit {
+		return ErrQuotaExceeded
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tenant_response_slots (tenant_id, lease_id, expires_at)
+		VALUES ($1,$2,$3)`, tenantID, leaseID, expiresAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresResponseStore) RenewResponseSlot(ctx context.Context, tenantID, leaseID string, expiresAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE tenant_response_slots SET expires_at = $3, updated_at = now()
+		WHERE tenant_id = $1 AND lease_id = $2`, tenantID, leaseID, expiresAt)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PostgresResponseStore) ReleaseResponseSlot(ctx context.Context, tenantID, leaseID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM tenant_response_slots WHERE tenant_id = $1 AND lease_id = $2`, tenantID, leaseID)
+	return err
 }
 
 func (s *PostgresResponseStore) Create(ctx context.Context, tenantID string, response core.Response) error {
@@ -225,6 +284,71 @@ func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID st
 		return core.Response{}, fmt.Errorf("decode response: %w", err)
 	}
 	response.RetainContent = retainContent
+	if isTerminal(response.Status) && response.ContentExpiresAt != nil && time.Now().Unix() >= *response.ContentExpiresAt {
+		redacted := redactResponseContent(response)
+		redacted.Revision = response.Revision + 1
+		redactedPayload, err := json.Marshal(redacted)
+		if err != nil {
+			return core.Response{}, err
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return core.Response{}, err
+		}
+		defer func() { _ = tx.Rollback() }()
+		result, err := tx.ExecContext(ctx, `
+			UPDATE responses SET revision = $4, payload = $5, updated_at = now()
+			WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
+			  AND execution_epoch = (SELECT execution_epoch FROM tenants WHERE id = $1)`,
+			tenantID, responseID, response.Revision, redacted.Revision, redactedPayload)
+		if err != nil {
+			return core.Response{}, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return core.Response{}, err
+		}
+		if rows == 1 {
+			redactionPayload, _ := json.Marshal(map[string]any{"id": response.ID, "content_expired": true})
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE transactional_outbox SET payload = $3
+				WHERE tenant_id = $1 AND aggregate_type = 'response' AND aggregate_id = $2`,
+				tenantID, response.ID, redactionPayload); err != nil {
+				return core.Response{}, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM response_events WHERE tenant_id = $1 AND response_id = $2`, tenantID, response.ID); err != nil {
+				return core.Response{}, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM conversation_items WHERE tenant_id = $1 AND response_id = $2`, tenantID, response.ID); err != nil {
+				return core.Response{}, err
+			}
+			if response.ConversationID != "" {
+				var conversationRevision int64
+				if err := tx.QueryRowContext(ctx, `
+					UPDATE conversations SET revision = revision + 1, updated_at = now()
+					WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+					RETURNING revision`, tenantID, response.ConversationID).Scan(&conversationRevision); err != nil {
+					return core.Response{}, err
+				}
+				if err := insertAggregateOutbox(
+					ctx, tx, tenantID, "conversation", response.ConversationID, conversationRevision,
+					"conversation.content_expired", redactionPayload,
+				); err != nil {
+					return core.Response{}, err
+				}
+			}
+			if err := insertOutbox(ctx, tx, tenantID, redacted, "response.content_expired", redactedPayload); err != nil {
+				return core.Response{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return core.Response{}, err
+			}
+			response = redacted
+		} else {
+			_ = tx.Rollback()
+			return s.Get(ctx, tenantID, responseID)
+		}
+	}
 	return response, nil
 }
 
@@ -335,12 +459,15 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO savings_ledger (
 			id, tenant_id, response_id, measure, attribution, price_snapshot_id, provider_usage,
-			gross_saving, net_saving, currency, created_at
-		) VALUES ($1, $2, $3, 'observed_discount', $4, $5, $6, $7, $7, $8, $9)`,
+			gross_saving, net_saving, currency, holdout_cohort, created_at
+		) VALUES ($1, $2, $3, 'observed_discount', $4, $5, $6, $7, $7, $8, NULLIF($9,''), $10)`,
 		usage.ID+"_observed", tenantID, response.ID, attribution, usage.PriceSnapshot.ID,
-		providerUsage, grossSaving, usage.Currency, usage.CreatedAt,
+		providerUsage, grossSaving, usage.Currency, usage.HoldoutCohort, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert observed savings evidence: %w", err)
+	}
+	if err := insertExperimentEvidence(ctx, tx, tenantID, response.ID, usage, providerUsage); err != nil {
+		return err
 	}
 	if protected := usage.ProtectedHit; protected != nil &&
 		protectedHitVerified(*protected, usage.CacheUsageReliable, usage.Usage.CachedInputTokens) {
@@ -371,6 +498,66 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 		return err
 	}
 	return tx.Commit()
+}
+
+func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, responseID string, usage core.UsageRecord, providerUsage json.RawMessage) error {
+	if usage.HoldoutCohort != "treatment" && usage.HoldoutCohort != "holdout" {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT s.holdout_cohort, count(*), COALESCE(sum(u.amount), 0)::bigint
+		FROM savings_ledger s
+		JOIN usage_ledger u ON u.tenant_id = s.tenant_id AND u.response_id = s.response_id
+		WHERE s.tenant_id = $1 AND s.measure = 'observed_discount'
+		  AND s.price_snapshot_id = $2 AND s.holdout_cohort IN ('treatment', 'holdout')
+		GROUP BY s.holdout_cohort`, tenantID, usage.PriceSnapshot.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type cohort struct{ responses, cost int64 }
+	cohorts := map[string]cohort{}
+	for rows.Next() {
+		var name string
+		var value cohort
+		if err := rows.Scan(&name, &value.responses, &value.cost); err != nil {
+			return err
+		}
+		cohorts[name] = value
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	treatment, holdout := cohorts["treatment"], cohorts["holdout"]
+	if treatment.responses == 0 || holdout.responses == 0 {
+		return nil
+	}
+	var refreshCost int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(sum(r.amount), 0)::bigint
+		FROM cache_refresh_usage_ledger r
+		JOIN cache_refresh_intents i
+		  ON i.tenant_id = r.tenant_id AND i.id = r.cache_refresh_intent_id
+		WHERE r.tenant_id = $1 AND r.price_snapshot_id = $2
+		  AND i.candidate->>'HoldoutCohort' = 'treatment'`, tenantID, usage.PriceSnapshot.ID).Scan(&refreshCost); err != nil {
+		return err
+	}
+	treatment.cost += refreshCost
+	saving := (holdout.cost/holdout.responses - treatment.cost/treatment.responses) * treatment.responses
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO savings_ledger (
+			id, tenant_id, response_id, measure, attribution, price_snapshot_id, provider_usage,
+			gross_saving, net_saving, currency, holdout_cohort, created_at
+		) VALUES ($1,$2,$3,'experimentally_validated_saving','experiment',$4,$5,$6,$6,$7,'treatment_vs_holdout',$8)`,
+		usage.ID+"_experiment", tenantID, responseID, usage.PriceSnapshot.ID, providerUsage,
+		saving, usage.Currency, usage.CreatedAt,
+	); err != nil {
+		return fmt.Errorf("insert experiment savings evidence: %w", err)
+	}
+	return nil
 }
 
 func protectedHitVerified(evidence core.ProtectedHitEvidence, reliable bool, cachedInputTokens int64) bool {

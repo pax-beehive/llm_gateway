@@ -124,8 +124,21 @@ func (c *Coordinator) Run(ctx context.Context, candidate Candidate, protector pr
 		Candidate: candidate,
 	}
 	reserved, created, err := c.repository.Reserve(ctx, intent)
-	if err != nil || !created {
+	if err != nil {
 		return reserved, err
+	}
+	if !created {
+		if reserved.Status != IntentShadow || decision.Shadow {
+			return reserved, nil
+		}
+		reserved.Candidate = candidate
+		reserved.ExpectedNetSavingMicros = decision.ExpectedNetSavingMicros
+		reserved.ScheduledFor = decision.ScheduledFor
+		reserved.UpdatedAt = now
+		reserved, err = c.repository.Update(ctx, reserved, IntentPlanned)
+		if err != nil {
+			return Intent{}, err
+		}
 	}
 	if decision.Shadow {
 		return c.repository.Update(ctx, reserved, IntentShadow)

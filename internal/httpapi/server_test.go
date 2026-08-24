@@ -69,6 +69,40 @@ func TestTenantCanCreateAndRetrieveResponse(t *testing.T) {
 	}
 }
 
+func TestStatefulWriteIsForwardedToTenantHomeRegion(t *testing.T) {
+	t.Parallel()
+	forwarded := make(chan *http.Request, 1)
+	forwardClient := &http.Client{Transport: httpRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		forwarded <- request.Clone(context.Background())
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"forwarded":true}`)), Request: request,
+		}, nil
+	})}
+	handler := httpapi.New(httpapi.Config{
+		Runtime:           runtime.New(store.NewMemoryResponseStore(), provider.NewStaticRouter(provider.NewEchoExecutor())),
+		Authenticator:     httpapi.StaticAuthenticator{"tenant-a-key": "tenant-a"},
+		TenantHomeRegions: map[string]string{"tenant-a": "us-west"}, LocalRegion: "cn-north",
+		HomeRegionURLs: map[string]string{"us-west": "https://us-west.gateway.test"}, ForwardClient: forwardClient,
+	})
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "input": "home region",
+	})
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"forwarded":true`) {
+		t.Fatalf("status/body = %d / %s", response.Code, response.Body.String())
+	}
+	request := <-forwarded
+	if request.URL.Path != "/v1/responses" || request.Header.Get("Authorization") != "Bearer tenant-a-key" {
+		t.Fatalf("forwarded request = %s / %q", request.URL.Path, request.Header.Get("Authorization"))
+	}
+}
+
+type httpRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function httpRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
 func TestChatCompletionsStreamsCanonicalEventsAsSSE(t *testing.T) {
 	t.Parallel()
 
@@ -267,7 +301,7 @@ func TestResponsesExposesCanonicalToolsAndSamplingFields(t *testing.T) {
 	if len(request.Input) != 2 || request.Input[0].Role != "system" || request.Input[1].Role != "user" {
 		t.Fatalf("canonical instructions/input = %#v", request.Input)
 	}
-	if strings.Join(request.RequestedFeatures, ",") != "text,tools,sampling" {
+	if strings.Join(request.RequestedFeatures, ",") != "text,tools,sampling,end_user_id" {
 		t.Fatalf("requested features = %#v", request.RequestedFeatures)
 	}
 }
@@ -384,6 +418,7 @@ func handlerForExecutor(executor provider.ResponseExecutor) http.Handler {
 		Profile: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{
 			"text": provider.CapabilityNative, "streaming": provider.CapabilityNative,
 			"tools": provider.CapabilityNative, "sampling": provider.CapabilityNative, "multimodal": provider.CapabilityNative,
+			"end_user_id": provider.CapabilityNative,
 		}},
 		PriceSnapshot: core.PriceSnapshot{
 			ID: "test-price", Provider: "test-provider", Model: "provider-model", Region: "local",
