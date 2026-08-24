@@ -155,6 +155,7 @@ func run() error {
 	engine := runtime.NewWithOptions(responseStore, router, runtime.Options{
 		CacheCoordinator:    cacheCoordinator,
 		OnCacheError:        func(err error) { slog.Warn("cache protection degraded", "error", err) },
+		OnCoordinationError: func(err error) { slog.Warn("gateway coordination degraded", "error", err) },
 		CacheProtectionMode: cacheProtectionMode, CacheHoldoutPercent: holdoutPercent,
 		TenantPolicies: tenantPolicies,
 	})

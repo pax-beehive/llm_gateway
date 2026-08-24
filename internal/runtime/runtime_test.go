@@ -169,12 +169,15 @@ func TestTenantPolicyEnforcesConcurrentResponseQuota(t *testing.T) {
 func TestLostGlobalQuotaLeaseCancelsProviderExecution(t *testing.T) {
 	t.Parallel()
 	stream := newBlockingStream()
+	var coordinationErrors, cacheErrors atomic.Int64
 	responseStore := &failingRenewalStore{MemoryResponseStore: store.NewMemoryResponseStore(), renewed: make(chan struct{})}
 	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(testRoute("quota-renewal", executorFunc(
 		func(context.Context, core.Request) (provider.EventStream, error) { return stream, nil },
 	))), gatewayruntime.Options{
 		ProviderIdleTimeout: time.Second, QuotaLeaseTTL: 30 * time.Millisecond, QuotaRenewInterval: 5 * time.Millisecond,
-		TenantPolicies: map[string]core.TenantPolicy{"tenant-a": {MaxConcurrentResponses: 1}},
+		OnCoordinationError: func(error) { coordinationErrors.Add(1) },
+		OnCacheError:        func(error) { cacheErrors.Add(1) },
+		TenantPolicies:      map[string]core.TenantPolicy{"tenant-a": {MaxConcurrentResponses: 1}},
 	})
 	_, err := engine.Execute(context.Background(), core.Request{
 		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
@@ -186,6 +189,9 @@ func TestLostGlobalQuotaLeaseCancelsProviderExecution(t *testing.T) {
 	case <-responseStore.renewed:
 	default:
 		t.Fatal("global quota lease was never renewed")
+	}
+	if coordinationErrors.Load() != 1 || cacheErrors.Load() != 0 {
+		t.Fatalf("coordination/cache errors = %d/%d, want 1/0", coordinationErrors.Load(), cacheErrors.Load())
 	}
 }
 
@@ -317,7 +323,8 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 		t.Fatal(err)
 	}
 	usageRecords := responseStore.UsageRecords("tenant-a", response.ID)
-	if len(usageRecords) != 1 || usageRecords[0].HoldoutCohort != "treatment" {
+	if len(usageRecords) != 1 || usageRecords[0].HoldoutCohort != "treatment" ||
+		!strings.Contains(usageRecords[0].ExperimentRevision, "route-cache-route") {
 		t.Fatalf("treatment usage cohort = %#v", usageRecords)
 	}
 	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(4*time.Minute + 55*time.Second) })

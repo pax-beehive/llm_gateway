@@ -31,6 +31,7 @@ type Runtime struct {
 	keepaliveInterval   time.Duration
 	cacheCoordinator    *cacheprotection.Coordinator
 	cacheError          func(error)
+	coordinationError   func(error)
 	tracer              trace.Tracer
 	responses           metric.Int64Counter
 	providerAttempts    metric.Int64Counter
@@ -54,6 +55,7 @@ type Options struct {
 	KeepaliveInterval   time.Duration
 	CacheCoordinator    *cacheprotection.Coordinator
 	OnCacheError        func(error)
+	OnCoordinationError func(error)
 	CacheProtectionMode string
 	CacheHoldoutPercent int
 	TenantPolicies      map[string]core.TenantPolicy
@@ -104,7 +106,8 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 		store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc), inflight: make(map[string]int),
 		idleTimeout: options.ProviderIdleTimeout, keepaliveInterval: options.KeepaliveInterval,
 		cacheCoordinator: options.CacheCoordinator, cacheError: options.OnCacheError,
-		tracer: otel.Tracer("github.com/toddzheng/llm-gateway/runtime"), responses: responses,
+		coordinationError: options.OnCoordinationError,
+		tracer:            otel.Tracer("github.com/toddzheng/llm-gateway/runtime"), responses: responses,
 		providerAttempts: providerAttempts, tokens: tokens, costMicros: costMicros,
 		cacheOutcomes: cacheOutcomes, providerDuration: providerDuration,
 		cacheProtectionMode: options.CacheProtectionMode, cacheHoldoutPercent: options.CacheHoldoutPercent,
@@ -470,8 +473,8 @@ func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Cont
 					renewErr := global.RenewResponseSlot(renewalCtx, request.TenantID, leaseID, r.now().UTC().Add(r.quotaLeaseTTL))
 					cancel()
 					if renewErr != nil {
-						if r.cacheError != nil {
-							r.cacheError(fmt.Errorf("renew global Response quota lease: %w", renewErr))
+						if r.coordinationError != nil {
+							r.coordinationError(fmt.Errorf("renew global Response quota lease: %w", renewErr))
 						}
 						cancelLease()
 						return
@@ -675,7 +678,7 @@ func (r *Runtime) experimentRevision(route provider.Route) string {
 	if r.cacheProtectionMode != CacheProtectionAnthropicCanaryMode {
 		return ""
 	}
-	return fmt.Sprintf("%s:v1:holdout-%d:capability-%d", r.cacheProtectionMode, r.cacheHoldoutPercent, route.Profile.Revision)
+	return fmt.Sprintf("%s:v1:route-%s:holdout-%d:capability-%d", r.cacheProtectionMode, route.ID, r.cacheHoldoutPercent, route.Profile.Revision)
 }
 
 func stableCohortBucket(identity string) int {
