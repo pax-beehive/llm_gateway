@@ -87,6 +87,7 @@ type Request struct {
 	IdempotencyKey     string
 	RequestHash        []byte
 	ContextItemCount   int
+	ExperimentIdentity string
 	CacheProtection    *CacheProtectionPolicy
 }
 

@@ -165,14 +165,16 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		}
 		request.Input = append(cloneItems(conversation.Items), responseInput...)
 		request.ContextItemCount = len(conversation.Items)
+		request.ExperimentIdentity = "conversation:" + request.ConversationID
 	}
 	if request.PreviousResponseID != "" {
-		chain, previous, err := r.responseChain(ctx, request.TenantID, request.PreviousResponseID, request.HomeRegion, request.ExecutionEpoch)
+		chain, previous, rootResponseID, err := r.responseChain(ctx, request.TenantID, request.PreviousResponseID, request.HomeRegion, request.ExecutionEpoch)
 		if err != nil {
 			return core.Response{}, fmt.Errorf("previous response: %w", err)
 		}
 		request.Input = append(chain, responseInput...)
 		request.ContextItemCount = len(chain)
+		request.ExperimentIdentity = "chain:" + rootResponseID
 		if len(previous.Attempts) > 0 {
 			request.PreferredRouteID = previous.Attempts[len(previous.Attempts)-1].RouteID
 		}
@@ -637,10 +639,8 @@ func (r *Runtime) experimentCohort(request core.Request, route provider.Route) s
 	}
 	identity := request.TenantID + "\x1f" + route.ID + "\x1f"
 	switch {
-	case request.ConversationID != "":
-		identity += "conversation:" + request.ConversationID
-	case request.PreviousResponseID != "":
-		identity += "chain:" + request.PreviousResponseID
+	case request.ExperimentIdentity != "":
+		identity += request.ExperimentIdentity
 	default:
 		encoded, _ := json.Marshal(request.Input)
 		digest := sha256.Sum256(encoded)
@@ -674,30 +674,30 @@ func cacheLeaseID(anchor provider.CacheAnchor) string {
 	return "lease_" + hex.EncodeToString(digest[:16])
 }
 
-func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeRegion string, executionEpoch int64) ([]core.Item, core.Response, error) {
+func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeRegion string, executionEpoch int64) ([]core.Item, core.Response, string, error) {
 	seen := make(map[string]struct{})
 	var reversed []core.Response
 	currentID := responseID
 	for currentID != "" {
 		if len(reversed) >= 256 {
-			return nil, core.Response{}, errors.New("response chain exceeds 256 links")
+			return nil, core.Response{}, "", errors.New("response chain exceeds 256 links")
 		}
 		if _, exists := seen[currentID]; exists {
-			return nil, core.Response{}, errors.New("response chain contains a cycle")
+			return nil, core.Response{}, "", errors.New("response chain contains a cycle")
 		}
 		seen[currentID] = struct{}{}
 		response, err := r.store.Get(ctx, tenantID, currentID)
 		if err != nil {
-			return nil, core.Response{}, err
+			return nil, core.Response{}, "", err
 		}
 		if response.HomeRegion != "" && response.HomeRegion != homeRegion {
-			return nil, core.Response{}, errors.New("response chain crosses home regions")
+			return nil, core.Response{}, "", errors.New("response chain crosses home regions")
 		}
 		if response.ExecutionEpoch != executionEpoch {
-			return nil, core.Response{}, errors.New("response chain crosses execution epochs")
+			return nil, core.Response{}, "", errors.New("response chain crosses execution epochs")
 		}
 		if response.Status != core.ResponseStatusCompleted {
-			return nil, core.Response{}, errors.New("previous response is not completed")
+			return nil, core.Response{}, "", errors.New("previous response is not completed")
 		}
 		reversed = append(reversed, response)
 		currentID = response.PreviousResponseID
@@ -707,7 +707,7 @@ func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeR
 		items = append(items, cloneItems(reversed[index].Input)...)
 		items = append(items, cloneItems(reversed[index].Output)...)
 	}
-	return items, reversed[0], nil
+	return items, reversed[0], reversed[len(reversed)-1].ID, nil
 }
 
 func responseForPersistence(response core.Response) core.Response {
