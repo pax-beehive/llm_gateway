@@ -134,7 +134,7 @@ func (p *CacheProtector) Refresh(ctx context.Context, anchor provider.CacheAncho
 		return provider.RefreshResult{Status: "uncertain", ProviderUsage: responseBody}, errors.New("Anthropic refresh unexpectedly produced output")
 	}
 	usage := core.Usage{
-		InputTokens:  response.Usage.InputTokens + response.Usage.CacheCreationInputTokens,
+		InputTokens:  response.Usage.InputTokens + response.Usage.CacheCreationInputTokens + response.Usage.CacheReadInputTokens,
 		OutputTokens: response.Usage.OutputTokens, CachedInputTokens: response.Usage.CacheReadInputTokens,
 	}
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens

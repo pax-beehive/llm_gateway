@@ -24,6 +24,9 @@ var configurationMigration string
 //go:embed migrations/000004_cache_protection_runtime.sql
 var cacheProtectionMigration string
 
+//go:embed migrations/000005_protected_hit_evidence.sql
+var protectedHitMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -44,6 +47,9 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, cacheProtectionMigration); err != nil {
 		return fmt.Errorf("migrate cache protection store: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, protectedHitMigration); err != nil {
+		return fmt.Errorf("migrate protected hit evidence: %w", err)
 	}
 	return nil
 }
@@ -302,6 +308,25 @@ func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID 
 	); err != nil {
 		return fmt.Errorf("insert observed savings evidence: %w", err)
 	}
+	if protected := usage.ProtectedHit; protected != nil &&
+		protectedHitVerified(*protected, usage.CacheUsageReliable, usage.Usage.CachedInputTokens) {
+		costs := protected.RefreshCostMicros + protected.ForecastCostMicros +
+			protected.StorageCostMicros + protected.RouteLockCostMicros
+		netSaving := grossSaving - costs
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO savings_ledger (
+				id, tenant_id, response_id, cache_lease_id, measure, attribution,
+				price_snapshot_id, provider_usage, gross_saving, refresh_cost, forecast_cost,
+				storage_cost, route_lock_cost, net_saving, currency, created_at
+			) VALUES ($1,$2,$3,$4,'estimated_protected_saving','estimated',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			usage.ID+"_protected", tenantID, response.ID, protected.CacheLeaseID,
+			usage.PriceSnapshot.ID, providerUsage, grossSaving, protected.RefreshCostMicros,
+			protected.ForecastCostMicros, protected.StorageCostMicros,
+			protected.RouteLockCostMicros, netSaving, usage.Currency, usage.CreatedAt,
+		); err != nil {
+			return fmt.Errorf("insert protected hit evidence: %w", err)
+		}
+	}
 	if err := insertOutbox(ctx, tx, tenantID, response, "response.completed", payload); err != nil {
 		return err
 	}
@@ -310,6 +335,14 @@ func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID 
 		return err
 	}
 	return tx.Commit()
+}
+
+func protectedHitVerified(evidence core.ProtectedHitEvidence, reliable bool, cachedInputTokens int64) bool {
+	return reliable && cachedInputTokens > 0 && evidence.CacheLeaseID != "" &&
+		!evidence.RefreshSucceededAt.IsZero() &&
+		evidence.RefreshSucceededAt.Before(evidence.OriginalLeaseExpiresAt) &&
+		evidence.CustomerRequestAt.After(evidence.OriginalLeaseExpiresAt) &&
+		evidence.CustomerRequestAt.Before(evidence.RefreshExpiresAt)
 }
 
 func ensurePriceSnapshot(ctx context.Context, tx *sql.Tx, snapshot core.PriceSnapshot) error {

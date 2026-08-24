@@ -86,4 +86,15 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	if revision != candidate.Lease.Revision+1 || fencingToken != candidate.Lease.FencingToken+1 || status != "refreshed" {
 		t.Fatalf("lease revision/fence/status = %d/%d/%s", revision, fencingToken, status)
 	}
+	requestObserver := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(6 * time.Minute) })
+	requestResult, err := requestObserver.CustomerRequest(ctx, candidate.Lease.Anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := requestResult.ProtectedHitCandidate
+	if evidence == nil || evidence.CacheLeaseID != candidate.Lease.ID ||
+		!evidence.OriginalLeaseExpiresAt.Equal(now.Add(5*time.Minute)) ||
+		!evidence.RefreshExpiresAt.Equal(now.Add(10*time.Minute)) {
+		t.Fatalf("protected hit candidate = %#v", evidence)
+	}
 }

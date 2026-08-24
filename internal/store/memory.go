@@ -351,5 +351,9 @@ func equalBytes(left, right []byte) bool {
 
 func cloneUsageRecord(record core.UsageRecord) core.UsageRecord {
 	record.ProviderUsage = append([]byte(nil), record.ProviderUsage...)
+	if record.ProtectedHit != nil {
+		protected := *record.ProtectedHit
+		record.ProtectedHit = &protected
+	}
 	return record
 }

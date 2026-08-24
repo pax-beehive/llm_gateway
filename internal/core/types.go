@@ -183,5 +183,18 @@ type UsageRecord struct {
 	AmountMicros       int64
 	Currency           string
 	CacheUsageReliable bool
+	ProtectedHit       *ProtectedHitEvidence
 	CreatedAt          time.Time
+}
+
+type ProtectedHitEvidence struct {
+	CacheLeaseID           string
+	OriginalLeaseExpiresAt time.Time
+	RefreshSucceededAt     time.Time
+	RefreshExpiresAt       time.Time
+	CustomerRequestAt      time.Time
+	RefreshCostMicros      int64
+	ForecastCostMicros     int64
+	StorageCostMicros      int64
+	RouteLockCostMicros    int64
 }

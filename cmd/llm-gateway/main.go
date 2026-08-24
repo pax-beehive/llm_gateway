@@ -55,11 +55,12 @@ type routeConfig struct {
 }
 
 type cacheRefreshConfig struct {
-	Kind       string `json:"kind"`
-	BaseURL    string `json:"base_url"`
-	APIKeyEnv  string `json:"api_key_env"`
-	TTLSeconds int64  `json:"ttl_seconds"`
-	APIVersion string `json:"api_version,omitempty"`
+	Kind                string  `json:"kind"`
+	BaseURL             string  `json:"base_url"`
+	APIKeyEnv           string  `json:"api_key_env"`
+	TTLSeconds          int64   `json:"ttl_seconds"`
+	APIVersion          string  `json:"api_version,omitempty"`
+	WriteCostPerMillion float64 `json:"write_cost_per_million"`
 }
 
 func main() {
@@ -258,20 +259,13 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		if config.ID == "" || config.PublicModel == "" || config.Provider == "" || config.Region == "" || config.HomeRegion == "" {
 			return nil, fmt.Errorf("route %d requires id, provider, public_model, region, and home_region", index)
 		}
-		executor, err := openaicompat.New(openaicompat.Config{
-			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
-			Headers: config.Headers,
-		})
+		executor, cacheProtector, cacheAnchorBuilder, err := buildProviderComponents(config)
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", config.ID, err)
 		}
 		effectiveAt, err := time.Parse(time.RFC3339, config.PriceEffectiveAt)
 		if err != nil || config.PriceSnapshotID == "" || config.PriceSource == "" || config.Currency == "" {
 			return nil, fmt.Errorf("route %q requires immutable price_snapshot_id, RFC3339 price_effective_at, price_source, and currency", config.ID)
-		}
-		cacheProtector, err := buildCacheProtector(config)
-		if err != nil {
-			return nil, fmt.Errorf("route %q cache refresh: %w", config.ID, err)
 		}
 		routes = append(routes, provider.Route{
 			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
@@ -286,9 +280,58 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 			},
 			CacheUsageReliable: config.CacheUsageReliable,
 			CacheProtector:     cacheProtector,
+			CacheAnchorBuilder: cacheAnchorBuilder,
 		})
 	}
 	return routes, nil
+}
+
+func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
+	if config.Provider == "anthropic" {
+		var ttl time.Duration
+		var apiVersion string
+		var writeCostMicros int64
+		if refresh := config.CacheRefresh; refresh != nil {
+			if refresh.Kind != "anthropic" {
+				return nil, nil, nil, fmt.Errorf("Anthropic route cannot use %q cache refresh", refresh.Kind)
+			}
+			if refresh.TTLSeconds <= 0 || math.IsNaN(refresh.WriteCostPerMillion) || math.IsInf(refresh.WriteCostPerMillion, 0) || refresh.WriteCostPerMillion < 0 {
+				return nil, nil, nil, errors.New("Anthropic cache refresh requires positive ttl_seconds and finite non-negative write_cost_per_million")
+			}
+			if refresh.BaseURL != "" && strings.TrimRight(refresh.BaseURL, "/") != strings.TrimRight(config.BaseURL, "/") {
+				return nil, nil, nil, errors.New("Anthropic execution and cache refresh must use the same base_url")
+			}
+			if refresh.APIKeyEnv != "" && refresh.APIKeyEnv != config.APIKeyEnv {
+				return nil, nil, nil, errors.New("Anthropic execution and cache refresh must use the same credential")
+			}
+			ttl = time.Duration(refresh.TTLSeconds) * time.Second
+			apiVersion = refresh.APIVersion
+			writeCostMicros = currencyMicros(refresh.WriteCostPerMillion)
+		}
+		adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
+			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), APIVersion: apiVersion,
+			TTL: ttl, Model: config.ProviderModel, RouteID: config.ID,
+			CredentialScope: config.CredentialScope, Region: config.Region,
+			CacheWritePerMillionMicros: writeCostMicros,
+		})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if config.CacheRefresh == nil {
+			return adapter, nil, nil, nil
+		}
+		return adapter, adapter, adapter, nil
+	}
+
+	executor, err := openaicompat.New(openaicompat.Config{
+		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
+		Headers: config.Headers,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cacheProtector, err := buildCacheProtector(config)
+	return executor, cacheProtector, nil, err
 }
 
 func buildCacheProtector(config routeConfig) (provider.CacheProtector, error) {
@@ -300,11 +343,6 @@ func buildCacheProtector(config routeConfig) (provider.CacheProtector, error) {
 		return nil, errors.New("positive ttl_seconds is required")
 	}
 	switch refresh.Kind {
-	case "anthropic":
-		return anthropic.NewCacheProtector(anthropic.CacheConfig{
-			BaseURL: refresh.BaseURL, APIKey: os.Getenv(refresh.APIKeyEnv), APIVersion: refresh.APIVersion,
-			TTL: time.Duration(refresh.TTLSeconds) * time.Second,
-		})
 	case "gemini":
 		return gemini.NewCacheProtector(
 			refresh.BaseURL, os.Getenv(refresh.APIKeyEnv), time.Duration(refresh.TTLSeconds)*time.Second, nil,

@@ -171,7 +171,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			Region: route.Region, StartedAt: attemptStart, PriceSnapshotID: route.PriceSnapshot.ID,
 		}
 		response.Attempts = append(response.Attempts, attempt)
-		r.cancelPendingCacheProtection(executionCtx, request, route)
+		protectedHit := r.observeCustomerRequest(executionCtx, request, route)
 		stream, executeErr := route.Executor.Execute(executionCtx, request)
 		if executeErr != nil {
 			lastErr = executeErr
@@ -254,6 +254,9 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			AmountMicros: calculateUsageAmount(response.Usage, route.PriceSnapshot), Currency: route.PriceSnapshot.Currency,
 			CacheUsageReliable: route.CacheUsageReliable, CreatedAt: completed,
 		}
+		if protectedHit != nil && route.CacheUsageReliable && response.Usage.CachedInputTokens > 0 {
+			usageRecord.ProtectedHit = protectedHit
+		}
 		financialStore, supportsFinancialCompletion := r.store.(store.FinancialResponseStore)
 		var persistErr error
 		if supportsFinancialCompletion {
@@ -312,17 +315,29 @@ func perMillionCost(tokens, rate int64) int64 {
 	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
 }
 
-func (r *Runtime) cancelPendingCacheProtection(ctx context.Context, request core.Request, route provider.Route) {
-	if r.cacheCoordinator == nil || request.CacheProtection == nil || !request.CacheProtection.Enabled || route.CacheAnchorBuilder == nil {
-		return
+func (r *Runtime) observeCustomerRequest(ctx context.Context, request core.Request, route provider.Route) *core.ProtectedHitEvidence {
+	if r.cacheCoordinator == nil || route.CacheAnchorBuilder == nil {
+		return nil
 	}
 	anchor, exists, err := route.CacheAnchorBuilder.CurrentCacheAnchor(ctx, request)
 	if err == nil && exists {
-		_, err = r.cacheCoordinator.CustomerRequest(ctx, anchor)
+		var result cacheprotection.CustomerRequestResult
+		result, err = r.cacheCoordinator.CustomerRequest(ctx, anchor)
+		if err == nil && result.ProtectedHitCandidate != nil {
+			candidate := result.ProtectedHitCandidate
+			return &core.ProtectedHitEvidence{
+				CacheLeaseID: candidate.CacheLeaseID, OriginalLeaseExpiresAt: candidate.OriginalLeaseExpiresAt,
+				RefreshSucceededAt: candidate.RefreshSucceededAt, RefreshExpiresAt: candidate.RefreshExpiresAt,
+				CustomerRequestAt: r.now().UTC(), RefreshCostMicros: candidate.RefreshCostMicros,
+				ForecastCostMicros: candidate.ForecastCostMicros, StorageCostMicros: candidate.StorageCostMicros,
+				RouteLockCostMicros: candidate.RouteLockCostMicros,
+			}
+		}
 	}
 	if err != nil && r.cacheError != nil {
 		r.cacheError(err)
 	}
+	return nil
 }
 
 func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request, response core.Response, route provider.Route) {

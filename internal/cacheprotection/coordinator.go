@@ -43,8 +43,24 @@ type Intent struct {
 type IntentRepository interface {
 	Reserve(context.Context, Intent) (Intent, bool, error)
 	Update(context.Context, Intent, IntentStatus) (Intent, error)
-	CancelPending(context.Context, provider.CacheAnchor) (int, error)
+	CustomerRequest(context.Context, provider.CacheAnchor, time.Time) (CustomerRequestResult, error)
 	ClaimDue(context.Context, time.Time, int) ([]Intent, error)
+}
+
+type ProtectedHitCandidate struct {
+	CacheLeaseID           string
+	OriginalLeaseExpiresAt time.Time
+	RefreshSucceededAt     time.Time
+	RefreshExpiresAt       time.Time
+	RefreshCostMicros      int64
+	ForecastCostMicros     int64
+	StorageCostMicros      int64
+	RouteLockCostMicros    int64
+}
+
+type CustomerRequestResult struct {
+	Cancelled             int
+	ProtectedHitCandidate *ProtectedHitCandidate
 }
 
 type Coordinator struct {
@@ -146,6 +162,7 @@ func (c *Coordinator) RunDue(ctx context.Context, limit int, resolve ProtectorRe
 }
 
 func (c *Coordinator) execute(ctx context.Context, intent Intent, protector provider.CacheProtector) (Intent, error) {
+	intent.UpdatedAt = c.now().UTC()
 	running, err := c.repository.Update(ctx, intent, IntentRunning)
 	if err != nil {
 		return Intent{}, err
@@ -156,6 +173,7 @@ func (c *Coordinator) execute(ctx context.Context, intent Intent, protector prov
 func (c *Coordinator) executeClaimed(ctx context.Context, running Intent, protector provider.CacheProtector) (Intent, error) {
 	result, refreshErr := protector.Refresh(ctx, running.Anchor)
 	running.ProviderResult = result
+	running.UpdatedAt = c.now().UTC()
 	if refreshErr != nil {
 		running.Error = refreshErr.Error()
 		status := IntentUncertain
@@ -168,8 +186,8 @@ func (c *Coordinator) executeClaimed(ctx context.Context, running Intent, protec
 	return c.repository.Update(ctx, running, IntentSucceeded)
 }
 
-func (c *Coordinator) CustomerRequest(ctx context.Context, anchor provider.CacheAnchor) (int, error) {
-	return c.repository.CancelPending(ctx, anchor)
+func (c *Coordinator) CustomerRequest(ctx context.Context, anchor provider.CacheAnchor) (CustomerRequestResult, error) {
+	return c.repository.CustomerRequest(ctx, anchor, c.now().UTC())
 }
 
 type MemoryIntentRepository struct {
@@ -205,27 +223,41 @@ func (r *MemoryIntentRepository) Update(_ context.Context, intent Intent, status
 		return Intent{}, errors.New("cache refresh intent fencing conflict")
 	}
 	intent.Status = status
-	intent.UpdatedAt = time.Now().UTC()
+	if intent.UpdatedAt.IsZero() {
+		intent.UpdatedAt = time.Now().UTC()
+	}
 	r.intents[intent.ID] = intent
 	return intent, nil
 }
 
-func (r *MemoryIntentRepository) CancelPending(_ context.Context, anchor provider.CacheAnchor) (int, error) {
+func (r *MemoryIntentRepository) CustomerRequest(_ context.Context, anchor provider.CacheAnchor, requestedAt time.Time) (CustomerRequestResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	cancelled := 0
+	result := CustomerRequestResult{}
 	for id, intent := range r.intents {
 		if intent.TenantID != anchor.TenantID || intent.Anchor.RouteID != anchor.RouteID || intent.Anchor.CacheKey != anchor.CacheKey || intent.Anchor.PrefixHash != anchor.PrefixHash {
 			continue
 		}
 		if intent.Status == IntentPlanned {
 			intent.Status = IntentCancelled
-			intent.UpdatedAt = time.Now().UTC()
+			intent.UpdatedAt = requestedAt
 			r.intents[id] = intent
-			cancelled++
+			result.Cancelled++
+		}
+		if intent.Status == IntentSucceeded &&
+			intent.UpdatedAt.Before(intent.Candidate.Lease.EstimatedExpiresAt) &&
+			requestedAt.After(intent.Candidate.Lease.EstimatedExpiresAt) &&
+			requestedAt.Before(intent.ProviderResult.ExpiresAt) {
+			result.ProtectedHitCandidate = &ProtectedHitCandidate{
+				CacheLeaseID: intent.CacheLeaseID, OriginalLeaseExpiresAt: intent.Candidate.Lease.EstimatedExpiresAt,
+				RefreshSucceededAt: intent.UpdatedAt, RefreshExpiresAt: intent.ProviderResult.ExpiresAt,
+				RefreshCostMicros:   intent.Candidate.Economics.RefreshCostMicros,
+				ForecastCostMicros:  intent.Candidate.Forecast.CostMicros,
+				RouteLockCostMicros: intent.Candidate.Economics.RouteLockOpportunityCostMicros,
+			}
 		}
 	}
-	return cancelled, nil
+	return result, nil
 }
 
 func (r *MemoryIntentRepository) ClaimDue(_ context.Context, now time.Time, limit int) ([]Intent, error) {

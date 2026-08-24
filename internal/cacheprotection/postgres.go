@@ -33,9 +33,9 @@ func (r *PostgresIntentRepository) Reserve(ctx context.Context, intent Intent) (
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO cache_leases (
 			tenant_id, id, revision, route_id, provider, model, credential_scope, region,
-			cache_key, prefix_hash, estimated_expires_at, fencing_token, status,
+			cache_key, prefix_hash, estimated_expires_at, original_expires_at, fencing_token, status,
 			created_at, refresh_count, spent_micros
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active',$13,$14,$15)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,'active',$13,$14,$15)
 		ON CONFLICT (tenant_id, id) DO UPDATE SET
 			revision = EXCLUDED.revision,
 			estimated_expires_at = EXCLUDED.estimated_expires_at,
@@ -126,11 +126,16 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 			UPDATE cache_leases
 			SET revision = revision + 1, fencing_token = fencing_token + 1,
 			    estimated_expires_at = $6, status = 'refreshed',
-			    refresh_count = refresh_count + 1, spent_micros = spent_micros + $7, updated_at = now()
+			    refresh_count = refresh_count + 1, spent_micros = spent_micros + $7,
+			    last_refresh_succeeded_at = $8, last_refresh_expires_at = $6,
+			    last_refresh_cost_micros = $7, last_forecast_cost_micros = $9,
+			    last_route_lock_cost_micros = $10, updated_at = $8
 			WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND fencing_token = $4
 			  AND route_id = $5`,
 			intent.TenantID, intent.CacheLeaseID, intent.CacheLeaseRevision, intent.FencingToken,
 			intent.Anchor.RouteID, expiresAt, intent.Candidate.Economics.RefreshCostMicros,
+			intent.UpdatedAt, intent.Candidate.Forecast.CostMicros,
+			intent.Candidate.Economics.RouteLockOpportunityCostMicros,
 		)
 		if err != nil {
 			return Intent{}, err
@@ -148,23 +153,60 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 	return intent, nil
 }
 
-func (r *PostgresIntentRepository) CancelPending(ctx context.Context, anchor provider.CacheAnchor) (int, error) {
-	result, err := r.db.ExecContext(ctx, `
+func (r *PostgresIntentRepository) CustomerRequest(ctx context.Context, anchor provider.CacheAnchor, requestedAt time.Time) (CustomerRequestResult, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CustomerRequestResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE cache_refresh_intents i
-		SET status = 'cancelled', updated_at = now()
+		SET status = 'cancelled', updated_at = $9
 		FROM cache_leases l
 		WHERE i.tenant_id = l.tenant_id AND i.cache_lease_id = l.id
 		  AND i.status = 'planned'
 		  AND l.tenant_id = $1 AND l.route_id = $2 AND l.provider = $3 AND l.model = $4
 		  AND l.credential_scope = $5 AND l.region = $6 AND l.cache_key = $7 AND l.prefix_hash = $8`,
 		anchor.TenantID, anchor.RouteID, anchor.Provider, anchor.Model, anchor.CredentialScope,
-		anchor.Region, anchor.CacheKey, anchor.PrefixHash,
+		anchor.Region, anchor.CacheKey, anchor.PrefixHash, requestedAt,
 	)
 	if err != nil {
-		return 0, err
+		return CustomerRequestResult{}, err
 	}
 	rows, err := result.RowsAffected()
-	return int(rows), err
+	if err != nil {
+		return CustomerRequestResult{}, err
+	}
+	requestResult := CustomerRequestResult{Cancelled: int(rows)}
+	var candidate ProtectedHitCandidate
+	err = tx.QueryRowContext(ctx, `
+		SELECT l.id, l.original_expires_at, l.last_refresh_succeeded_at,
+		       l.last_refresh_expires_at, l.last_refresh_cost_micros,
+		       l.last_forecast_cost_micros, l.last_storage_cost_micros,
+		       l.last_route_lock_cost_micros
+		FROM cache_leases l
+		WHERE l.tenant_id = $1 AND l.route_id = $2 AND l.provider = $3 AND l.model = $4
+		  AND l.credential_scope = $5 AND l.region = $6 AND l.cache_key = $7 AND l.prefix_hash = $8
+		  AND l.last_refresh_succeeded_at < l.original_expires_at
+		  AND $9 > l.original_expires_at AND $9 < l.last_refresh_expires_at
+		ORDER BY l.last_refresh_succeeded_at DESC
+		LIMIT 1`,
+		anchor.TenantID, anchor.RouteID, anchor.Provider, anchor.Model, anchor.CredentialScope,
+		anchor.Region, anchor.CacheKey, anchor.PrefixHash, requestedAt,
+	).Scan(
+		&candidate.CacheLeaseID, &candidate.OriginalLeaseExpiresAt, &candidate.RefreshSucceededAt,
+		&candidate.RefreshExpiresAt, &candidate.RefreshCostMicros, &candidate.ForecastCostMicros,
+		&candidate.StorageCostMicros, &candidate.RouteLockCostMicros,
+	)
+	if err == nil {
+		requestResult.ProtectedHitCandidate = &candidate
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return CustomerRequestResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CustomerRequestResult{}, err
+	}
+	return requestResult, nil
 }
 
 func (r *PostgresIntentRepository) ClaimDue(ctx context.Context, now time.Time, limit int) ([]Intent, error) {
