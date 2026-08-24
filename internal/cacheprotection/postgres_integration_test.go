@@ -45,10 +45,13 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	candidate.Forecast.ExpectedAt = now.Add(30 * time.Minute)
 	candidate.HoldoutCohort = "treatment"
 	candidate.ExperimentRevision = "experiment-v1"
+	candidate.RefreshBudgetRevision = "canary-v1"
+	candidate.SessionIdentity = "chain:root-response"
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM transactional_outbox WHERE tenant_id = $1`, tenantID)
 		_, _ = db.Exec(`DELETE FROM cache_refresh_usage_ledger WHERE tenant_id = $1`, tenantID)
 		_, _ = db.Exec(`DELETE FROM cache_refresh_intents WHERE tenant_id = $1`, tenantID)
+		_, _ = db.Exec(`DELETE FROM cache_refresh_session_budgets WHERE tenant_id = $1`, tenantID)
 		_, _ = db.Exec(`DELETE FROM cache_leases WHERE tenant_id = $1`, tenantID)
 		_, _ = db.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)
 		_, _ = db.Exec(`DELETE FROM provider_price_snapshots WHERE id = $1`, candidate.RefreshPriceSnapshot.ID)
@@ -91,6 +94,17 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	again, err := worker.RunDue(ctx, 10, func(provider.CacheAnchor) provider.CacheProtector { return protector })
 	if err != nil || len(again) != 0 || refreshCalls.Load() != 1 {
 		t.Fatalf("second claim = %#v, err %v, refresh calls %d", again, err, refreshCalls.Load())
+	}
+	secondLease := candidate
+	secondLease.Lease.ID = "lease-second-prefix"
+	secondLease.Lease.Anchor.CacheKey = "prefix-v2"
+	secondLease.Lease.Anchor.PrefixHash = "sha256:def"
+	rejected, err := planner.Run(ctx, secondLease, protector)
+	if err != nil || rejected.Status != cacheprotection.IntentRejected || rejected.Error != "session_refresh_limit_reached" {
+		t.Fatalf("second session lease = %#v, error = %v", rejected, err)
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("session refresh calls = %d, want one", refreshCalls.Load())
 	}
 	var revision, fencingToken int64
 	var status string

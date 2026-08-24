@@ -136,7 +136,7 @@ func TestPostgresPersistsExperimentallyValidatedSavingFromStableCohorts(t *testi
 	for index, sample := range []struct {
 		cohort string
 		tokens int64
-	}{{"holdout", 1_000_000}, {"treatment", 500_000}} {
+	}{{"holdout", 1_000_000}, {"treatment", 500_000}, {"treatment", 750_000}} {
 		response := core.Response{
 			ID: fmt.Sprintf("resp-%d", index), Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
 			Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{},
@@ -156,14 +156,15 @@ func TestPostgresPersistsExperimentallyValidatedSavingFromStableCohorts(t *testi
 			t.Fatal(err)
 		}
 	}
+	var rows int64
 	var net int64
 	if err := db.QueryRowContext(ctx, `
-		SELECT net_saving::bigint FROM savings_ledger
-		WHERE tenant_id = $1 AND measure = 'experimentally_validated_saving'`, tenantID).Scan(&net); err != nil {
+		SELECT count(*), COALESCE(sum(net_saving), 0)::bigint FROM savings_ledger
+		WHERE tenant_id = $1 AND measure = 'experimentally_validated_saving'`, tenantID).Scan(&rows, &net); err != nil {
 		t.Fatal(err)
 	}
-	if net != 500_000 {
-		t.Fatalf("experiment net saving = %d, want 500000", net)
+	if rows != 2 || net != 750_000 {
+		t.Fatalf("experiment rows/net saving = %d/%d, want 2/750000", rows, net)
 	}
 }
 

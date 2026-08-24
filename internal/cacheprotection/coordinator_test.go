@@ -106,6 +106,40 @@ func TestShadowIntentCanBePromotedToTreatmentAtSameLeaseRevision(t *testing.T) {
 	}
 }
 
+func TestTreatmentAllowsOnlyOneRefreshAcrossSessionCacheLeases(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	repository := cacheprotection.NewMemoryIntentRepository()
+	coordinator := cacheprotection.NewCoordinator(repository, func() time.Time { return now })
+	var refreshCalls atomic.Int64
+	protector := cacheProtectorStub{
+		inspect: provider.CacheCapability{Supported: true},
+		refresh: func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
+			refreshCalls.Add(1)
+			return provider.RefreshResult{Status: "succeeded", ExpiresAt: now.Add(5 * time.Minute)}, nil
+		},
+	}
+	candidate := eligibleCandidate(now)
+	candidate.HoldoutCohort = "treatment"
+	candidate.ExperimentRevision = "experiment-v1"
+	candidate.RefreshBudgetRevision = "canary-v1"
+	candidate.SessionIdentity = "chain:root-response"
+	first, err := coordinator.Run(context.Background(), candidate, protector)
+	if err != nil || first.Status != cacheprotection.IntentSucceeded {
+		t.Fatalf("first session refresh = %#v, error = %v", first, err)
+	}
+	candidate.Lease.ID = "lease-2"
+	candidate.Lease.Anchor.CacheKey = "prefix-v2"
+	candidate.Lease.Anchor.PrefixHash = "sha256:def"
+	second, err := coordinator.Run(context.Background(), candidate, protector)
+	if err != nil || second.Status != cacheprotection.IntentRejected || second.Error != "session_refresh_limit_reached" {
+		t.Fatalf("second session refresh = %#v, error = %v", second, err)
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("session refresh calls = %d, want exactly one", refreshCalls.Load())
+	}
+}
+
 func eligibleCandidate(now time.Time) cacheprotection.Candidate {
 	return cacheprotection.Candidate{
 		Policy: cacheprotection.Policy{

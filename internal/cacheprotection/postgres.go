@@ -105,6 +105,20 @@ func (r *PostgresIntentRepository) Reserve(ctx context.Context, intent Intent) (
 		}
 		return existing, false, nil
 	}
+	budgetReserved, err := reserveRefreshSessionBudget(ctx, tx, intent)
+	if err != nil {
+		return Intent{}, false, err
+	}
+	if !budgetReserved {
+		intent.Status = IntentRejected
+		intent.Error = "session_refresh_limit_reached"
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE cache_refresh_intents
+			SET status = 'rejected', error = $3, updated_at = now()
+			WHERE tenant_id = $1 AND id = $2`, intent.TenantID, intent.ID, intent.Error); err != nil {
+			return Intent{}, false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Intent{}, false, err
 	}
@@ -122,6 +136,16 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		return Intent{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if status == IntentPlanned {
+		budgetReserved, reserveErr := reserveRefreshSessionBudget(ctx, tx, intent)
+		if reserveErr != nil {
+			return Intent{}, reserveErr
+		}
+		if !budgetReserved {
+			status = IntentRejected
+			intent.Error = "session_refresh_limit_reached"
+		}
+	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE cache_refresh_intents
 		SET status = $6, provider_result = $7, error = NULLIF($8,''), candidate = $10, updated_at = now()
@@ -208,6 +232,26 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 	intent.Status = status
 	intent.UpdatedAt = time.Now().UTC()
 	return intent, nil
+}
+
+func reserveRefreshSessionBudget(ctx context.Context, tx *sql.Tx, intent Intent) (bool, error) {
+	candidate := intent.Candidate
+	if candidate.Policy.ShadowMode || candidate.HoldoutCohort != "treatment" ||
+		candidate.RefreshBudgetRevision == "" || candidate.SessionIdentity == "" {
+		return true, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO cache_refresh_session_budgets (
+			tenant_id, budget_revision, session_identity, refresh_intent_id
+		) VALUES ($1,$2,$3,$4)
+		ON CONFLICT (tenant_id, budget_revision, session_identity) DO NOTHING`,
+		intent.TenantID, candidate.RefreshBudgetRevision, candidate.SessionIdentity, intent.ID,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
 }
 
 func (r *PostgresIntentRepository) CustomerRequest(ctx context.Context, anchor provider.CacheAnchor, requestedAt time.Time) (CustomerRequestResult, error) {

@@ -202,6 +202,10 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		HomeRegion: request.HomeRegion, Revision: 1,
 		ExecutionEpoch: request.ExecutionEpoch, RetainContent: request.Store,
 	}
+	if request.ExperimentIdentity == "" {
+		// A standalone Response is the root of any future Response Chain.
+		request.ExperimentIdentity = "chain:" + response.ID
+	}
 	if policy, exists := r.tenantPolicies[request.TenantID]; request.Store && exists && policy.RetentionSeconds > 0 {
 		expiresAt := now.Add(time.Duration(policy.RetentionSeconds) * time.Second).Unix()
 		response.ContentExpiresAt = &expiresAt
@@ -636,9 +640,11 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 			PredictedColdCostMicros: coldCost, PredictedHitCostMicros: hitCost,
 			RefreshCostMicros: refreshCost,
 		},
-		RefreshPriceSnapshot: route.PriceSnapshot,
-		HoldoutCohort:        holdoutCohort,
-		ExperimentRevision:   r.experimentRevision(route),
+		RefreshPriceSnapshot:  route.PriceSnapshot,
+		HoldoutCohort:         holdoutCohort,
+		ExperimentRevision:    r.experimentRevision(route),
+		RefreshBudgetRevision: r.refreshBudgetRevision(),
+		SessionIdentity:       request.ExperimentIdentity,
 	}
 	intent, err := r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
 	status := string(intent.Status)
@@ -679,6 +685,13 @@ func (r *Runtime) experimentRevision(route provider.Route) string {
 		return ""
 	}
 	return fmt.Sprintf("%s:v1:route-%s:holdout-%d:capability-%d", r.cacheProtectionMode, route.ID, r.cacheHoldoutPercent, route.Profile.Revision)
+}
+
+func (r *Runtime) refreshBudgetRevision() string {
+	if r.cacheProtectionMode != CacheProtectionAnthropicCanaryMode {
+		return ""
+	}
+	return fmt.Sprintf("%s:v1:holdout-%d", r.cacheProtectionMode, r.cacheHoldoutPercent)
 }
 
 func stableCohortBucket(identity string) int {

@@ -46,13 +46,15 @@ type Economics struct {
 }
 
 type Candidate struct {
-	Policy               Policy
-	Lease                Lease
-	Forecast             Forecast
-	Economics            Economics
-	RefreshPriceSnapshot core.PriceSnapshot
-	HoldoutCohort        string
-	ExperimentRevision   string
+	Policy                Policy
+	Lease                 Lease
+	Forecast              Forecast
+	Economics             Economics
+	RefreshPriceSnapshot  core.PriceSnapshot
+	HoldoutCohort         string
+	ExperimentRevision    string
+	RefreshBudgetRevision string
+	SessionIdentity       string
 }
 
 type Decision struct {

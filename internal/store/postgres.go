@@ -43,6 +43,9 @@ var globalQuotaMigration string
 //go:embed migrations/000010_experiment_evidence.sql
 var experimentEvidenceMigration string
 
+//go:embed migrations/000011_cache_refresh_session_budget.sql
+var cacheRefreshSessionBudgetMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -81,6 +84,9 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, experimentEvidenceMigration); err != nil {
 		return fmt.Errorf("migrate experiment evidence: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, cacheRefreshSessionBudgetMigration); err != nil {
+		return fmt.Errorf("migrate cache refresh session budget: %w", err)
 	}
 	return nil
 }
@@ -559,6 +565,10 @@ func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, respons
 	if (usage.HoldoutCohort != "treatment" && usage.HoldoutCohort != "holdout") || usage.ExperimentRevision == "" {
 		return nil
 	}
+	lockIdentity := tenantID + "\x1f" + usage.PriceSnapshot.ID + "\x1f" + usage.ExperimentRevision
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockIdentity); err != nil {
+		return fmt.Errorf("lock experiment evidence revision: %w", err)
+	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT s.holdout_cohort, count(*), COALESCE(sum(u.amount), 0)::bigint
 		FROM savings_ledger s
@@ -610,13 +620,24 @@ func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, respons
 	}
 	treatment.cost += refreshCost
 	saving := (holdout.cost/holdout.responses - treatment.cost/treatment.responses) * treatment.responses
+	var previouslyRecorded int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(sum(net_saving), 0)::bigint
+		FROM savings_ledger
+		WHERE tenant_id = $1 AND measure = 'experimentally_validated_saving'
+		  AND price_snapshot_id = $2 AND experiment_revision = $3`,
+		tenantID, usage.PriceSnapshot.ID, usage.ExperimentRevision,
+	).Scan(&previouslyRecorded); err != nil {
+		return err
+	}
+	incrementalSaving := saving - previouslyRecorded
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO savings_ledger (
 			id, tenant_id, response_id, measure, attribution, price_snapshot_id, provider_usage,
 			gross_saving, net_saving, currency, holdout_cohort, experiment_revision, created_at
 		) VALUES ($1,$2,$3,'experimentally_validated_saving','experiment',$4,$5,$6,$6,$7,'treatment_vs_holdout',$8,$9)`,
 		usage.ID+"_experiment", tenantID, responseID, usage.PriceSnapshot.ID, providerUsage,
-		saving, usage.Currency, usage.ExperimentRevision, usage.CreatedAt,
+		incrementalSaving, usage.Currency, usage.ExperimentRevision, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert experiment savings evidence: %w", err)
 	}
