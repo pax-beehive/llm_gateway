@@ -214,7 +214,7 @@ func (s *sseStream) Recv() (core.Event, error) {
 				InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens,
 				TotalTokens: chunk.Usage.TotalTokens, CachedInputTokens: chunk.Usage.PromptTokenDetails.CachedTokens,
 			}
-			return core.Event{Type: "response.completed", Usage: &usage}, nil
+			return core.Event{Type: "response.completed", Usage: &usage, ProviderUsage: append(json.RawMessage(nil), []byte(data)...)}, nil
 		}
 		if len(chunk.Choices) > 0 {
 			choice := chunk.Choices[0]

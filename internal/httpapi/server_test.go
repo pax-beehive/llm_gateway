@@ -207,6 +207,53 @@ func TestResponsesCreateIsIdempotentPerTenantAndRequestHash(t *testing.T) {
 	}
 }
 
+func TestConversationOrdersInitialInputAndResponseOutput(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler()
+	createdConversation := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/conversations", map[string]any{
+		"items": []map[string]any{{
+			"type": "message", "role": "system",
+			"content": []map[string]any{{"type": "input_text", "text": "system:"}},
+		}},
+	})
+	if createdConversation.Code != http.StatusOK {
+		t.Fatalf("create conversation status = %d, body = %s", createdConversation.Code, createdConversation.Body.String())
+	}
+	var conversation core.Conversation
+	decodeJSON(t, createdConversation, &conversation)
+	if conversation.Revision != 1 {
+		t.Fatalf("initial revision = %d, want 1", conversation.Revision)
+	}
+
+	createdResponse := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "conversation": conversation.ID, "input": "user",
+	})
+	if createdResponse.Code != http.StatusOK {
+		t.Fatalf("create response status = %d, body = %s", createdResponse.Code, createdResponse.Body.String())
+	}
+	var response core.Response
+	decodeJSON(t, createdResponse, &response)
+	if response.OutputText() != "system:user" {
+		t.Fatalf("response output = %q, want full conversation context", response.OutputText())
+	}
+
+	retrieved := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/conversations/"+conversation.ID, nil)
+	if retrieved.Code != http.StatusOK {
+		t.Fatalf("get conversation status = %d, body = %s", retrieved.Code, retrieved.Body.String())
+	}
+	decodeJSON(t, retrieved, &conversation)
+	if conversation.Revision != 3 || conversation.ActiveResponseID != "" {
+		t.Fatalf("final conversation revision/active = %d/%q, want 3/empty", conversation.Revision, conversation.ActiveResponseID)
+	}
+	if len(conversation.Items) != 3 {
+		t.Fatalf("conversation items = %#v, want system, user, assistant", conversation.Items)
+	}
+	if conversation.Items[2].Role != "assistant" {
+		t.Fatalf("last item role = %q, want assistant", conversation.Items[2].Role)
+	}
+}
+
 func newTestHandler() http.Handler {
 	responseStore := store.NewMemoryResponseStore()
 	executor := provider.NewEchoExecutor()

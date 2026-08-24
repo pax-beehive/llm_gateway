@@ -56,6 +56,11 @@ func New(config Config) http.Handler {
 	server.mux.HandleFunc("POST /v1/responses/{response_id}/cancel", server.cancelResponse)
 	server.mux.HandleFunc("GET /v1/responses/{response_id}/input_items", server.inputItems)
 	server.mux.HandleFunc("POST /v1/chat/completions", server.chatCompletions)
+	server.mux.HandleFunc("POST /v1/conversations", server.createConversation)
+	server.mux.HandleFunc("GET /v1/conversations/{conversation_id}", server.getConversation)
+	server.mux.HandleFunc("DELETE /v1/conversations/{conversation_id}", server.deleteConversation)
+	server.mux.HandleFunc("GET /v1/conversations/{conversation_id}/items", server.conversationItems)
+	server.mux.HandleFunc("POST /v1/conversations/{conversation_id}/items", server.appendConversationItems)
 	return server
 }
 
@@ -241,6 +246,94 @@ func (s *Server) inputItems(responseWriter http.ResponseWriter, request *http.Re
 		return
 	}
 	writeJSON(responseWriter, http.StatusOK, map[string]any{"object": "list", "data": items, "has_more": false})
+}
+
+type createConversationRequest struct {
+	Items    []core.Item       `json:"items,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+func (s *Server) createConversation(responseWriter http.ResponseWriter, request *http.Request) {
+	var payload createConversationRequest
+	if err := decodeBody(request, &payload); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return
+	}
+	if err := validateItems(payload.Items); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "items")
+		return
+	}
+	conversation, err := s.runtime.CreateConversation(request.Context(), tenantID(request), s.homeRegion(request), payload.Items, payload.Metadata)
+	if err != nil {
+		writeStoreError(responseWriter, err)
+		return
+	}
+	writeJSON(responseWriter, http.StatusOK, conversation)
+}
+
+func (s *Server) getConversation(responseWriter http.ResponseWriter, request *http.Request) {
+	conversation, err := s.runtime.GetConversation(request.Context(), tenantID(request), request.PathValue("conversation_id"))
+	if err != nil {
+		writeStoreError(responseWriter, err)
+		return
+	}
+	writeJSON(responseWriter, http.StatusOK, conversation)
+}
+
+type appendConversationItemsRequest struct {
+	Items            []core.Item `json:"items"`
+	ExpectedRevision int64       `json:"expected_revision"`
+}
+
+func (s *Server) appendConversationItems(responseWriter http.ResponseWriter, request *http.Request) {
+	var payload appendConversationItemsRequest
+	if err := decodeBody(request, &payload); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return
+	}
+	if payload.ExpectedRevision <= 0 {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "expected_revision must be positive", "expected_revision")
+		return
+	}
+	if err := validateItems(payload.Items); err != nil || len(payload.Items) == 0 {
+		if err == nil {
+			err = errors.New("items cannot be empty")
+		}
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "items")
+		return
+	}
+	conversation, err := s.runtime.AppendConversationItems(
+		request.Context(), tenantID(request), request.PathValue("conversation_id"), payload.Items, payload.ExpectedRevision,
+	)
+	if err != nil {
+		writeStoreError(responseWriter, err)
+		return
+	}
+	writeJSON(responseWriter, http.StatusOK, conversation)
+}
+
+func (s *Server) conversationItems(responseWriter http.ResponseWriter, request *http.Request) {
+	conversation, err := s.runtime.GetConversation(request.Context(), tenantID(request), request.PathValue("conversation_id"))
+	if err != nil {
+		writeStoreError(responseWriter, err)
+		return
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{
+		"object": "list", "data": conversation.Items, "has_more": false, "revision": conversation.Revision,
+	})
+}
+
+func (s *Server) deleteConversation(responseWriter http.ResponseWriter, request *http.Request) {
+	conversation, err := s.runtime.GetConversation(request.Context(), tenantID(request), request.PathValue("conversation_id"))
+	if err != nil {
+		writeStoreError(responseWriter, err)
+		return
+	}
+	if err := s.runtime.DeleteConversation(request.Context(), tenantID(request), conversation.ID, conversation.Revision); err != nil {
+		writeStoreError(responseWriter, err)
+		return
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{"id": conversation.ID, "object": "conversation.deleted", "deleted": true})
 }
 
 type chatCompletionRequest struct {
@@ -499,12 +592,19 @@ func decodeInput(raw json.RawMessage) ([]core.Item, error) {
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, errors.New("input must be a string or an array of typed items")
 	}
-	for index := range items {
-		if items[index].Type == "" {
-			return nil, errors.New("every input item must have a type")
-		}
+	if err := validateItems(items); err != nil {
+		return nil, err
 	}
 	return items, nil
+}
+
+func validateItems(items []core.Item) error {
+	for index := range items {
+		if items[index].Type == "" {
+			return errors.New("every item must have a type")
+		}
+	}
+	return nil
 }
 
 func decodeBody(request *http.Request, target any) error {
@@ -535,6 +635,10 @@ func writeStoreError(responseWriter http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, store.ErrConflict) {
 		writeError(responseWriter, http.StatusConflict, "conflict", err.Error(), "")
+		return
+	}
+	if errors.Is(err, store.ErrConversationBusy) {
+		writeError(responseWriter, http.StatusConflict, "conversation_busy", err.Error(), "conversation")
 		return
 	}
 	writeError(responseWriter, http.StatusInternalServerError, "store_error", err.Error(), "")

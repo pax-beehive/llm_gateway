@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
@@ -64,18 +65,20 @@ type CapabilityProfile struct {
 }
 
 type Route struct {
-	ID              string
-	Provider        string
-	Model           string
-	Region          string
-	CredentialScope string
-	HomeRegion      string
-	Healthy         bool
-	InputCost       float64
-	OutputCost      float64
-	Profile         CapabilityProfile
-	Executor        ResponseExecutor
-	CacheProtector  CacheProtector
+	ID                 string
+	Provider           string
+	Model              string
+	Region             string
+	CredentialScope    string
+	HomeRegion         string
+	Healthy            bool
+	InputCost          float64
+	OutputCost         float64
+	Profile            CapabilityProfile
+	Executor           ResponseExecutor
+	CacheProtector     CacheProtector
+	PriceSnapshot      core.PriceSnapshot
+	CacheUsageReliable bool
 }
 
 type Router interface {
@@ -83,26 +86,69 @@ type Router interface {
 }
 
 type StaticRouter struct {
-	routes []Route
+	snapshot atomic.Pointer[routeSnapshot]
+}
+
+type routeSnapshot struct {
+	revision int64
+	routes   []Route
 }
 
 func NewStaticRouter(executor ResponseExecutor) *StaticRouter {
-	return &StaticRouter{routes: []Route{{
+	return NewVersionedRouter(1, []Route{{
 		ID: "echo-default", Provider: "echo", Model: "echo-v1", Region: "local",
 		HomeRegion: "local", Healthy: true, Executor: executor,
 		Profile: CapabilityProfile{Revision: 1, Features: map[string]CapabilitySupport{
 			"text": CapabilityNative, "streaming": CapabilityNative,
 		}},
-	}}}
+		PriceSnapshot: core.PriceSnapshot{
+			ID: "price_echo_v1", Provider: "echo", Model: "echo-v1", Region: "local", Currency: "USD",
+			EffectiveAt: 0, Source: "builtin-zero-cost",
+		},
+		CacheUsageReliable: true,
+	}})
 }
 
 func NewRouter(routes ...Route) *StaticRouter {
-	return &StaticRouter{routes: append([]Route(nil), routes...)}
+	return NewVersionedRouter(1, routes)
+}
+
+func NewVersionedRouter(revision int64, routes []Route) *StaticRouter {
+	if revision <= 0 {
+		panic("route snapshot revision must be positive")
+	}
+	router := &StaticRouter{}
+	router.snapshot.Store(&routeSnapshot{revision: revision, routes: append([]Route(nil), routes...)})
+	return router
+}
+
+func (r *StaticRouter) Update(revision int64, routes []Route) error {
+	for {
+		current := r.snapshot.Load()
+		if current != nil && revision <= current.revision {
+			return errors.New("route snapshot revision must increase")
+		}
+		next := &routeSnapshot{revision: revision, routes: append([]Route(nil), routes...)}
+		if r.snapshot.CompareAndSwap(current, next) {
+			return nil
+		}
+	}
+}
+
+func (r *StaticRouter) Revision() int64 {
+	if snapshot := r.snapshot.Load(); snapshot != nil {
+		return snapshot.revision
+	}
+	return 0
 }
 
 func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Route, error) {
+	snapshot := r.snapshot.Load()
+	if snapshot == nil {
+		return nil, errors.New("model route configuration is unavailable")
+	}
 	var candidates []Route
-	for _, route := range r.routes {
+	for _, route := range snapshot.routes {
 		if !route.Healthy || (request.Model != route.Model && request.Model != route.ID) {
 			continue
 		}
@@ -157,7 +203,7 @@ func (EchoExecutor) Execute(_ context.Context, request core.Request) (EventStrea
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	return &sliceStream{events: []core.Event{
 		{Type: "response.output_text.delta", Delta: text},
-		{Type: "response.completed", Usage: &usage},
+		{Type: "response.completed", Usage: &usage, ProviderUsage: json.RawMessage(`{"synthetic":true}`)},
 	}}, nil
 }
 

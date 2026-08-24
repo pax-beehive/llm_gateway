@@ -94,6 +94,44 @@ func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
 	}
 }
 
+func TestCompletionRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testing.T) {
+	t.Parallel()
+
+	usage := core.Usage{InputTokens: 1_000_000, CachedInputTokens: 800_000, OutputTokens: 100_000, TotalTokens: 1_100_000}
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{
+			{event: core.Event{Type: "response.output_text.delta", Delta: "done"}},
+			{event: core.Event{Type: "response.completed", Usage: &usage, ProviderUsage: []byte(`{"cache":"reported"}`)}},
+		}}, nil
+	})
+	route := testRoute("priced", executor)
+	route.PriceSnapshot = core.PriceSnapshot{
+		ID: "price-v1", Provider: "priced", Model: "gateway-model", Region: "local", Currency: "USD",
+		InputPerMillionMicros: 10_000_000, CachedInputPerMillionMicros: 1_000_000,
+		OutputPerMillionMicros: 20_000_000, EffectiveAt: 1, Source: "test-contract",
+	}
+	route.CacheUsageReliable = true
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.New(responseStore, provider.NewRouter(route))
+	response, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := responseStore.UsageRecords("tenant-a", response.ID)
+	if len(records) != 1 {
+		t.Fatalf("usage records = %#v, want one", records)
+	}
+	record := records[0]
+	if record.AmountMicros != 4_800_000 || record.PriceSnapshot.ID != "price-v1" {
+		t.Fatalf("usage amount/snapshot = %d/%q, want 4800000/price-v1", record.AmountMicros, record.PriceSnapshot.ID)
+	}
+	if string(record.ProviderUsage) != `{"cache":"reported"}` {
+		t.Fatalf("provider usage = %s", record.ProviderUsage)
+	}
+}
+
 type executorFunc func(context.Context, core.Request) (provider.EventStream, error)
 
 func (f executorFunc) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {

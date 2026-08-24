@@ -7,15 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/configuration"
+	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
@@ -38,6 +42,12 @@ type routeConfig struct {
 	Headers            map[string]string                     `json:"headers"`
 	InputCost          float64                               `json:"input_cost_per_million"`
 	OutputCost         float64                               `json:"output_cost_per_million"`
+	CachedInputCost    float64                               `json:"cached_input_cost_per_million"`
+	PriceSnapshotID    string                                `json:"price_snapshot_id"`
+	PriceEffectiveAt   string                                `json:"price_effective_at"`
+	PriceSource        string                                `json:"price_source"`
+	Currency           string                                `json:"currency"`
+	CacheUsageReliable bool                                  `json:"cache_usage_reliable"`
 }
 
 func main() {
@@ -67,6 +77,8 @@ func healthcheck() error {
 }
 
 func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	apiKeys, err := parseStringMapEnv("GATEWAY_API_KEYS_JSON")
 	if err != nil || len(apiKeys) == 0 {
 		return fmt.Errorf("GATEWAY_API_KEYS_JSON: configure at least one token-to-tenant mapping: %w", err)
@@ -76,12 +88,12 @@ func run() error {
 		return fmt.Errorf("GATEWAY_TENANT_HOME_REGIONS_JSON: %w", err)
 	}
 
-	responseStore, cleanup, err := configureStore(apiKeys, homeRegions)
+	responseStore, database, cleanup, err := configureStore(apiKeys, homeRegions)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	router, err := configureRouter()
+	router, err := configureRouter(ctx, database)
 	if err != nil {
 		return err
 	}
@@ -95,8 +107,6 @@ func run() error {
 		Addr: address, Handler: handler, ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20,
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	serveErrors := make(chan error, 1)
 	go func() {
 		slog.Info("gateway listening", "address", address)
@@ -115,49 +125,110 @@ func run() error {
 	}
 }
 
-func configureStore(apiKeys, homeRegions map[string]string) (store.ResponseStore, func(), error) {
+func configureStore(apiKeys, homeRegions map[string]string) (store.ResponseStore, *sql.DB, func(), error) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		if os.Getenv("GATEWAY_DEV_MEMORY_STORE") != "true" {
-			return nil, func() {}, errors.New("DATABASE_URL is required unless GATEWAY_DEV_MEMORY_STORE=true")
+			return nil, nil, func() {}, errors.New("DATABASE_URL is required unless GATEWAY_DEV_MEMORY_STORE=true")
 		}
-		return store.NewMemoryResponseStore(), func() {}, nil
+		return store.NewMemoryResponseStore(), nil, func() {}, nil
 	}
 	if os.Getenv("GATEWAY_ENV") == "production" && os.Getenv("GATEWAY_DURABILITY_ATTESTATION") != "sync-multi-az" {
-		return nil, func() {}, errors.New("production requires GATEWAY_DURABILITY_ATTESTATION=sync-multi-az")
+		return nil, nil, func() {}, errors.New("production requires GATEWAY_DURABILITY_ATTESTATION=sync-multi-az")
 	}
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 	cleanup := func() { _ = db.Close() }
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		cleanup()
-		return nil, func() {}, fmt.Errorf("connect PostgreSQL: %w", err)
+		return nil, nil, func() {}, fmt.Errorf("connect PostgreSQL: %w", err)
 	}
 	postgresStore := store.NewPostgresResponseStore(db)
 	if os.Getenv("GATEWAY_MIGRATE") == "true" {
 		if err := postgresStore.Migrate(ctx); err != nil {
 			cleanup()
-			return nil, func() {}, err
+			return nil, nil, func() {}, err
 		}
 	}
 	if err := ensureTenants(ctx, db, apiKeys, homeRegions); err != nil {
 		cleanup()
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
-	return postgresStore, cleanup, nil
+	return postgresStore, db, cleanup, nil
 }
 
-func configureRouter() (provider.Router, error) {
+func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRouter, error) {
 	if os.Getenv("GATEWAY_DEV_ECHO") == "true" {
 		return provider.NewStaticRouter(provider.NewEchoExecutor()), nil
 	}
+	if database == nil {
+		routes, err := routesFromJSON([]byte(os.Getenv("GATEWAY_ROUTES_JSON")))
+		if err != nil {
+			return nil, fmt.Errorf("GATEWAY_ROUTES_JSON: %w", err)
+		}
+		return provider.NewVersionedRouter(1, routes), nil
+	}
+	repository := configuration.NewPostgresRepository(database)
+	snapshot, err := repository.Current(ctx, "model_routes")
+	if errors.Is(err, configuration.ErrNotFound) {
+		if os.Getenv("GATEWAY_BOOTSTRAP_ROUTES") != "true" {
+			return nil, errors.New("model_routes configuration is absent; publish it or explicitly set GATEWAY_BOOTSTRAP_ROUTES=true")
+		}
+		revision, parseErr := strconv.ParseInt(envOr("GATEWAY_CONFIG_REVISION", "1"), 10, 64)
+		if parseErr != nil {
+			return nil, fmt.Errorf("GATEWAY_CONFIG_REVISION: %w", parseErr)
+		}
+		snapshot, err = repository.Publish(
+			ctx, "model_routes", 0, revision, json.RawMessage(os.Getenv("GATEWAY_ROUTES_JSON")), envOr("GATEWAY_CONFIG_ACTOR", "bootstrap"),
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if os.Getenv("GATEWAY_PUBLISH_ROUTES") == "true" {
+		expected, expectedErr := strconv.ParseInt(os.Getenv("GATEWAY_CONFIG_EXPECTED_REVISION"), 10, 64)
+		revision, revisionErr := strconv.ParseInt(os.Getenv("GATEWAY_CONFIG_REVISION"), 10, 64)
+		if expectedErr != nil || revisionErr != nil {
+			return nil, errors.New("publishing routes requires numeric GATEWAY_CONFIG_EXPECTED_REVISION and GATEWAY_CONFIG_REVISION")
+		}
+		snapshot, err = repository.Publish(
+			ctx, "model_routes", expected, revision, json.RawMessage(os.Getenv("GATEWAY_ROUTES_JSON")), envOr("GATEWAY_CONFIG_ACTOR", "operator"),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	routes, err := routesFromJSON(snapshot.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("model_routes revision %d: %w", snapshot.Revision, err)
+	}
+	router := provider.NewVersionedRouter(snapshot.Revision, routes)
+	go func() {
+		err := configuration.Watch(ctx, repository, "model_routes", 5*time.Second, func(next configuration.Snapshot) error {
+			if next.Revision <= router.Revision() {
+				return nil
+			}
+			nextRoutes, err := routesFromJSON(next.Payload)
+			if err != nil {
+				return err
+			}
+			return router.Update(next.Revision, nextRoutes)
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("route configuration watch stopped", "error", err)
+		}
+	}()
+	return router, nil
+}
+
+func routesFromJSON(payload []byte) ([]provider.Route, error) {
 	var configs []routeConfig
-	if err := json.Unmarshal([]byte(os.Getenv("GATEWAY_ROUTES_JSON")), &configs); err != nil || len(configs) == 0 {
-		return nil, fmt.Errorf("GATEWAY_ROUTES_JSON: configure at least one model route: %w", err)
+	if err := json.Unmarshal(payload, &configs); err != nil || len(configs) == 0 {
+		return nil, fmt.Errorf("configure at least one model route: %w", err)
 	}
 	routes := make([]provider.Route, 0, len(configs))
 	for index, config := range configs {
@@ -171,14 +242,29 @@ func configureRouter() (provider.Router, error) {
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", config.ID, err)
 		}
+		effectiveAt, err := time.Parse(time.RFC3339, config.PriceEffectiveAt)
+		if err != nil || config.PriceSnapshotID == "" || config.PriceSource == "" || config.Currency == "" {
+			return nil, fmt.Errorf("route %q requires immutable price_snapshot_id, RFC3339 price_effective_at, price_source, and currency", config.ID)
+		}
 		routes = append(routes, provider.Route{
 			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
 			HomeRegion: config.HomeRegion, CredentialScope: config.CredentialScope, Healthy: true,
 			InputCost: config.InputCost, OutputCost: config.OutputCost, Executor: executor,
 			Profile: provider.CapabilityProfile{Revision: max(config.CapabilityRevision, 1), Features: config.Capabilities},
+			PriceSnapshot: core.PriceSnapshot{
+				ID: config.PriceSnapshotID, Provider: config.Provider, Model: config.ProviderModel, Region: config.Region,
+				Currency: config.Currency, InputPerMillionMicros: currencyMicros(config.InputCost),
+				CachedInputPerMillionMicros: currencyMicros(config.CachedInputCost), OutputPerMillionMicros: currencyMicros(config.OutputCost),
+				EffectiveAt: effectiveAt.Unix(), Source: config.PriceSource,
+			},
+			CacheUsageReliable: config.CacheUsageReliable,
 		})
 	}
-	return provider.NewRouter(routes...), nil
+	return routes, nil
+}
+
+func currencyMicros(amount float64) int64 {
+	return int64(math.Round(amount * 1_000_000))
 }
 
 func ensureTenants(ctx context.Context, db *sql.DB, apiKeys, homeRegions map[string]string) error {

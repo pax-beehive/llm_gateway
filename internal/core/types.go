@@ -79,15 +79,16 @@ type Request struct {
 }
 
 type Attempt struct {
-	ID             string     `json:"id"`
-	RouteID        string     `json:"route_id"`
-	Provider       string     `json:"provider"`
-	ProviderModel  string     `json:"provider_model"`
-	Region         string     `json:"region"`
-	StartedAt      time.Time  `json:"started_at"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
-	FirstVisibleAt *time.Time `json:"first_visible_at,omitempty"`
-	Error          *Error     `json:"error,omitempty"`
+	ID              string     `json:"id"`
+	RouteID         string     `json:"route_id"`
+	Provider        string     `json:"provider"`
+	ProviderModel   string     `json:"provider_model"`
+	Region          string     `json:"region"`
+	StartedAt       time.Time  `json:"started_at"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
+	FirstVisibleAt  *time.Time `json:"first_visible_at,omitempty"`
+	Error           *Error     `json:"error,omitempty"`
+	PriceSnapshotID string     `json:"price_snapshot_id,omitempty"`
 }
 
 type Response struct {
@@ -109,6 +110,17 @@ type Response struct {
 	Revision           int64             `json:"revision"`
 }
 
+type Conversation struct {
+	ID               string            `json:"id"`
+	Object           string            `json:"object"`
+	CreatedAt        int64             `json:"created_at"`
+	HomeRegion       string            `json:"home_region"`
+	Items            []Item            `json:"items"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	Revision         int64             `json:"revision"`
+	ActiveResponseID string            `json:"active_response_id,omitempty"`
+}
+
 func (r Response) OutputText() string {
 	var text string
 	for _, item := range r.Output {
@@ -125,11 +137,39 @@ func (r Response) OutputText() string {
 }
 
 type Event struct {
-	Sequence int64     `json:"sequence_number"`
-	Type     string    `json:"type"`
-	Delta    string    `json:"delta,omitempty"`
-	Item     *Item     `json:"item,omitempty"`
-	Usage    *Usage    `json:"usage,omitempty"`
-	Error    *Error    `json:"error,omitempty"`
-	Response *Response `json:"response,omitempty"`
+	Sequence      int64           `json:"sequence_number"`
+	Type          string          `json:"type"`
+	Delta         string          `json:"delta,omitempty"`
+	Item          *Item           `json:"item,omitempty"`
+	Usage         *Usage          `json:"usage,omitempty"`
+	Error         *Error          `json:"error,omitempty"`
+	Response      *Response       `json:"response,omitempty"`
+	ProviderUsage json.RawMessage `json:"-"`
+}
+
+type PriceSnapshot struct {
+	ID                          string `json:"id"`
+	Provider                    string `json:"provider"`
+	Model                       string `json:"model"`
+	Region                      string `json:"region"`
+	Currency                    string `json:"currency"`
+	InputPerMillionMicros       int64  `json:"input_per_million_micros"`
+	CachedInputPerMillionMicros int64  `json:"cached_input_per_million_micros"`
+	OutputPerMillionMicros      int64  `json:"output_per_million_micros"`
+	EffectiveAt                 int64  `json:"effective_at"`
+	Source                      string `json:"source"`
+}
+
+type UsageRecord struct {
+	ID                 string
+	TenantID           string
+	ResponseID         string
+	AttemptID          string
+	PriceSnapshot      PriceSnapshot
+	ProviderUsage      json.RawMessage
+	Usage              Usage
+	AmountMicros       int64
+	Currency           string
+	CacheUsageReliable bool
+	CreatedAt          time.Time
 }

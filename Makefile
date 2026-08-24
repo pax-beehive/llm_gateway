@@ -1,4 +1,4 @@
-.PHONY: build test test-race vet run-dev compose-up compose-down
+.PHONY: build test test-race test-integration vet run-dev compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -10,6 +10,9 @@ test:
 
 test-race:
 	GOCACHE=$(GOCACHE) go test -race ./...
+
+test-integration:
+	GOCACHE=$(GOCACHE) go test -tags=integration ./internal/store ./internal/configuration
 
 vet:
 	GOCACHE=$(GOCACHE) go vet ./...

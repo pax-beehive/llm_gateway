@@ -71,14 +71,31 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	if request.HomeRegion == "" {
 		request.HomeRegion = "local"
 	}
+	if request.ConversationID != "" && request.PreviousResponseID != "" {
+		return core.Response{}, errors.New("conversation and previous_response_id cannot both be set")
+	}
+	responseInput := prepareItems(request.Input)
+	request.Input = responseInput
+	if request.ConversationID != "" {
+		conversationStore, ok := r.store.(store.ConversationStore)
+		if !ok {
+			return core.Response{}, errors.New("configured Response Store does not support Conversations")
+		}
+		conversation, err := conversationStore.GetConversation(ctx, request.TenantID, request.ConversationID)
+		if err != nil {
+			return core.Response{}, fmt.Errorf("conversation: %w", err)
+		}
+		if conversation.HomeRegion != request.HomeRegion {
+			return core.Response{}, errors.New("conversation belongs to a different home region")
+		}
+		request.Input = append(cloneItems(conversation.Items), responseInput...)
+	}
 	if request.PreviousResponseID != "" {
-		previous, err := r.store.Get(ctx, request.TenantID, request.PreviousResponseID)
+		chain, previous, err := r.responseChain(ctx, request.TenantID, request.PreviousResponseID, request.HomeRegion)
 		if err != nil {
 			return core.Response{}, fmt.Errorf("previous response: %w", err)
 		}
-		if previous.HomeRegion != "" && previous.HomeRegion != request.HomeRegion {
-			return core.Response{}, errors.New("previous response belongs to a different home region")
-		}
+		request.Input = append(chain, responseInput...)
 		if len(previous.Attempts) > 0 {
 			request.PreferredRouteID = previous.Attempts[len(previous.Attempts)-1].RouteID
 		}
@@ -87,7 +104,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	response := core.Response{
 		ID: newID("resp"), Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
 		Model: request.Model, PreviousResponseID: request.PreviousResponseID, ConversationID: request.ConversationID,
-		Input: append([]core.Item(nil), request.Input...), Output: []core.Item{}, Metadata: request.Metadata,
+		Input: responseInput, Output: []core.Item{}, Metadata: request.Metadata,
 		HomeRegion: request.HomeRegion, Revision: 1,
 	}
 	if request.IdempotencyKey != "" {
@@ -142,7 +159,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		attemptStart := r.now().UTC()
 		attempt := core.Attempt{
 			ID: newID("attempt"), RouteID: route.ID, Provider: route.Provider, ProviderModel: route.Model,
-			Region: route.Region, StartedAt: attemptStart,
+			Region: route.Region, StartedAt: attemptStart, PriceSnapshotID: route.PriceSnapshot.ID,
 		}
 		response.Attempts = append(response.Attempts, attempt)
 		stream, executeErr := route.Executor.Execute(executionCtx, request)
@@ -154,6 +171,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 
 		visible := false
 		var outputText string
+		var providerUsage []byte
 		for {
 			event, recvErr := r.recv(executionCtx, stream, emitEvent)
 			if recvErr == io.EOF {
@@ -192,10 +210,16 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			}
 			outputText += event.Delta
 			if event.Item != nil {
+				if event.Item.ID == "" {
+					event.Item.ID = newID("item")
+				}
 				response.Output = append(response.Output, *event.Item)
 			}
 			if event.Usage != nil {
 				response.Usage = *event.Usage
+			}
+			if len(event.ProviderUsage) > 0 {
+				providerUsage = append(providerUsage[:0], event.ProviderUsage...)
 			}
 		}
 		_ = stream.Close()
@@ -210,8 +234,30 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		completedUnix := completed.Unix()
 		response.CompletedAt = &completedUnix
 		response.Attempts[len(response.Attempts)-1].CompletedAt = &completed
-		if err := r.store.Update(context.WithoutCancel(executionCtx), request.TenantID, response, response.Revision); err != nil {
-			return core.Response{}, fmt.Errorf("persist completed response: %w", err)
+		if len(providerUsage) == 0 {
+			providerUsage = []byte("{}")
+		}
+		usageRecord := core.UsageRecord{
+			ID: newID("usage"), TenantID: request.TenantID, ResponseID: response.ID,
+			AttemptID: response.Attempts[len(response.Attempts)-1].ID, PriceSnapshot: route.PriceSnapshot,
+			ProviderUsage: providerUsage, Usage: response.Usage,
+			AmountMicros: calculateUsageAmount(response.Usage, route.PriceSnapshot), Currency: route.PriceSnapshot.Currency,
+			CacheUsageReliable: route.CacheUsageReliable, CreatedAt: completed,
+		}
+		financialStore, supportsFinancialCompletion := r.store.(store.FinancialResponseStore)
+		var persistErr error
+		if supportsFinancialCompletion {
+			if err := validatePriceSnapshot(route, usageRecord.PriceSnapshot); err != nil {
+				return core.Response{}, err
+			}
+			persistErr = financialStore.CompleteWithUsage(
+				context.WithoutCancel(executionCtx), request.TenantID, response, response.Revision, usageRecord,
+			)
+		} else {
+			persistErr = r.store.Update(context.WithoutCancel(executionCtx), request.TenantID, response, response.Revision)
+		}
+		if persistErr != nil {
+			return core.Response{}, fmt.Errorf("persist completed response and usage: %w", persistErr)
 		}
 		response.Revision++
 		if !request.Store {
@@ -232,6 +278,80 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		return r.cancelled(context.WithoutCancel(executionCtx), request.TenantID, response)
 	}
 	return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "provider_unavailable", lastErr)
+}
+
+func validatePriceSnapshot(route provider.Route, snapshot core.PriceSnapshot) error {
+	if snapshot.ID == "" || snapshot.Provider != route.Provider || snapshot.Model == "" || snapshot.Region != route.Region ||
+		snapshot.Currency == "" || snapshot.Source == "" || snapshot.InputPerMillionMicros < 0 ||
+		snapshot.CachedInputPerMillionMicros < 0 || snapshot.OutputPerMillionMicros < 0 {
+		return fmt.Errorf("model route %q has an invalid immutable price snapshot", route.ID)
+	}
+	return nil
+}
+
+func calculateUsageAmount(usage core.Usage, snapshot core.PriceSnapshot) int64 {
+	cached := min(max(usage.CachedInputTokens, 0), max(usage.InputTokens, 0))
+	uncached := max(usage.InputTokens-cached, 0)
+	return perMillionCost(uncached, snapshot.InputPerMillionMicros) +
+		perMillionCost(cached, snapshot.CachedInputPerMillionMicros) +
+		perMillionCost(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros)
+}
+
+func perMillionCost(tokens, rate int64) int64 {
+	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
+}
+
+func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeRegion string) ([]core.Item, core.Response, error) {
+	seen := make(map[string]struct{})
+	var reversed []core.Response
+	currentID := responseID
+	for currentID != "" {
+		if len(reversed) >= 256 {
+			return nil, core.Response{}, errors.New("response chain exceeds 256 links")
+		}
+		if _, exists := seen[currentID]; exists {
+			return nil, core.Response{}, errors.New("response chain contains a cycle")
+		}
+		seen[currentID] = struct{}{}
+		response, err := r.store.Get(ctx, tenantID, currentID)
+		if err != nil {
+			return nil, core.Response{}, err
+		}
+		if response.HomeRegion != "" && response.HomeRegion != homeRegion {
+			return nil, core.Response{}, errors.New("response chain crosses home regions")
+		}
+		if response.Status != core.ResponseStatusCompleted {
+			return nil, core.Response{}, errors.New("previous response is not completed")
+		}
+		reversed = append(reversed, response)
+		currentID = response.PreviousResponseID
+	}
+	items := make([]core.Item, 0)
+	for index := len(reversed) - 1; index >= 0; index-- {
+		items = append(items, cloneItems(reversed[index].Input)...)
+		items = append(items, cloneItems(reversed[index].Output)...)
+	}
+	return items, reversed[0], nil
+}
+
+func prepareItems(items []core.Item) []core.Item {
+	prepared := cloneItems(items)
+	for index := range prepared {
+		if prepared[index].ID == "" {
+			prepared[index].ID = newID("item")
+		}
+	}
+	return prepared
+}
+
+func cloneItems(items []core.Item) []core.Item {
+	cloned := make([]core.Item, len(items))
+	for index, item := range items {
+		cloned[index] = item
+		cloned[index].Content = append([]core.Content(nil), item.Content...)
+		cloned[index].Arguments = append([]byte(nil), item.Arguments...)
+	}
+	return cloned
 }
 
 type receiveResult struct {
@@ -281,6 +401,45 @@ func (r *Runtime) Get(ctx context.Context, tenantID, responseID string) (core.Re
 
 func (r *Runtime) InputItems(ctx context.Context, tenantID, responseID string) ([]core.Item, error) {
 	return r.store.ListInputItems(ctx, tenantID, responseID)
+}
+
+func (r *Runtime) CreateConversation(ctx context.Context, tenantID, homeRegion string, items []core.Item, metadata map[string]string) (core.Conversation, error) {
+	conversationStore, ok := r.store.(store.ConversationStore)
+	if !ok {
+		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
+	}
+	conversation := core.Conversation{
+		ID: newID("conv"), Object: "conversation", CreatedAt: r.now().UTC().Unix(), HomeRegion: homeRegion,
+		Items: prepareItems(items), Metadata: metadata, Revision: 1,
+	}
+	if err := conversationStore.CreateConversation(ctx, tenantID, conversation); err != nil {
+		return core.Conversation{}, err
+	}
+	return conversation, nil
+}
+
+func (r *Runtime) GetConversation(ctx context.Context, tenantID, conversationID string) (core.Conversation, error) {
+	conversationStore, ok := r.store.(store.ConversationStore)
+	if !ok {
+		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
+	}
+	return conversationStore.GetConversation(ctx, tenantID, conversationID)
+}
+
+func (r *Runtime) AppendConversationItems(ctx context.Context, tenantID, conversationID string, items []core.Item, expectedRevision int64) (core.Conversation, error) {
+	conversationStore, ok := r.store.(store.ConversationStore)
+	if !ok {
+		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
+	}
+	return conversationStore.AppendConversationItems(ctx, tenantID, conversationID, prepareItems(items), expectedRevision)
+}
+
+func (r *Runtime) DeleteConversation(ctx context.Context, tenantID, conversationID string, expectedRevision int64) error {
+	conversationStore, ok := r.store.(store.ConversationStore)
+	if !ok {
+		return errors.New("configured Response Store does not support Conversations")
+	}
+	return conversationStore.DeleteConversation(ctx, tenantID, conversationID, expectedRevision)
 }
 
 func (r *Runtime) Delete(ctx context.Context, tenantID, responseID string) error {

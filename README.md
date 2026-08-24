@@ -45,6 +45,8 @@ GATEWAY_ROUTES_JSON=[...]
 
 Each route declares its public model, provider model, execution/home region, credential scope, versioned Capability Profile, prices, and secret environment-variable reference. Credentials are read server-side and are never returned by the API.
 
+With PostgreSQL, `model_routes` is loaded from immutable `configuration_history` revisions and projected into an atomic in-process snapshot. Set `GATEWAY_BOOTSTRAP_ROUTES=true` only for the first revision. Later publications require `GATEWAY_PUBLISH_ROUTES=true`, explicit expected/new revisions, and an actor; stale CAS publications fail without replacing the live snapshot.
+
 Example route:
 
 ```json
@@ -66,7 +68,13 @@ Example route:
       "sampling": "native",
       "tools": "translated"
     },
+    "price_snapshot_id": "provider-model-usd-2026-08-24",
+    "price_effective_at": "2026-08-24T00:00:00Z",
+    "price_source": "provider-price-contract-2026-08-24",
+    "currency": "USD",
     "input_cost_per_million": 1.0,
+    "cached_input_cost_per_million": 0.1,
+    "cache_usage_reliable": true,
     "output_cost_per_million": 4.0
   }
 ]
@@ -83,3 +91,9 @@ make vet
 ```
 
 The core migration is embedded in the binary and runs only when `GATEWAY_MIGRATE=true`. Production schema rollout should normally happen as a separate deployment gate.
+
+## Stateful operations
+
+Responses can continue a branch with `previous_response_id`, or use a mutable Conversation with `conversation`; these modes are intentionally mutually exclusive. Conversation create/get/delete and CAS item append are available under `/v1/conversations`. A Response transaction appends its new input while acquiring the Conversation, then appends terminal output and releases it during the same transaction that records final usage.
+
+Every successful execution records the normalized token counts, original provider usage payload, immutable price snapshot, calculated amount, observed cache-discount evidence, and transactional outbox events. Provider cache discounts are not labeled as Cache Protection savings unless separate Protected Hit evidence exists.
