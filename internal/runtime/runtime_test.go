@@ -277,7 +277,7 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(completed) != 1 || completed[0].Status != cacheprotection.IntentSucceeded || adapter.refreshCalls.Load() != 1 {
-		t.Fatalf("cache protection completion = %#v, refresh calls = %d", completed, adapter.refreshCalls.Load())
+		t.Fatalf("cache protection result = %#v, refresh calls = %d", completed, adapter.refreshCalls.Load())
 	}
 }
 

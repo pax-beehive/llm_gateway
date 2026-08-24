@@ -162,7 +162,7 @@ func TestPostgresConversationAndResponseCommitTogether(t *testing.T) {
 	}
 }
 
-func TestPostgresCompletionRecordsVerifiedProtectedHitNetSaving(t *testing.T) {
+func TestPostgresResponseFinalizationRecordsVerifiedProtectedHitNetSaving(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
