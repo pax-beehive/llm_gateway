@@ -149,7 +149,8 @@ func TestPostgresPersistsExperimentallyValidatedSavingFromStableCohorts(t *testi
 			ID: fmt.Sprintf("usage-%d", index), TenantID: tenantID, ResponseID: response.ID,
 			AttemptID: fmt.Sprintf("attempt-%d", index), PriceSnapshot: price,
 			ProviderUsage: []byte(`{}`), Usage: core.Usage{InputTokens: sample.tokens},
-			AmountMicros: sample.tokens, Currency: "USD", HoldoutCohort: sample.cohort, CreatedAt: now,
+			AmountMicros: sample.tokens, Currency: "USD", HoldoutCohort: sample.cohort,
+			ExperimentRevision: "experiment-v1", CreatedAt: now,
 		}
 		if err := responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, usage); err != nil {
 			t.Fatal(err)
@@ -188,6 +189,9 @@ func TestPostgresRetentionExpiryScrubsResponseAndOutboxContent(t *testing.T) {
 	}
 	if err := responseStore.Create(ctx, tenantID, response); err != nil {
 		t.Fatal(err)
+	}
+	if scrubbed, err := responseStore.ScrubExpiredContent(ctx, "local", 10); err != nil || scrubbed != 1 {
+		t.Fatalf("retention scrub count/error = %d / %v", scrubbed, err)
 	}
 	got, err := responseStore.Get(ctx, tenantID, response.ID)
 	if err != nil {

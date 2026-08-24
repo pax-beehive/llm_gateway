@@ -159,6 +159,7 @@ func run() error {
 		TenantPolicies: tenantPolicies,
 	})
 	go runCacheWorker(ctx, cacheCoordinator, router)
+	go runRetentionWorker(ctx, responseStore, localRegion)
 	handler := httpapi.New(httpapi.Config{
 		Runtime: engine, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
 		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
@@ -416,6 +417,38 @@ func runCacheWorker(ctx context.Context, coordinator *cacheprotection.Coordinato
 			if err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("cache protection worker iteration failed", "error", err)
 			}
+		}
+	}
+}
+
+func runRetentionWorker(ctx context.Context, responseStore store.ResponseStore, localRegion string) {
+	retentionStore, ok := responseStore.(store.RetentionStore)
+	if !ok {
+		return
+	}
+	run := func() {
+		for {
+			scrubbed, err := retentionStore.ScrubExpiredContent(ctx, localRegion, 256)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Error("retention scrub failed", "error", err)
+				}
+				return
+			}
+			if scrubbed < 256 {
+				return
+			}
+		}
+	}
+	run()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
 		}
 	}
 }

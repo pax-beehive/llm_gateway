@@ -141,7 +141,8 @@ func (p *CacheProtector) Refresh(ctx context.Context, anchor provider.CacheAncho
 	}
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	return provider.RefreshResult{
-		Status: "succeeded", Usage: usage, ProviderUsage: responseBody, ExpiresAt: time.Now().UTC().Add(p.ttl),
+		Status: "succeeded", Usage: usage, UsageReliable: usage.InputTokens > 0,
+		ProviderUsage: responseBody, ExpiresAt: time.Now().UTC().Add(p.ttl),
 	}, nil
 }
 

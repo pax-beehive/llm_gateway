@@ -41,6 +41,8 @@ type Runtime struct {
 	cacheProtectionMode string
 	cacheHoldoutPercent int
 	tenantPolicies      map[string]core.TenantPolicy
+	quotaLeaseTTL       time.Duration
+	quotaRenewInterval  time.Duration
 
 	mu       sync.Mutex
 	cancels  map[string]context.CancelFunc
@@ -55,6 +57,8 @@ type Options struct {
 	CacheProtectionMode string
 	CacheHoldoutPercent int
 	TenantPolicies      map[string]core.TenantPolicy
+	QuotaLeaseTTL       time.Duration
+	QuotaRenewInterval  time.Duration
 }
 
 const (
@@ -83,6 +87,12 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 	if options.CacheHoldoutPercent < 0 || options.CacheHoldoutPercent > 100 {
 		options.CacheHoldoutPercent = 100
 	}
+	if options.QuotaLeaseTTL <= 0 {
+		options.QuotaLeaseTTL = 5 * time.Minute
+	}
+	if options.QuotaRenewInterval <= 0 || options.QuotaRenewInterval >= options.QuotaLeaseTTL {
+		options.QuotaRenewInterval = min(options.QuotaLeaseTTL/3, time.Minute)
+	}
 	meter := otel.Meter("github.com/toddzheng/llm-gateway/runtime")
 	responses, _ := meter.Int64Counter("gateway.responses")
 	providerAttempts, _ := meter.Int64Counter("gateway.provider.attempts")
@@ -99,6 +109,7 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 		cacheOutcomes: cacheOutcomes, providerDuration: providerDuration,
 		cacheProtectionMode: options.CacheProtectionMode, cacheHoldoutPercent: options.CacheHoldoutPercent,
 		tenantPolicies: cloneTenantPolicies(options.TenantPolicies),
+		quotaLeaseTTL:  options.QuotaLeaseTTL, quotaRenewInterval: options.QuotaRenewInterval,
 	}
 }
 
@@ -123,11 +134,12 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	if request.TenantID == "" || request.Model == "" {
 		return core.Response{}, errors.New("tenant and model are required")
 	}
-	release, err := r.admit(ctx, request)
+	admittedCtx, release, err := r.admit(ctx, request)
 	if err != nil {
 		return core.Response{}, err
 	}
 	defer release()
+	ctx = admittedCtx
 	if request.CompatibilityMode == "" {
 		request.CompatibilityMode = core.CompatibilityStrict
 	}
@@ -366,7 +378,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			ProviderUsage: providerUsage, Usage: response.Usage,
 			AmountMicros: calculateUsageAmount(response.Usage, route.PriceSnapshot), Currency: route.PriceSnapshot.Currency,
 			CacheUsageReliable: route.CacheUsageReliable, CreatedAt: completed,
-			HoldoutCohort: r.experimentCohort(request, route),
+			HoldoutCohort: r.experimentCohort(request, route), ExperimentRevision: r.experimentRevision(route),
 		}
 		if protectedHit != nil && route.CacheUsageReliable && response.Usage.CachedInputTokens > 0 {
 			usageRecord.ProtectedHit = protectedHit
@@ -418,51 +430,57 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "provider_unavailable", lastErr)
 }
 
-func (r *Runtime) admit(ctx context.Context, request core.Request) (func(), error) {
+func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Context, func(), error) {
 	policy, configured := r.tenantPolicies[request.TenantID]
 	if configured {
 		if policy.MaxInputItems > 0 && len(request.Input) > policy.MaxInputItems {
-			return nil, fmt.Errorf("tenant input-item quota exceeded: maximum is %d", policy.MaxInputItems)
+			return nil, nil, fmt.Errorf("tenant input-item quota exceeded: maximum is %d", policy.MaxInputItems)
 		}
 		if request.Store && policy.AllowStoredResponses != nil && !*policy.AllowStoredResponses {
-			return nil, errors.New("tenant policy forbids stored Responses")
+			return nil, nil, errors.New("tenant policy forbids stored Responses")
 		}
 		if request.CacheProtection != nil && request.CacheProtection.Enabled {
 			if policy.AllowCacheProtection != nil && !*policy.AllowCacheProtection {
-				return nil, errors.New("tenant policy forbids Cache Protection")
+				return nil, nil, errors.New("tenant policy forbids Cache Protection")
 			}
 			if request.CacheProtection.AllowContentInspection &&
 				(policy.AllowContentInspection == nil || !*policy.AllowContentInspection) {
-				return nil, errors.New("tenant policy forbids Cache Protection content inspection")
+				return nil, nil, errors.New("tenant policy forbids Cache Protection content inspection")
 			}
 		}
 	}
 	if !configured || policy.MaxConcurrentResponses <= 0 {
-		return func() {}, nil
+		return ctx, func() {}, nil
 	}
 	if global, ok := r.store.(store.GlobalQuotaStore); ok {
 		leaseID := newID("quota")
-		const leaseTTL = 5 * time.Minute
-		if err := global.AcquireResponseSlot(ctx, request.TenantID, leaseID, policy.MaxConcurrentResponses, r.now().UTC().Add(leaseTTL)); err != nil {
-			return nil, err
+		if err := global.AcquireResponseSlot(ctx, request.TenantID, leaseID, policy.MaxConcurrentResponses, r.now().UTC().Add(r.quotaLeaseTTL)); err != nil {
+			return nil, nil, err
 		}
-		renewCtx, stopRenewal := context.WithCancel(context.Background())
+		leaseCtx, cancelLease := context.WithCancel(ctx)
 		go func() {
-			ticker := time.NewTicker(time.Minute)
+			ticker := time.NewTicker(r.quotaRenewInterval)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-renewCtx.Done():
+				case <-leaseCtx.Done():
 					return
 				case <-ticker.C:
 					renewalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					_ = global.RenewResponseSlot(renewalCtx, request.TenantID, leaseID, r.now().UTC().Add(leaseTTL))
+					renewErr := global.RenewResponseSlot(renewalCtx, request.TenantID, leaseID, r.now().UTC().Add(r.quotaLeaseTTL))
 					cancel()
+					if renewErr != nil {
+						if r.cacheError != nil {
+							r.cacheError(fmt.Errorf("renew global Response quota lease: %w", renewErr))
+						}
+						cancelLease()
+						return
+					}
 				}
 			}
 		}()
-		return func() {
-			stopRenewal()
+		return leaseCtx, func() {
+			cancelLease()
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = global.ReleaseResponseSlot(releaseCtx, request.TenantID, leaseID)
@@ -471,10 +489,10 @@ func (r *Runtime) admit(ctx context.Context, request core.Request) (func(), erro
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.inflight[request.TenantID] >= policy.MaxConcurrentResponses {
-		return nil, ErrQuotaExceeded
+		return nil, nil, ErrQuotaExceeded
 	}
 	r.inflight[request.TenantID]++
-	return func() {
+	return ctx, func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.inflight[request.TenantID] <= 1 {
@@ -617,6 +635,7 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 		},
 		RefreshPriceSnapshot: route.PriceSnapshot,
 		HoldoutCohort:        holdoutCohort,
+		ExperimentRevision:   r.experimentRevision(route),
 	}
 	intent, err := r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
 	status := string(intent.Status)
@@ -650,6 +669,13 @@ func (r *Runtime) experimentCohort(request core.Request, route provider.Route) s
 		return "holdout"
 	}
 	return "treatment"
+}
+
+func (r *Runtime) experimentRevision(route provider.Route) string {
+	if r.cacheProtectionMode != CacheProtectionAnthropicCanaryMode {
+		return ""
+	}
+	return fmt.Sprintf("%s:v1:holdout-%d:capability-%d", r.cacheProtectionMode, r.cacheHoldoutPercent, route.Profile.Revision)
 }
 
 func stableCohortBucket(identity string) int {

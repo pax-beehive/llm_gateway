@@ -144,6 +144,7 @@ type Response struct {
 	Revision           int64             `json:"revision"`
 	RetainContent      bool              `json:"-"`
 	ContentExpiresAt   *int64            `json:"content_expires_at,omitempty"`
+	ContentExpiredAt   *int64            `json:"content_expired_at,omitempty"`
 }
 
 type Conversation struct {
@@ -210,6 +211,7 @@ type UsageRecord struct {
 	Currency           string
 	CacheUsageReliable bool
 	HoldoutCohort      string
+	ExperimentRevision string
 	ProtectedHit       *ProtectedHitEvidence
 	CreatedAt          time.Time
 }

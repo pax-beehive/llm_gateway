@@ -29,4 +29,8 @@ func TestMemoryStoreScrubsResponseContentAfterRetentionExpiry(t *testing.T) {
 	if len(got.Input) != 0 || len(got.Output) != 0 || len(got.Metadata) != 0 || got.Revision != 2 {
 		t.Fatalf("expired Response retained content: %#v", got)
 	}
+	again, err := responseStore.Get(context.Background(), "tenant-a", response.ID)
+	if err != nil || again.Revision != 2 || again.ContentExpiresAt != nil || again.ContentExpiredAt == nil {
+		t.Fatalf("retention scrub repeated or lost evidence: %#v / %v", again, err)
+	}
 }

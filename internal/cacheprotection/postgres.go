@@ -116,6 +116,7 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		return Intent{}, fmt.Errorf("invalid cache intent transition %s -> %s", intent.Status, status)
 	}
 	providerResult, _ := json.Marshal(intent.ProviderResult)
+	candidate, _ := json.Marshal(intent.Candidate)
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Intent{}, err
@@ -123,11 +124,11 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE cache_refresh_intents
-		SET status = $6, provider_result = $7, error = NULLIF($8,''), updated_at = now()
+		SET status = $6, provider_result = $7, error = NULLIF($8,''), candidate = $10, updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND cache_lease_id = $3
 		  AND cache_lease_revision = $4 AND fencing_token = $5 AND status = $9`,
 		intent.TenantID, intent.ID, intent.CacheLeaseID, intent.CacheLeaseRevision,
-		intent.FencingToken, status, providerResult, intent.Error, intent.Status,
+		intent.FencingToken, status, providerResult, intent.Error, intent.Status, candidate,
 	)
 	if err != nil {
 		return Intent{}, err
@@ -155,12 +156,12 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 			INSERT INTO cache_refresh_usage_ledger (
 				id, tenant_id, cache_refresh_intent_id, cache_lease_id, price_snapshot_id,
 				provider_usage, input_tokens, cached_input_tokens, cache_write_input_tokens,
-				output_tokens, amount, currency, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+				output_tokens, amount, currency, usage_reliable, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 			usageID, intent.TenantID, intent.ID, intent.CacheLeaseID,
 			intent.Candidate.RefreshPriceSnapshot.ID, providerUsage, usage.InputTokens,
 			usage.CachedInputTokens, usage.CacheWriteInputTokens, usage.OutputTokens,
-			refreshCost, intent.Candidate.RefreshPriceSnapshot.Currency, intent.UpdatedAt,
+			refreshCost, intent.Candidate.RefreshPriceSnapshot.Currency, intent.ProviderResult.UsageReliable, intent.UpdatedAt,
 		); err != nil {
 			return Intent{}, fmt.Errorf("insert immutable refresh usage: %w", err)
 		}

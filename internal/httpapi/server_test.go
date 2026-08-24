@@ -88,7 +88,7 @@ func TestStatefulWriteIsForwardedToTenantHomeRegion(t *testing.T) {
 	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
 		"model": "echo-v1", "input": "home region",
 	})
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"forwarded":true`) {
+	if response.Code != http.StatusOK || !response.Flushed || !strings.Contains(response.Body.String(), `"forwarded":true`) {
 		t.Fatalf("status/body = %d / %s", response.Code, response.Body.String())
 	}
 	request := <-forwarded

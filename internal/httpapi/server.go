@@ -130,7 +130,22 @@ func (s *Server) forwardToHomeRegion(responseWriter http.ResponseWriter, request
 		}
 	}
 	responseWriter.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(responseWriter, response.Body)
+	destination := io.Writer(responseWriter)
+	if flusher, ok := responseWriter.(http.Flusher); ok {
+		destination = flushingWriter{writer: responseWriter, flusher: flusher}
+	}
+	_, _ = io.Copy(destination, response.Body)
+}
+
+type flushingWriter struct {
+	writer  io.Writer
+	flusher http.Flusher
+}
+
+func (writer flushingWriter) Write(payload []byte) (int, error) {
+	written, err := writer.writer.Write(payload)
+	writer.flusher.Flush()
+	return written, err
 }
 
 type createResponseRequest struct {

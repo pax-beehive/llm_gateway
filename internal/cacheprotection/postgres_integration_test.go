@@ -44,6 +44,7 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	candidate.Lease.EstimatedExpiresAt = now.Add(5 * time.Minute)
 	candidate.Forecast.ExpectedAt = now.Add(30 * time.Minute)
 	candidate.HoldoutCohort = "treatment"
+	candidate.ExperimentRevision = "experiment-v1"
 	t.Cleanup(func() {
 		_, _ = db.Exec(`DELETE FROM transactional_outbox WHERE tenant_id = $1`, tenantID)
 		_, _ = db.Exec(`DELETE FROM cache_refresh_usage_ledger WHERE tenant_id = $1`, tenantID)
@@ -61,11 +62,17 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 			refreshCalls.Add(1)
 			return provider.RefreshResult{
 				Status: "succeeded", ExpiresAt: now.Add(10 * time.Minute),
-				Usage:         core.Usage{InputTokens: 100_000, CacheWriteInputTokens: 100_000},
+				Usage: core.Usage{InputTokens: 100_000, CacheWriteInputTokens: 100_000}, UsageReliable: true,
 				ProviderUsage: []byte(`{"cache_creation_input_tokens":100000}`),
 			}, nil
 		},
 	}
+	candidate.Policy.ShadowMode = true
+	shadow, err := planner.Run(ctx, candidate, protector)
+	if err != nil || shadow.Status != cacheprotection.IntentShadow {
+		t.Fatalf("shadow intent = %#v, error = %v", shadow, err)
+	}
+	candidate.Policy.ShadowMode = false
 	planned, err := planner.Run(ctx, candidate, protector)
 	if err != nil {
 		t.Fatal(err)
@@ -97,14 +104,15 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	}
 	var refreshAmount int64
 	var refreshProviderUsage []byte
+	var refreshUsageReliable bool
 	if err := db.QueryRowContext(ctx, `
-		SELECT amount::bigint, provider_usage
+		SELECT amount::bigint, provider_usage, usage_reliable
 		FROM cache_refresh_usage_ledger
 		WHERE tenant_id = $1 AND cache_refresh_intent_id = $2`, tenantID, completed[0].ID,
-	).Scan(&refreshAmount, &refreshProviderUsage); err != nil {
+	).Scan(&refreshAmount, &refreshProviderUsage, &refreshUsageReliable); err != nil {
 		t.Fatal(err)
 	}
-	if refreshAmount != 1_250_000 || string(refreshProviderUsage) != `{"cache_creation_input_tokens": 100000}` {
+	if refreshAmount != 1_250_000 || !refreshUsageReliable || string(refreshProviderUsage) != `{"cache_creation_input_tokens": 100000}` {
 		t.Fatalf("refresh financial evidence = %d / %s", refreshAmount, refreshProviderUsage)
 	}
 	requestObserver := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(6 * time.Minute) })

@@ -42,6 +42,7 @@ type CacheCapability struct {
 type RefreshResult struct {
 	Status        string
 	Usage         core.Usage
+	UsageReliable bool
 	ProviderUsage json.RawMessage
 	ExpiresAt     time.Time
 }

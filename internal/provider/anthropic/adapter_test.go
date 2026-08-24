@@ -62,7 +62,7 @@ func TestAdapterSharesExactSerializationAcrossStreamingAndCacheRefresh(t *testin
 		t.Fatalf("refresh recipe rejected: %s", capability.Reason)
 	}
 	result, err := adapter.Refresh(context.Background(), observation.Anchor)
-	if err != nil || result.Status != "succeeded" || !result.ExpiresAt.After(time.Now()) || result.Usage.InputTokens != 100 {
+	if err != nil || result.Status != "succeeded" || !result.UsageReliable || !result.ExpiresAt.After(time.Now()) || result.Usage.InputTokens != 100 {
 		t.Fatalf("refresh = %#v, err = %v", result, err)
 	}
 

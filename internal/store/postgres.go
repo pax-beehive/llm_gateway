@@ -40,6 +40,9 @@ var refreshFinancialEvidenceMigration string
 //go:embed migrations/000009_global_quota.sql
 var globalQuotaMigration string
 
+//go:embed migrations/000010_experiment_evidence.sql
+var experimentEvidenceMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -75,6 +78,9 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, globalQuotaMigration); err != nil {
 		return fmt.Errorf("migrate global quota leases: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, experimentEvidenceMigration); err != nil {
+		return fmt.Errorf("migrate experiment evidence: %w", err)
 	}
 	return nil
 }
@@ -268,6 +274,10 @@ func (s *PostgresResponseStore) CreateIdempotent(ctx context.Context, tenantID s
 }
 
 func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID string) (core.Response, error) {
+	return s.getResponse(ctx, tenantID, responseID, false, "")
+}
+
+func (s *PostgresResponseStore) getResponse(ctx context.Context, tenantID, responseID string, scrubExpired bool, scrubRegion string) (core.Response, error) {
 	var payload []byte
 	var retainContent bool
 	err := s.db.QueryRowContext(ctx, `
@@ -284,7 +294,7 @@ func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID st
 		return core.Response{}, fmt.Errorf("decode response: %w", err)
 	}
 	response.RetainContent = retainContent
-	if isTerminal(response.Status) && response.ContentExpiresAt != nil && time.Now().Unix() >= *response.ContentExpiresAt {
+	if scrubExpired && isTerminal(response.Status) && response.ContentExpiresAt != nil && time.Now().Unix() >= *response.ContentExpiresAt {
 		redacted := redactResponseContent(response)
 		redacted.Revision = response.Revision + 1
 		redactedPayload, err := json.Marshal(redacted)
@@ -299,8 +309,8 @@ func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID st
 		result, err := tx.ExecContext(ctx, `
 			UPDATE responses SET revision = $4, payload = $5, updated_at = now()
 			WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
-			  AND execution_epoch = (SELECT execution_epoch FROM tenants WHERE id = $1)`,
-			tenantID, responseID, response.Revision, redacted.Revision, redactedPayload)
+			  AND EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND home_region = $6)`,
+			tenantID, responseID, response.Revision, redacted.Revision, redactedPayload, scrubRegion)
 		if err != nil {
 			return core.Response{}, err
 		}
@@ -346,10 +356,55 @@ func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID st
 			response = redacted
 		} else {
 			_ = tx.Rollback()
-			return s.Get(ctx, tenantID, responseID)
+			return core.Response{}, ErrConflict
 		}
 	}
 	return response, nil
+}
+
+func (s *PostgresResponseStore) ScrubExpiredContent(ctx context.Context, homeRegion string, limit int) (int, error) {
+	if homeRegion == "" || limit <= 0 {
+		return 0, errors.New("retention scrub requires a Home Region and positive limit")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.tenant_id, r.id
+		FROM responses r
+		JOIN tenants t ON t.id = r.tenant_id AND t.home_region = $1
+		WHERE r.deleted_at IS NULL
+		  AND r.status IN ('completed', 'failed', 'cancelled')
+		  AND r.payload ? 'content_expires_at'
+		  AND (r.payload->>'content_expires_at')::bigint <= extract(epoch FROM now())::bigint
+		ORDER BY r.updated_at, r.tenant_id, r.id
+		LIMIT $2`, homeRegion, limit)
+	if err != nil {
+		return 0, err
+	}
+	var identities [][2]string
+	for rows.Next() {
+		var identity [2]string
+		if err := rows.Scan(&identity[0], &identity[1]); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		identities = append(identities, identity)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	scrubbed := 0
+	for _, identity := range identities {
+		if _, err := s.getResponse(ctx, identity[0], identity[1], true, homeRegion); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return scrubbed, err
+		}
+		scrubbed++
+	}
+	return scrubbed, nil
 }
 
 func (s *PostgresResponseStore) Update(ctx context.Context, tenantID string, response core.Response, expectedRevision int64) error {
@@ -459,10 +514,10 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO savings_ledger (
 			id, tenant_id, response_id, measure, attribution, price_snapshot_id, provider_usage,
-			gross_saving, net_saving, currency, holdout_cohort, created_at
-		) VALUES ($1, $2, $3, 'observed_discount', $4, $5, $6, $7, $7, $8, NULLIF($9,''), $10)`,
+			gross_saving, net_saving, currency, holdout_cohort, experiment_revision, created_at
+		) VALUES ($1, $2, $3, 'observed_discount', $4, $5, $6, $7, $7, $8, NULLIF($9,''), NULLIF($10,''), $11)`,
 		usage.ID+"_observed", tenantID, response.ID, attribution, usage.PriceSnapshot.ID,
-		providerUsage, grossSaving, usage.Currency, usage.HoldoutCohort, usage.CreatedAt,
+		providerUsage, grossSaving, usage.Currency, usage.HoldoutCohort, usage.ExperimentRevision, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert observed savings evidence: %w", err)
 	}
@@ -501,7 +556,7 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 }
 
 func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, responseID string, usage core.UsageRecord, providerUsage json.RawMessage) error {
-	if usage.HoldoutCohort != "treatment" && usage.HoldoutCohort != "holdout" {
+	if (usage.HoldoutCohort != "treatment" && usage.HoldoutCohort != "holdout") || usage.ExperimentRevision == "" {
 		return nil
 	}
 	rows, err := tx.QueryContext(ctx, `
@@ -509,8 +564,9 @@ func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, respons
 		FROM savings_ledger s
 		JOIN usage_ledger u ON u.tenant_id = s.tenant_id AND u.response_id = s.response_id
 		WHERE s.tenant_id = $1 AND s.measure = 'observed_discount'
-		  AND s.price_snapshot_id = $2 AND s.holdout_cohort IN ('treatment', 'holdout')
-		GROUP BY s.holdout_cohort`, tenantID, usage.PriceSnapshot.ID)
+		  AND s.price_snapshot_id = $2 AND s.experiment_revision = $3
+		  AND s.holdout_cohort IN ('treatment', 'holdout')
+		GROUP BY s.holdout_cohort`, tenantID, usage.PriceSnapshot.ID, usage.ExperimentRevision)
 	if err != nil {
 		return err
 	}
@@ -535,25 +591,32 @@ func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, respons
 	if treatment.responses == 0 || holdout.responses == 0 {
 		return nil
 	}
-	var refreshCost int64
+	var refreshCost, unreliableRefreshes int64
 	if err := tx.QueryRowContext(ctx, `
-		SELECT COALESCE(sum(r.amount), 0)::bigint
+		SELECT COALESCE(sum(r.amount), 0)::bigint,
+		       count(*) FILTER (WHERE NOT r.usage_reliable)
 		FROM cache_refresh_usage_ledger r
 		JOIN cache_refresh_intents i
 		  ON i.tenant_id = r.tenant_id AND i.id = r.cache_refresh_intent_id
 		WHERE r.tenant_id = $1 AND r.price_snapshot_id = $2
-		  AND i.candidate->>'HoldoutCohort' = 'treatment'`, tenantID, usage.PriceSnapshot.ID).Scan(&refreshCost); err != nil {
+		  AND i.candidate->>'HoldoutCohort' = 'treatment'
+		  AND i.candidate->>'ExperimentRevision' = $3`, tenantID, usage.PriceSnapshot.ID, usage.ExperimentRevision).Scan(
+		&refreshCost, &unreliableRefreshes,
+	); err != nil {
 		return err
+	}
+	if unreliableRefreshes > 0 {
+		return nil
 	}
 	treatment.cost += refreshCost
 	saving := (holdout.cost/holdout.responses - treatment.cost/treatment.responses) * treatment.responses
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO savings_ledger (
 			id, tenant_id, response_id, measure, attribution, price_snapshot_id, provider_usage,
-			gross_saving, net_saving, currency, holdout_cohort, created_at
-		) VALUES ($1,$2,$3,'experimentally_validated_saving','experiment',$4,$5,$6,$6,$7,'treatment_vs_holdout',$8)`,
+			gross_saving, net_saving, currency, holdout_cohort, experiment_revision, created_at
+		) VALUES ($1,$2,$3,'experimentally_validated_saving','experiment',$4,$5,$6,$6,$7,'treatment_vs_holdout',$8,$9)`,
 		usage.ID+"_experiment", tenantID, responseID, usage.PriceSnapshot.ID, providerUsage,
-		saving, usage.Currency, usage.CreatedAt,
+		saving, usage.Currency, usage.ExperimentRevision, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert experiment savings evidence: %w", err)
 	}

@@ -166,6 +166,29 @@ func TestTenantPolicyEnforcesConcurrentResponseQuota(t *testing.T) {
 	}
 }
 
+func TestLostGlobalQuotaLeaseCancelsProviderExecution(t *testing.T) {
+	t.Parallel()
+	stream := newBlockingStream()
+	responseStore := &failingRenewalStore{MemoryResponseStore: store.NewMemoryResponseStore(), renewed: make(chan struct{})}
+	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(testRoute("quota-renewal", executorFunc(
+		func(context.Context, core.Request) (provider.EventStream, error) { return stream, nil },
+	))), gatewayruntime.Options{
+		ProviderIdleTimeout: time.Second, QuotaLeaseTTL: 30 * time.Millisecond, QuotaRenewInterval: 5 * time.Millisecond,
+		TenantPolicies: map[string]core.TenantPolicy{"tenant-a": {MaxConcurrentResponses: 1}},
+	})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	})
+	if err == nil {
+		t.Fatal("execution continued after global quota lease renewal failed")
+	}
+	select {
+	case <-responseStore.renewed:
+	default:
+		t.Fatal("global quota lease was never renewed")
+	}
+}
+
 func TestTenantPolicyRejectsDisallowedCacheContentInspection(t *testing.T) {
 	t.Parallel()
 	allowCache := true
@@ -400,6 +423,25 @@ type cacheAdapterStub struct {
 	observation   provider.CacheObservation
 	refreshResult provider.RefreshResult
 	refreshCalls  atomic.Int64
+}
+
+type failingRenewalStore struct {
+	*store.MemoryResponseStore
+	renewed chan struct{}
+	once    sync.Once
+}
+
+func (s *failingRenewalStore) AcquireResponseSlot(context.Context, string, string, int, time.Time) error {
+	return nil
+}
+
+func (s *failingRenewalStore) RenewResponseSlot(context.Context, string, string, time.Time) error {
+	s.once.Do(func() { close(s.renewed) })
+	return errors.New("quota database unavailable")
+}
+
+func (s *failingRenewalStore) ReleaseResponseSlot(context.Context, string, string) error {
+	return nil
 }
 
 func (s *cacheAdapterStub) Inspect(context.Context, provider.CacheAnchor) provider.CacheCapability {

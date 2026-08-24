@@ -52,6 +52,7 @@ type Candidate struct {
 	Economics            Economics
 	RefreshPriceSnapshot core.PriceSnapshot
 	HoldoutCohort        string
+	ExperimentRevision   string
 }
 
 type Decision struct {

@@ -46,6 +46,10 @@ type GlobalQuotaStore interface {
 	ReleaseResponseSlot(context.Context, string, string) error
 }
 
+type RetentionStore interface {
+	ScrubExpiredContent(context.Context, string, int) (int, error)
+}
+
 type idempotencyRecord struct {
 	requestHash []byte
 	responseID  string
@@ -287,9 +291,12 @@ func cloneResponse(response core.Response) core.Response {
 }
 
 func redactResponseContent(response core.Response) core.Response {
+	expiredAt := time.Now().UTC().Unix()
 	response.Input = nil
 	response.Output = nil
 	response.Metadata = nil
+	response.ContentExpiresAt = nil
+	response.ContentExpiredAt = &expiredAt
 	if response.Error != nil {
 		response.Error = &core.Error{Code: response.Error.Code, Type: response.Error.Type, Param: response.Error.Param, Message: "redacted after retention expiry"}
 	}
