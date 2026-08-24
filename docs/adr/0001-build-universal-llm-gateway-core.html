@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ADR 0001 · Universal LLM Gateway Core</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --paper: #fffdf8;
+      --ink: #18211d;
+      --muted: #65706a;
+      --line: #d9d8cf;
+      --accent: #0c725d;
+      --accent-2: #d4623b;
+      --accent-soft: #dcefe9;
+      --warn-soft: #f8e9d2;
+      --code: #17231f;
+      --code-ink: #e7f3ed;
+      --shadow: 0 16px 48px rgba(31, 45, 38, .09);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111714;
+        --paper: #18201c;
+        --ink: #ebf0ed;
+        --muted: #a9b4ae;
+        --line: #34413a;
+        --accent: #62c7aa;
+        --accent-2: #ef8a65;
+        --accent-soft: #203d34;
+        --warn-soft: #483929;
+        --code: #0d1310;
+        --code-ink: #dcece4;
+        --shadow: 0 16px 48px rgba(0, 0, 0, .24);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 4% 2%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 28rem),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+    }
+
+    a { color: var(--accent); text-underline-offset: 3px; }
+    a:hover { text-decoration-thickness: 2px; }
+
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(220px, 280px) minmax(0, 920px);
+      gap: 44px;
+      width: min(1280px, calc(100% - 48px));
+      margin: 0 auto;
+      padding: 36px 0 80px;
+    }
+
+    nav {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--paper) 88%, transparent);
+      backdrop-filter: blur(16px);
+    }
+
+    nav .eyebrow { margin-bottom: 12px; }
+    nav strong { display: block; margin-bottom: 14px; font-size: 15px; }
+    nav a {
+      display: block;
+      padding: 7px 10px;
+      color: var(--muted);
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 14px;
+    }
+    nav a:hover { color: var(--ink); background: var(--accent-soft); }
+
+    main {
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    header, section { padding: 44px 56px; }
+    section { border-top: 1px solid var(--line); }
+
+    header {
+      position: relative;
+      overflow: hidden;
+      padding-top: 60px;
+      padding-bottom: 54px;
+    }
+
+    header::after {
+      content: "";
+      position: absolute;
+      width: 330px;
+      height: 330px;
+      right: -165px;
+      top: -155px;
+      border: 52px solid color-mix(in srgb, var(--accent) 12%, transparent);
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.22; letter-spacing: -.025em; }
+    h1 { max-width: 760px; margin: 12px 0 22px; font-size: clamp(38px, 6vw, 68px); }
+    h2 { margin: 0 0 22px; font-size: 30px; }
+    h3 { margin: 28px 0 10px; font-size: 20px; }
+    p { margin: 0 0 16px; }
+
+    .lede {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.65;
+    }
+
+    .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: color-mix(in srgb, var(--paper) 70%, transparent);
+      font-size: 13px;
+      font-weight: 650;
+    }
+    .pill.status { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 35%, var(--line)); }
+
+    .callout {
+      margin: 24px 0 0;
+      padding: 20px 22px;
+      border-left: 4px solid var(--accent);
+      border-radius: 4px 14px 14px 4px;
+      background: var(--accent-soft);
+      font-size: 17px;
+    }
+
+    .grid { display: grid; gap: 16px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .card {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: color-mix(in srgb, var(--paper) 92%, var(--accent-soft));
+    }
+    .card h3 { margin-top: 0; }
+    .card p:last-child { margin-bottom: 0; }
+    .card .num {
+      display: inline-grid;
+      place-items: center;
+      width: 31px;
+      height: 31px;
+      margin-bottom: 13px;
+      border-radius: 9px;
+      color: var(--paper);
+      background: var(--accent);
+      font-weight: 800;
+    }
+
+    .architecture {
+      display: grid;
+      gap: 12px;
+      margin-top: 24px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--bg) 60%, var(--paper));
+    }
+
+    .arch-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .arch-row.single { grid-template-columns: 1fr; }
+    .arch-box {
+      position: relative;
+      padding: 13px 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+      border-radius: 12px;
+      text-align: center;
+      background: var(--paper);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .arch-box.primary { color: var(--paper); background: var(--accent); }
+    .arrow { color: var(--muted); text-align: center; line-height: 1; }
+
+    pre, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { font-size: .9em; }
+    pre {
+      overflow: auto;
+      margin: 18px 0;
+      padding: 20px;
+      border-radius: 14px;
+      color: var(--code-ink);
+      background: var(--code);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    table {
+      width: 100%;
+      margin: 20px 0;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td { padding: 13px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+
+    ul, ol { padding-left: 22px; }
+    li { margin: 7px 0; }
+
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border-radius: 6px;
+      color: var(--accent);
+      background: var(--accent-soft);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .formula {
+      padding: 24px;
+      border: 1px solid color-mix(in srgb, var(--accent-2) 35%, var(--line));
+      border-radius: 16px;
+      background: var(--warn-soft);
+    }
+    .formula strong { display: block; margin-bottom: 8px; color: var(--accent-2); }
+
+    .timeline { counter-reset: phase; display: grid; gap: 13px; padding: 0; list-style: none; }
+    .timeline li {
+      counter-increment: phase;
+      position: relative;
+      margin: 0;
+      padding: 16px 18px 16px 58px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+    }
+    .timeline li::before {
+      content: counter(phase);
+      position: absolute;
+      left: 16px;
+      top: 15px;
+      display: grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      color: var(--paper);
+      background: var(--accent);
+      font-weight: 800;
+      font-size: 13px;
+    }
+
+    .footer-note { color: var(--muted); font-size: 13px; }
+
+    @media (max-width: 900px) {
+      .shell { display: block; width: min(100% - 24px, 920px); padding-top: 12px; }
+      nav { position: static; max-height: none; margin-bottom: 12px; padding: 14px; }
+      nav strong, nav .eyebrow { display: none; }
+      nav a { display: inline-block; padding: 5px 8px; }
+      main { border-radius: 20px; }
+      header, section { padding: 34px 26px; }
+      .grid.two, .grid.three, .arch-row { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+
+    @media print {
+      :root { --bg: white; --paper: white; --ink: black; --muted: #444; --line: #bbb; }
+      body { background: white; font-size: 11pt; }
+      .shell { display: block; width: 100%; padding: 0; }
+      nav { display: none; }
+      main { border: 0; box-shadow: none; }
+      header, section { padding: 24px 0; break-inside: avoid; }
+      a { color: black; }
+      .card, .formula, .architecture { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <nav aria-label="文档导航">
+      <div class="eyebrow">ADR 0001</div>
+      <strong>Universal LLM Gateway</strong>
+      <a href="#summary">决策摘要</a>
+      <a href="#architecture">总体架构</a>
+      <a href="#state">Responses 状态</a>
+      <a href="#streaming">Streaming</a>
+      <a href="#cache">缓存模型</a>
+      <a href="#protection">Cache Protection</a>
+      <a href="#accounting">节省归因</a>
+      <a href="#technology">技术选型</a>
+      <a href="#reuse">开源复用</a>
+      <a href="#highlights">功能亮点</a>
+      <a href="#delivery">交付顺序</a>
+      <a href="#tradeoffs">取舍与非目标</a>
+    </nav>
+
+    <main>
+      <header id="summary">
+        <div class="eyebrow">Architecture Decision Record · 0001</div>
+        <h1>构建一个 Responses-first 的 Go Universal LLM Gateway</h1>
+        <p class="lede">面向中国客户出海：一个 OpenAI-compatible 接口，一套跨国内外 Provider 的模型路由，以及可审计、可控成本的全球 Responses 状态与 Prompt Cache Protection。</p>
+        <div class="meta">
+          <span class="pill status">● Proposed</span>
+          <span class="pill">2026-08-23</span>
+          <span class="pill">Go 1.26.x</span>
+          <span class="pill">Chat + Responses + SSE</span>
+        </div>
+        <div class="callout"><strong>核心判断：</strong>统一用户体验，但不伪装 Provider 能力完全相同；正确性放进 Response Store，Prompt Cache 只作为可丢弃的加速层；主动缓存保护必须按预期净收益决策。</div>
+      </header>
+
+      <section>
+        <h2>我们决定做什么</h2>
+        <div class="grid three">
+          <article class="card"><span class="num">1</span><h3>Responses-first Core</h3><p>内部使用 typed item/event canonical model。Chat Completions 是适配层，不是内部真相。</p></article>
+          <article class="card"><span class="num">2</span><h3>Capability-aware</h3><p>每条 Model Route 明确标记 <code>native</code>、<code>translated</code> 或 <code>unsupported</code>，绝不静默丢字段。</p></article>
+          <article class="card"><span class="num">3</span><h3>Home-region State</h3><p>状态型请求回 Home Region 单写；区域内强一致，跨区域异步复制，避免 split brain。</p></article>
+          <article class="card"><span class="num">4</span><h3>Streaming P0</h3><p>Chat 和 Responses 均支持 SSE；首个可见事件之后固定 Provider，不能透明 fallback。</p></article>
+          <article class="card"><span class="num">5</span><h3>Cache Protection</h3><p>预测 cache-compatible continuation，并在预算和 ROI 门槛内选择性续租 Provider Prompt Cache。</p></article>
+          <article class="card"><span class="num">6</span><h3>Provable FinOps</h3><p>区分普通缓存折扣、估算保护收益和实验验证收益，而不是展示一个不可验证的“省钱数字”。</p></article>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>总体架构</h2>
+        <p>复杂性被收进少数深模块；Public Transport、Provider Adapter 和存储实现都可替换，但不会把细节泄露给调用方。</p>
+        <div class="architecture" role="img" aria-label="LLM Gateway 架构图">
+          <div class="arch-row single"><div class="arch-box">Global Edge · Auth · Tenant Policy · Rate Limit</div></div>
+          <div class="arrow">↓</div>
+          <div class="arch-row"><div class="arch-box">Chat Completions Adapter</div><div class="arch-box primary">Canonical Response Runtime</div><div class="arch-box">Responses Adapter</div></div>
+          <div class="arrow">↓</div>
+          <div class="arch-row"><div class="arch-box">Routing Policy<br><small>capability · health · price · region</small></div><div class="arch-box">Response State<br><small>idempotency · CAS · lifecycle</small></div><div class="arch-box">Cache Economics<br><small>lease · forecast · savings</small></div></div>
+          <div class="arrow">↓</div>
+          <div class="arch-row"><div class="arch-box">Provider Adapters<br><small>OpenAI · Anthropic · Gemini · 中国 Provider</small></div><div class="arch-box">PostgreSQL + Object Store<br><small>authoritative</small></div><div class="arch-box">Redis + Event Journal<br><small>ephemeral / bounded</small></div></div>
+        </div>
+        <h3>核心接口形状</h3>
+        <pre><code>type ResponseExecutor interface {
+    Execute(context.Context, CanonicalRequest) (EventStream, error)
+}
+
+type CacheProtector interface {
+    Inspect(context.Context, CacheAnchor) CacheCapability
+    Refresh(context.Context, CacheAnchor) (RefreshResult, error)
+}</code></pre>
+        <p>Provider Adapter 负责 wire schema、事件转换、cache breakpoint、usage 和错误；Response Runtime 负责生命周期、attempt、幂等、持久化以及首字节后的重试约束。</p>
+      </section>
+
+      <section id="state">
+        <h2>Responses 状态与全球一致性</h2>
+        <div class="grid two">
+          <article class="card">
+            <h3>权威写入</h3>
+            <ul>
+              <li>区域内 PostgreSQL multi-AZ，同步 durable commit。</li>
+              <li>Response、items、attempt、revision、usage 和 outbox 同事务。</li>
+              <li>状态通过 CAS 单调推进，并由 execution epoch/fencing 防旧 Worker 写回。</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>全球行为</h3>
+            <ul>
+              <li>无状态请求可以全球 failover。</li>
+              <li>状态型请求路由回 Home Region。</li>
+              <li>跨区异步复制；DR 必须显式 promotion。</li>
+              <li>Home Region 故障时宁可短暂 503，也不接受冲突写入。</li>
+            </ul>
+          </article>
+        </div>
+        <div class="callout"><strong>Quorum 属于 Response Store，不属于 cache。</strong> Redis、Provider KV cache 和 Gateway Response Cache 都可以 miss、evict 或重建。</div>
+      </section>
+
+      <section id="streaming">
+        <h2>Streaming 是第一阶段能力</h2>
+        <p>Interactive chat、coding、reasoning 与 agent tool progress 依赖较低的感知延迟。第一版支持实时 SSE 和最终 Response 落库，但不承诺全球 token-by-token durable replay。</p>
+        <div class="grid two">
+          <article class="card"><h3>第一版包含</h3><ul><li>规范化 typed events 与单调 sequence</li><li>flush、keepalive、backpressure、idle timeout</li><li>最终 usage reconciliation</li><li>client disconnect cancellation</li><li>首个可见 event 后 provider pinning</li></ul></article>
+          <article class="card"><h3>后续增强</h3><ul><li>区域内短期 durable Event Journal</li><li><code>starting_after</code> 断点恢复</li><li>background response + polling/webhook</li><li>独立的 Realtime WebSocket/WebRTC contract</li></ul></article>
+        </div>
+      </section>
+
+      <section id="cache">
+        <h2>三个缓存概念必须分开</h2>
+        <table>
+          <thead><tr><th>概念</th><th>存储什么</th><th>一致性</th><th>失败行为</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Response Store</strong></td><td>Response、Conversation、items、状态、账本</td><td>Home Region 强一致</td><td>不可用时拒绝状态写入</td></tr>
+            <tr><td><strong>Prompt Cache</strong></td><td>Provider 侧 exact-prefix KV/tensor</td><td>Best effort</td><td>Miss 后正常 prefill</td></tr>
+            <tr><td><strong>Gateway Response Cache</strong></td><td>已完成答案的可选副本</td><td>可丢弃</td><td>Miss 后调用 Provider</td></tr>
+          </tbody>
+        </table>
+        <p>Gateway Response Cache 默认关闭，只允许明确可缓存的 stateless workload；Prompt Cache 不复用答案，只降低相同前缀的输入处理成本。</p>
+      </section>
+
+      <section id="protection">
+        <h2>功能亮点：Predictive Cache Protection</h2>
+        <p>把 Provider Prompt Cache 看成一个有路由身份、有预估过期时间、但不保证存在的 <strong>Cache Lease</strong>。真正预测的是下一次 cache-compatible request 的时间概率，而不是“任务是否已经结束”。</p>
+        <div class="formula">
+          <strong>Refresh 决策</strong>
+          <code>Expected Net Saving = Pcontinue × (Cold Cost − Hit Cost) − Refresh Cost − Forecast Cost − Route-lock Cost</code>
+        </div>
+        <h3>保护策略约束</h3>
+        <div class="grid two">
+          <article class="card"><ul><li>默认关闭，Tenant 或请求显式开启</li><li>限制 max spend、refresh 次数和保护时长</li><li>真实请求到达后取消 pending refresh</li><li>Home Region 故障时直接放弃优化</li></ul></article>
+          <article class="card"><ul><li>严格固定 provider/model/credential/region/cache key</li><li>refresh 不进入用户 Conversation/Response Chain</li><li>有副作用的 hosted tools 默认不 refresh</li><li>上游结果不确定时记录 uncertain，不盲目重试</li></ul></article>
+        </div>
+        <h3>Provider rollout</h3>
+        <table>
+          <thead><tr><th>阶段</th><th>Provider</th><th>策略</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>Anthropic direct</td><td>优先利用官方 zero-output pre-warm 和明确的 cache usage。</td></tr>
+            <tr><td>2</td><td>Gemini explicit cache</td><td>直接延长 cache object TTL，不发 dummy inference。</td></tr>
+            <tr><td>3</td><td>OpenAI</td><td>先 canary 验证 stateless refresh、breakpoint、输出成本和无状态污染。</td></tr>
+            <tr><td>观察</td><td>DeepSeek</td><td>先统计 hit；公开过期时间不确定，不做定时续租。</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="accounting">
+        <h2>省钱必须可以解释和验证</h2>
+        <div class="grid three">
+          <article class="card"><h3>Observed</h3><p>Provider 明确报告的 cached tokens × 当前 price snapshot 的折扣。说明发生了缓存命中，但不归因给保护功能。</p></article>
+          <article class="card"><h3>Estimated</h3><p>发生在原始 expiry 之后、refresh expiry 之前的 Protected Hit，减去 refresh、预测和路由机会成本。</p></article>
+          <article class="card"><h3>Validated</h3><p>Eligible session 随机 treatment/holdout 的增量成本差，校准预测误差和 Provider 自然延长缓存的影响。</p></article>
+        </div>
+        <p class="callout">产品界面展示 <strong>estimated net savings</strong>，只有经过 holdout 校准后才展示“由 Cache Protection 带来的验证节省”。</p>
+      </section>
+
+      <section id="technology">
+        <h2>技术选型</h2>
+        <table>
+          <thead><tr><th>领域</th><th>初始选择</th><th>理由</th></tr></thead>
+          <tbody>
+            <tr><td>语言</td><td>Go 1.26.x</td><td>网络与 streaming 性能、并发模型、单文件部署、符合项目目标。</td></tr>
+            <tr><td>Public contract</td><td>OpenAI Chat + Responses</td><td>覆盖主流 SDK 和 Agent ecosystem。</td></tr>
+            <tr><td>Canonical model</td><td>Responses-like item/event IR</td><td>比 messages 更好表达 tools、multimodal、reasoning、branch 与 lifecycle。</td></tr>
+            <tr><td>HTTP</td><td><code>net/http</code> 起步</td><td>优先保证取消与 streaming 语义；有 benchmark 证据后才替换。</td></tr>
+            <tr><td>Response Store</td><td>PostgreSQL</td><td>事务、CAS、append-only ledger、outbox 与成熟 multi-AZ。</td></tr>
+            <tr><td>协调与 cache</td><td>Redis-compatible</td><td>短 lease、rate limit、affinity、dedupe；不承担权威数据。</td></tr>
+            <tr><td>大对象</td><td>S3-compatible object store</td><td>区域化、便宜、durable，避免膨胀事务行。</td></tr>
+            <tr><td>Observability</td><td>OpenTelemetry + immutable usage events</td><td>供应商中立，成本可重算。</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="reuse">
+        <h2>开源项目复用计划</h2>
+        <p>我们的 domain、routing、state runtime 和 Savings Ledger 自己掌握；Provider 执行和兼容性细节尽量复用成熟工作，但全部放在可替换 seam 后。</p>
+        <table>
+          <thead><tr><th>项目</th><th>角色</th><th>准备复用</th></tr></thead>
+          <tbody>
+            <tr><td><a href="https://github.com/maximhq/bifrost">Bifrost</a><br><span class="tag">Apache-2.0</span></td><td>首个 Go Provider execution adapter 候选</td><td>Provider schema、stream transform、隔离队列、测试与低分配技巧；不暴露其宽 Provider interface。</td></tr>
+            <tr><td><a href="https://github.com/labring/aiproxy">AIProxy</a><br><span class="tag">MIT</span></td><td>中国 Provider 兼容参考</td><td>字段映射、供应商 quirks、usage、body/stream 处理和 conformance tests；不引入其应用层耦合。</td></tr>
+            <tr><td><a href="https://github.com/openai/openai-openapi">OpenAI OpenAPI</a><br><span class="tag">MIT</span></td><td>Wire contract source</td><td>生成/校验 fixtures；不直接生成内部 canonical model。</td></tr>
+            <tr><td><a href="https://github.com/openai/openai-go">openai-go</a><br><span class="tag">Apache-2.0</span></td><td>黑盒 conformance client</td><td>验证 Chat、Responses 与 streaming 行为。</td></tr>
+            <tr><td><a href="https://github.com/Aider-AI/aider">Aider</a><br><span class="tag">Apache-2.0</span></td><td>Keepalive lifecycle 参考</td><td>借鉴有限次数、timer 与取消语义，在 Go 中重写。</td></tr>
+            <tr><td><a href="https://github.com/BerriAI/litellm">LiteLLM</a><br><span class="tag">Reference</span></td><td>互操作行为语料</td><td><code>cache_control</code>、usage normalization 和 provider edge cases；不依赖 Python runtime。</td></tr>
+          </tbody>
+        </table>
+        <div class="callout"><strong>不直接复用：</strong>New API 作为 MaaS 与中国 Provider 产品参考，但 AGPL 和应用耦合使其不适合作为 proprietary core 的直接依赖。</div>
+      </section>
+
+      <section id="highlights">
+        <h2>面向客户的功能亮点</h2>
+        <div class="grid two">
+          <article class="card"><h3>China → Global</h3><p>国内外模型、区域 credential、data residency 和出海网络路径成为一等能力，而不是 generic OpenAI proxy 的附加项。</p></article>
+          <article class="card"><h3>Universal, but honest</h3><p>统一 contract 与 SDK 体验，同时公开能力差异、translation 和降级行为。</p></article>
+          <article class="card"><h3>Responses-native</h3><p>支持 stateless、Response Chain 和 Conversation，不强迫所有调用共享一个 session ID。</p></article>
+          <article class="card"><h3>Cache-aware routing</h3><p>在 compliance、health 和 budget 约束内保留 route affinity，而不是只按最低单价路由。</p></article>
+          <article class="card"><h3>Predictive savings</h3><p>对值得保护的长上下文主动续租，并用预算和 Expected Value 防止 heartbeat 反而烧钱。</p></article>
+          <article class="card"><h3>Auditable FinOps</h3><p>每次 attempt、cache read/write、price snapshot、refresh 和 protected hit 都可追溯。</p></article>
+        </div>
+      </section>
+
+      <section id="delivery">
+        <h2>建议交付顺序</h2>
+        <ol class="timeline">
+          <li><strong>Canonical contract</strong><br>Typed items/events、Capability Profile、OpenAI-compatible transports 与 fixtures。</li>
+          <li><strong>Stateless execution</strong><br>SSE、usage、attempt、provider error 与首字节后的固定路由。</li>
+          <li><strong>Durable Responses</strong><br>Response Chain、Conversation、Home Region、idempotency、CAS 与 tombstone。</li>
+          <li><strong>MaaS control plane</strong><br>Tenant policy、quota、price snapshot、ledger 与多维 routing。</li>
+          <li><strong>Cache observability</strong><br>统一 provider cache usage 与 cache-aware affinity，但先不主动 refresh。</li>
+          <li><strong>Protection shadow mode</strong><br>预测 continuation、计算 EV、记录假想决策，不产生额外模型调用。</li>
+          <li><strong>Anthropic canary</strong><br>最多一次 refresh、严格预算、随机 holdout、Savings Ledger。</li>
+          <li><strong>Provider expansion</strong><br>只有 provider-specific conformance 与经济测试通过后才加入新 refresh adapter。</li>
+        </ol>
+      </section>
+
+      <section id="tradeoffs">
+        <h2>明确接受的取舍</h2>
+        <ul>
+          <li>比 thin proxy 有更多 canonical modeling，但 provider 复杂度不会扩散到每个调用方。</li>
+          <li>Home Region 故障时，状态型写入可能暂时不可用，以换取无 split brain。</li>
+          <li>Provider capability、价格和 cache contract 必须版本化并持续验证。</li>
+          <li>Cache Protection 带来预测、隐私、调度和归因责任，因此默认关闭并渐进发布。</li>
+        </ul>
+        <h3>第一阶段非目标</h3>
+        <p><span class="tag">No</span> 全球 active-active Conversation 写入　<span class="tag">No</span> 所有 hosted tools 打平　<span class="tag">No</span> Realtime audio　<span class="tag">No</span> 默认 semantic response cache　<span class="tag">No</span> 流式输出后透明 fallback　<span class="tag">No</span> 全球 token-by-token replay</p>
+      </section>
+
+      <section>
+        <h2>参考资料</h2>
+        <ul>
+          <li><a href="https://developers.openai.com/api/docs/guides/prompt-caching">OpenAI Prompt Caching</a></li>
+          <li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic Prompt Caching</a></li>
+          <li><a href="https://ai.google.dev/gemini-api/docs/caching">Gemini Context Caching</a></li>
+          <li><a href="https://api-docs.deepseek.com/guides/kv_cache/">DeepSeek Context Caching</a></li>
+          <li><a href="https://openrouter.ai/blog/tutorials/prompt-caching-sticky-routing/">OpenRouter Prompt Caching + Sticky Routing</a></li>
+          <li><a href="https://arxiv.org/abs/2607.19214">Keeping the Cache Warm Pays</a></li>
+        </ul>
+        <p class="footer-note">本 HTML 是 ADR 的阅读版。规范来源：<a href="0001-build-universal-llm-gateway-core.md">0001-build-universal-llm-gateway-core.md</a>。Provider 的缓存语义和价格变化频繁，代码实现必须依赖版本化 capability data，而不是这份文档中的静态假设。</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
