@@ -1,0 +1,6 @@
+/llm-gateway
+/.env
+/.idea/
+/.vscode/
+*.log
+coverage.out

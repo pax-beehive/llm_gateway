@@ -1,0 +1,82 @@
+package cacheprotection_test
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
+	"github.com/toddzheng/llm-gateway/internal/provider"
+)
+
+func TestAmbiguousRefreshIsRecordedUncertainAndNeverRetried(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	repository := cacheprotection.NewMemoryIntentRepository()
+	coordinator := cacheprotection.NewCoordinator(repository, func() time.Time { return now })
+	var refreshCalls atomic.Int64
+	protector := cacheProtectorStub{
+		inspect: provider.CacheCapability{Supported: true},
+		refresh: func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
+			refreshCalls.Add(1)
+			return provider.RefreshResult{Status: "uncertain"}, errors.New("connection reset after request write")
+		},
+	}
+	candidate := eligibleCandidate(now)
+
+	intent, err := coordinator.Run(context.Background(), candidate, protector)
+	if err == nil {
+		t.Fatal("run error = nil, want ambiguous provider error")
+	}
+	if intent.Status != cacheprotection.IntentUncertain {
+		t.Fatalf("intent status = %q, want uncertain", intent.Status)
+	}
+
+	repeated, repeatedErr := coordinator.Run(context.Background(), candidate, protector)
+	if repeatedErr != nil {
+		t.Fatalf("repeat returned error: %v", repeatedErr)
+	}
+	if repeated.ID != intent.ID || repeated.Status != cacheprotection.IntentUncertain {
+		t.Fatalf("repeat intent = %#v, want original uncertain intent", repeated)
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("refresh calls = %d, want exactly one", refreshCalls.Load())
+	}
+}
+
+func eligibleCandidate(now time.Time) cacheprotection.Candidate {
+	return cacheprotection.Candidate{
+		Policy: cacheprotection.Policy{
+			Enabled: true, MaxSpendMicros: 3_000_000, MaxRefreshes: 1,
+			MaxProtectionWindow: time.Hour, SafetyMarginMicros: 100_000,
+		},
+		Lease: cacheprotection.Lease{
+			ID: "lease-1", Revision: 7, CreatedAt: now.Add(-4 * time.Minute),
+			EstimatedExpiresAt: now.Add(5 * time.Second), FencingToken: 12,
+			Anchor: provider.CacheAnchor{
+				TenantID: "tenant-a", RouteID: "anthropic-us", Provider: "anthropic", Model: "claude-opus-5",
+				CredentialScope: "tenant-a-primary", Region: "us-west", CacheKey: "prefix-v1", PrefixHash: "sha256:abc",
+			},
+		},
+		Forecast: cacheprotection.Forecast{Probability: 0.9, ExpectedAt: now.Add(10 * time.Minute)},
+		Economics: cacheprotection.Economics{
+			PredictedColdCostMicros: 10_000_000, PredictedHitCostMicros: 1_000_000, RefreshCostMicros: 2_000_000,
+		},
+	}
+}
+
+type cacheProtectorStub struct {
+	inspect provider.CacheCapability
+	refresh func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error)
+}
+
+func (s cacheProtectorStub) Inspect(context.Context, provider.CacheAnchor) provider.CacheCapability {
+	return s.inspect
+}
+
+func (s cacheProtectorStub) Refresh(ctx context.Context, anchor provider.CacheAnchor) (provider.RefreshResult, error) {
+	return s.refresh(ctx, anchor)
+}

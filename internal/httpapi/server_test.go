@@ -1,0 +1,220 @@
+package httpapi_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/httpapi"
+	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/runtime"
+	"github.com/toddzheng/llm-gateway/internal/store"
+)
+
+func TestTenantCanCreateAndRetrieveResponse(t *testing.T) {
+	t.Parallel()
+
+	responseStore := store.NewMemoryResponseStore()
+	executor := provider.NewEchoExecutor()
+	engine := runtime.New(responseStore, provider.NewStaticRouter(executor))
+	handler := httpapi.New(httpapi.Config{
+		Runtime: engine,
+		Authenticator: httpapi.StaticAuthenticator{
+			"tenant-a-key": "tenant-a",
+			"tenant-b-key": "tenant-b",
+		},
+	})
+
+	created := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1",
+		"input": "hello gateway",
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+
+	var got core.Response
+	decodeJSON(t, created, &got)
+	if got.Status != core.ResponseStatusCompleted {
+		t.Fatalf("status = %q, want %q", got.Status, core.ResponseStatusCompleted)
+	}
+	if got.Model != "echo-v1" {
+		t.Fatalf("model = %q, want echo-v1", got.Model)
+	}
+	if text := got.OutputText(); text != "hello gateway" {
+		t.Fatalf("output text = %q, want hello gateway", text)
+	}
+
+	retrieved := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/responses/"+got.ID, nil)
+	if retrieved.Code != http.StatusOK {
+		t.Fatalf("retrieve status = %d, body = %s", retrieved.Code, retrieved.Body.String())
+	}
+	var persisted core.Response
+	decodeJSON(t, retrieved, &persisted)
+	if persisted.ID != got.ID || persisted.OutputText() != "hello gateway" {
+		t.Fatalf("persisted response = %#v, want id %q and output hello gateway", persisted, got.ID)
+	}
+
+	isolated := performJSON(t, handler, "tenant-b-key", http.MethodGet, "/v1/responses/"+got.ID, nil)
+	if isolated.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant retrieve status = %d, want %d", isolated.Code, http.StatusNotFound)
+	}
+}
+
+func TestChatCompletionsStreamsCanonicalEventsAsSSE(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler()
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":  "echo-v1",
+		"stream": true,
+		"messages": []map[string]any{
+			{"role": "system", "content": "answer plainly"},
+			{"role": "user", "content": "hello stream"},
+		},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("stream status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/event-stream") {
+		t.Fatalf("content type = %q, want text/event-stream", contentType)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := string(body)
+	if !strings.Contains(stream, `"delta":{"content":"answer plainlyhello stream"}`) {
+		t.Fatalf("stream does not contain assistant delta: %s", stream)
+	}
+	if !strings.HasSuffix(stream, "data: [DONE]\n\n") {
+		t.Fatalf("stream does not end with [DONE]: %s", stream)
+	}
+}
+
+func TestResponsesStreamUsesNamedMonotonicCanonicalEvents(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler()
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "input": "hello responses stream", "stream": true,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("stream status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/event-stream") {
+		t.Fatalf("content type = %q, want text/event-stream", contentType)
+	}
+	stream := response.Body.String()
+	for _, expected := range []string{
+		"event: response.created\n", `"sequence_number":1`,
+		"event: response.output_text.delta\n", `"sequence_number":2`,
+		"event: response.completed\n", `"sequence_number":3`,
+	} {
+		if !strings.Contains(stream, expected) {
+			t.Fatalf("stream missing %q: %s", expected, stream)
+		}
+	}
+}
+
+func TestStoreFalseReturnsFinalResponseWithoutRetainingIt(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler()
+	created := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "input": "ephemeral", "store": false,
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var response core.Response
+	decodeJSON(t, created, &response)
+	if response.Status != core.ResponseStatusCompleted {
+		t.Fatalf("status = %q, want completed", response.Status)
+	}
+
+	retrieved := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/responses/"+response.ID, nil)
+	if retrieved.Code != http.StatusNotFound {
+		t.Fatalf("retrieve status = %d, want 404 for store:false", retrieved.Code)
+	}
+}
+
+func TestBackgroundResponseReturnsBeforeDurableCompletion(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler()
+	created := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "input": "background", "background": true,
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var initial core.Response
+	decodeJSON(t, created, &initial)
+	if initial.Status != core.ResponseStatusInProgress {
+		t.Fatalf("initial status = %q, want in_progress", initial.Status)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		retrieved := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/responses/"+initial.ID, nil)
+		if retrieved.Code != http.StatusOK {
+			t.Fatalf("retrieve status = %d, body = %s", retrieved.Code, retrieved.Body.String())
+		}
+		var final core.Response
+		decodeJSON(t, retrieved, &final)
+		if final.Status == core.ResponseStatusCompleted {
+			if final.OutputText() != "background" {
+				t.Fatalf("final output = %q", final.OutputText())
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background response did not complete: %#v", final)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func newTestHandler() http.Handler {
+	responseStore := store.NewMemoryResponseStore()
+	executor := provider.NewEchoExecutor()
+	engine := runtime.New(responseStore, provider.NewStaticRouter(executor))
+	return httpapi.New(httpapi.Config{
+		Runtime: engine,
+		Authenticator: httpapi.StaticAuthenticator{
+			"tenant-a-key": "tenant-a",
+			"tenant-b-key": "tenant-b",
+		},
+	})
+}
+
+func performJSON(t *testing.T, handler http.Handler, token, method, target string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var requestBody bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&requestBody).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(method, target, &requestBody)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func decodeJSON(t *testing.T, recorder *httptest.ResponseRecorder, target any) {
+	t.Helper()
+	if err := json.NewDecoder(recorder.Body).Decode(target); err != nil {
+		t.Fatalf("decode response: %v; body = %s", err, recorder.Body.String())
+	}
+}
