@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -131,18 +132,31 @@ func messagesFromItems(items []core.Item) ([]map[string]any, error) {
 }
 
 type sseStream struct {
-	body    io.ReadCloser
-	scanner *bufio.Scanner
-	done    bool
+	body      io.ReadCloser
+	scanner   *bufio.Scanner
+	done      bool
+	pending   []core.Event
+	toolCalls map[int]*toolCall
+}
+
+type toolCall struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
 }
 
 func newSSEStream(body io.ReadCloser) *sseStream {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	return &sseStream{body: body, scanner: scanner}
+	return &sseStream{body: body, scanner: scanner, toolCalls: make(map[int]*toolCall)}
 }
 
 func (s *sseStream) Recv() (core.Event, error) {
+	if len(s.pending) > 0 {
+		event := s.pending[0]
+		s.pending = s.pending[1:]
+		return event, nil
+	}
 	if s.done {
 		return core.Event{}, io.EOF
 	}
@@ -163,7 +177,15 @@ func (s *sseStream) Recv() (core.Event, error) {
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -194,8 +216,50 @@ func (s *sseStream) Recv() (core.Event, error) {
 			}
 			return core.Event{Type: "response.completed", Usage: &usage}, nil
 		}
-		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-			return core.Event{Type: "response.output_text.delta", Delta: chunk.Choices[0].Delta.Content}, nil
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			for _, delta := range choice.Delta.ToolCalls {
+				call := s.toolCalls[delta.Index]
+				if call == nil {
+					call = &toolCall{}
+					s.toolCalls[delta.Index] = call
+				}
+				if delta.ID != "" {
+					call.ID = delta.ID
+				}
+				if delta.Function.Name != "" {
+					call.Name = delta.Function.Name
+				}
+				call.Arguments.WriteString(delta.Function.Arguments)
+			}
+			if choice.FinishReason != nil && len(s.toolCalls) > 0 {
+				indices := make([]int, 0, len(s.toolCalls))
+				for index := range s.toolCalls {
+					indices = append(indices, index)
+				}
+				sort.Ints(indices)
+				for _, index := range indices {
+					call := s.toolCalls[index]
+					if call == nil {
+						continue
+					}
+					arguments := json.RawMessage(call.Arguments.String())
+					if !json.Valid(arguments) {
+						return core.Event{}, errors.New("provider returned invalid function-call arguments")
+					}
+					item := core.Item{Type: "function_call", CallID: call.ID, Name: call.Name, Arguments: arguments}
+					s.pending = append(s.pending, core.Event{Type: "response.output_item.done", Item: &item})
+				}
+				s.toolCalls = make(map[int]*toolCall)
+				if len(s.pending) > 0 {
+					event := s.pending[0]
+					s.pending = s.pending[1:]
+					return event, nil
+				}
+			}
+			if choice.Delta.Content != "" {
+				return core.Event{Type: "response.output_text.delta", Delta: choice.Delta.Content}, nil
+			}
 		}
 	}
 	s.done = true

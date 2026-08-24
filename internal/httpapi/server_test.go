@@ -182,6 +182,31 @@ func TestBackgroundResponseReturnsBeforeDurableCompletion(t *testing.T) {
 	}
 }
 
+func TestResponsesCreateIsIdempotentPerTenantAndRequestHash(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler()
+	body := map[string]any{"model": "echo-v1", "input": "idempotent"}
+	first := performJSONWithIdempotency(t, handler, "tenant-a-key", "request-42", body)
+	second := performJSONWithIdempotency(t, handler, "tenant-a-key", "request-42", body)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("statuses = %d/%d, bodies = %s / %s", first.Code, second.Code, first.Body.String(), second.Body.String())
+	}
+	var firstResponse, secondResponse core.Response
+	decodeJSON(t, first, &firstResponse)
+	decodeJSON(t, second, &secondResponse)
+	if firstResponse.ID != secondResponse.ID {
+		t.Fatalf("response IDs = %q/%q, want same idempotent response", firstResponse.ID, secondResponse.ID)
+	}
+
+	conflict := performJSONWithIdempotency(t, handler, "tenant-a-key", "request-42", map[string]any{
+		"model": "echo-v1", "input": "different request",
+	})
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d, want 409; body = %s", conflict.Code, conflict.Body.String())
+	}
+}
+
 func newTestHandler() http.Handler {
 	responseStore := store.NewMemoryResponseStore()
 	executor := provider.NewEchoExecutor()
@@ -209,6 +234,21 @@ func performJSON(t *testing.T, handler http.Handler, token, method, target strin
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func performJSONWithIdempotency(t *testing.T, handler http.Handler, token, key string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var requestBody bytes.Buffer
+	if err := json.NewEncoder(&requestBody).Encode(body); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", &requestBody)
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", key)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
 	return recorder
 }
 

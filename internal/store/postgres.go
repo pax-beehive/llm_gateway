@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	_ "embed"
@@ -53,6 +54,75 @@ func (s *PostgresResponseStore) Create(ctx context.Context, tenantID string, res
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *PostgresResponseStore) CreateIdempotent(ctx context.Context, tenantID string, response core.Response, operation, key string, requestHash []byte) (core.Response, bool, error) {
+	payload, err := json.Marshal(response)
+	if err != nil {
+		return core.Response{}, false, fmt.Errorf("encode response: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.Response{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO responses (
+			tenant_id, id, conversation_id, previous_response_id, status, home_region, revision, payload
+		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8)`,
+		tenantID, response.ID, response.ConversationID, response.PreviousResponseID, response.Status,
+		response.HomeRegion, response.Revision, payload,
+	)
+	if err != nil {
+		return core.Response{}, false, fmt.Errorf("insert idempotent response: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO idempotency_keys (
+			tenant_id, operation, idempotency_key, request_hash, response_id, expires_at
+		) VALUES ($1, $2, $3, $4, $5, now() + interval '24 hours')
+		ON CONFLICT (tenant_id, operation, idempotency_key) DO NOTHING`,
+		tenantID, operation, key, requestHash, response.ID,
+	)
+	if err != nil {
+		return core.Response{}, false, fmt.Errorf("reserve idempotency key: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return core.Response{}, false, err
+	}
+	if rows == 1 {
+		if err := insertOutbox(ctx, tx, tenantID, response, "response.created", payload); err != nil {
+			return core.Response{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return core.Response{}, false, err
+		}
+		return response, true, nil
+	}
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return core.Response{}, false, err
+	}
+	var existingHash, existingPayload []byte
+	err = s.db.QueryRowContext(ctx, `
+		SELECT k.request_hash, r.payload
+		FROM idempotency_keys k
+		JOIN responses r ON r.tenant_id = k.tenant_id AND r.id = k.response_id
+		WHERE k.tenant_id = $1 AND k.operation = $2 AND k.idempotency_key = $3
+		  AND k.expires_at > now()`, tenantID, operation, key).Scan(&existingHash, &existingPayload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.Response{}, false, ErrConflict
+	}
+	if err != nil {
+		return core.Response{}, false, err
+	}
+	if !bytes.Equal(existingHash, requestHash) {
+		return core.Response{}, false, ErrIdempotencyMismatch
+	}
+	var existing core.Response
+	if err := json.Unmarshal(existingPayload, &existing); err != nil {
+		return core.Response{}, false, err
+	}
+	return existing, false, nil
 }
 
 func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID string) (core.Response, error) {

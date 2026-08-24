@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("response not found")
-	ErrConflict = errors.New("response revision conflict")
+	ErrNotFound            = errors.New("response not found")
+	ErrConflict            = errors.New("response revision conflict")
+	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 )
 
 type ResponseStore interface {
@@ -21,13 +22,52 @@ type ResponseStore interface {
 	ListInputItems(context.Context, string, string) ([]core.Item, error)
 }
 
+type IdempotentResponseStore interface {
+	CreateIdempotent(context.Context, string, core.Response, string, string, []byte) (core.Response, bool, error)
+}
+
+type idempotencyRecord struct {
+	requestHash []byte
+	responseID  string
+}
+
 type MemoryResponseStore struct {
-	mu        sync.RWMutex
-	responses map[string]map[string]core.Response
+	mu          sync.RWMutex
+	responses   map[string]map[string]core.Response
+	idempotency map[string]map[string]idempotencyRecord
 }
 
 func NewMemoryResponseStore() *MemoryResponseStore {
-	return &MemoryResponseStore{responses: make(map[string]map[string]core.Response)}
+	return &MemoryResponseStore{
+		responses:   make(map[string]map[string]core.Response),
+		idempotency: make(map[string]map[string]idempotencyRecord),
+	}
+}
+
+func (s *MemoryResponseStore) CreateIdempotent(_ context.Context, tenantID string, response core.Response, operation, key string, requestHash []byte) (core.Response, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idempotency[tenantID] == nil {
+		s.idempotency[tenantID] = make(map[string]idempotencyRecord)
+	}
+	lookupKey := operation + "\x00" + key
+	if record, exists := s.idempotency[tenantID][lookupKey]; exists {
+		if !equalBytes(record.requestHash, requestHash) {
+			return core.Response{}, false, ErrIdempotencyMismatch
+		}
+		return cloneResponse(s.responses[tenantID][record.responseID]), false, nil
+	}
+	if s.responses[tenantID] == nil {
+		s.responses[tenantID] = make(map[string]core.Response)
+	}
+	if _, exists := s.responses[tenantID][response.ID]; exists {
+		return core.Response{}, false, ErrConflict
+	}
+	s.responses[tenantID][response.ID] = cloneResponse(response)
+	s.idempotency[tenantID][lookupKey] = idempotencyRecord{
+		requestHash: append([]byte(nil), requestHash...), responseID: response.ID,
+	}
+	return response, true, nil
 }
 
 func (s *MemoryResponseStore) Create(_ context.Context, tenantID string, response core.Response) error {
@@ -105,4 +145,15 @@ func cloneResponse(response core.Response) core.Response {
 		}
 	}
 	return response
+}
+
+func equalBytes(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	var different byte
+	for index := range left {
+		different |= left[index] ^ right[index]
+	}
+	return different == 0
 }

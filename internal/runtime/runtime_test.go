@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
@@ -61,6 +62,38 @@ func TestVisibleProviderFailureIsPersistedWithoutFallback(t *testing.T) {
 	}
 }
 
+func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
+	t.Parallel()
+
+	stream := newBlockingStream()
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return stream, nil
+	})
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(testRoute("idle", executor)), gatewayruntime.Options{
+		ProviderIdleTimeout: 25 * time.Millisecond,
+		KeepaliveInterval:   5 * time.Millisecond,
+	})
+	var keepalives atomic.Int64
+	response, err := engine.ExecuteStreaming(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	}, func(event core.Event) error {
+		if event.Type == "gateway.keepalive" {
+			keepalives.Add(1)
+		}
+		return nil
+	})
+	if !errors.Is(err, gatewayruntime.ErrProviderIdleTimeout) {
+		t.Fatalf("execute error = %v, want provider idle timeout", err)
+	}
+	if response.Status != core.ResponseStatusFailed {
+		t.Fatalf("status = %q, want failed", response.Status)
+	}
+	if keepalives.Load() == 0 {
+		t.Fatal("keepalive count = 0, want at least one before idle timeout")
+	}
+}
+
 type executorFunc func(context.Context, core.Request) (provider.EventStream, error)
 
 func (f executorFunc) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {
@@ -87,6 +120,28 @@ func (s *scriptedStream) Recv() (core.Event, error) {
 }
 
 func (s *scriptedStream) Close() error { return nil }
+
+type blockingStream struct {
+	closed chan struct{}
+}
+
+func newBlockingStream() *blockingStream {
+	return &blockingStream{closed: make(chan struct{})}
+}
+
+func (s *blockingStream) Recv() (core.Event, error) {
+	<-s.closed
+	return core.Event{}, io.EOF
+}
+
+func (s *blockingStream) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
 
 func testRoute(id string, executor provider.ResponseExecutor) provider.Route {
 	return provider.Route{

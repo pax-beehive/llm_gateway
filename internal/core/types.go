@@ -74,6 +74,8 @@ type Request struct {
 	Stop               json.RawMessage
 	EndUserID          string
 	PreferredRouteID   string
+	IdempotencyKey     string
+	RequestHash        []byte
 }
 
 type Attempt struct {

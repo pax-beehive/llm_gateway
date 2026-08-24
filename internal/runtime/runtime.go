@@ -16,16 +16,38 @@ import (
 )
 
 type Runtime struct {
-	store  store.ResponseStore
-	router provider.Router
-	now    func() time.Time
+	store             store.ResponseStore
+	router            provider.Router
+	now               func() time.Time
+	idleTimeout       time.Duration
+	keepaliveInterval time.Duration
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
 }
 
+type Options struct {
+	ProviderIdleTimeout time.Duration
+	KeepaliveInterval   time.Duration
+}
+
+var ErrProviderIdleTimeout = errors.New("provider stream idle timeout")
+
 func New(responseStore store.ResponseStore, router provider.Router) *Runtime {
-	return &Runtime{store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc)}
+	return NewWithOptions(responseStore, router, Options{})
+}
+
+func NewWithOptions(responseStore store.ResponseStore, router provider.Router, options Options) *Runtime {
+	if options.ProviderIdleTimeout <= 0 {
+		options.ProviderIdleTimeout = 90 * time.Second
+	}
+	if options.KeepaliveInterval <= 0 {
+		options.KeepaliveInterval = 15 * time.Second
+	}
+	return &Runtime{
+		store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc),
+		idleTimeout: options.ProviderIdleTimeout, keepaliveInterval: options.KeepaliveInterval,
+	}
 }
 
 func (r *Runtime) Execute(ctx context.Context, request core.Request) (core.Response, error) {
@@ -68,13 +90,30 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		Input: append([]core.Item(nil), request.Input...), Output: []core.Item{}, Metadata: request.Metadata,
 		HomeRegion: request.HomeRegion, Revision: 1,
 	}
-	if err := r.store.Create(ctx, request.TenantID, response); err != nil {
+	if request.IdempotencyKey != "" {
+		idempotentStore, ok := r.store.(store.IdempotentResponseStore)
+		if !ok {
+			return core.Response{}, errors.New("configured Response Store does not support idempotency")
+		}
+		existing, created, err := idempotentStore.CreateIdempotent(
+			ctx, request.TenantID, response, "responses.create", request.IdempotencyKey, request.RequestHash,
+		)
+		if err != nil {
+			return core.Response{}, fmt.Errorf("create response idempotently: %w", err)
+		}
+		if !created {
+			return existing, nil
+		}
+	} else if err := r.store.Create(ctx, request.TenantID, response); err != nil {
 		return core.Response{}, fmt.Errorf("create response: %w", err)
 	}
 	sequence := int64(0)
 	emitEvent := func(event core.Event) error {
 		if emit == nil {
 			return nil
+		}
+		if event.Type == "gateway.keepalive" {
+			return emit(event)
 		}
 		sequence++
 		event.Sequence = sequence
@@ -94,7 +133,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 
 	routes, err := r.router.Candidates(executionCtx, request)
 	if err != nil {
-		return r.fail(executionCtx, request.TenantID, response, "route_not_found", err)
+		return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "route_not_found", err)
 	}
 
 	var lastErr error
@@ -116,7 +155,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		visible := false
 		var outputText string
 		for {
-			event, recvErr := stream.Recv()
+			event, recvErr := r.recv(executionCtx, stream, emitEvent)
 			if recvErr == io.EOF {
 				break
 			}
@@ -124,11 +163,17 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 				lastErr = recvErr
 				response.Attempts[len(response.Attempts)-1].Error = gatewayError("provider_stream_error", recvErr)
 				_ = stream.Close()
+				if executionCtx.Err() != nil {
+					if outputText != "" {
+						response.Output = append(response.Output, outputMessage(outputText))
+					}
+					return r.cancelled(context.WithoutCancel(executionCtx), request.TenantID, response)
+				}
 				if visible {
 					if outputText != "" {
 						response.Output = append(response.Output, outputMessage(outputText))
 					}
-					return r.fail(executionCtx, request.TenantID, response, "stream_interrupted", recvErr)
+					return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "stream_interrupted", recvErr)
 				}
 				break
 			}
@@ -165,7 +210,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		completedUnix := completed.Unix()
 		response.CompletedAt = &completedUnix
 		response.Attempts[len(response.Attempts)-1].CompletedAt = &completed
-		if err := r.store.Update(executionCtx, request.TenantID, response, response.Revision); err != nil {
+		if err := r.store.Update(context.WithoutCancel(executionCtx), request.TenantID, response, response.Revision); err != nil {
 			return core.Response{}, fmt.Errorf("persist completed response: %w", err)
 		}
 		response.Revision++
@@ -183,7 +228,44 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	if lastErr == nil {
 		lastErr = errors.New("all model routes failed")
 	}
-	return r.fail(executionCtx, request.TenantID, response, "provider_unavailable", lastErr)
+	if executionCtx.Err() != nil {
+		return r.cancelled(context.WithoutCancel(executionCtx), request.TenantID, response)
+	}
+	return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "provider_unavailable", lastErr)
+}
+
+type receiveResult struct {
+	event core.Event
+	err   error
+}
+
+func (r *Runtime) recv(ctx context.Context, stream provider.EventStream, emit func(core.Event) error) (core.Event, error) {
+	result := make(chan receiveResult, 1)
+	go func() {
+		event, err := stream.Recv()
+		result <- receiveResult{event: event, err: err}
+	}()
+	idleTimer := time.NewTimer(r.idleTimeout)
+	defer idleTimer.Stop()
+	keepalive := time.NewTicker(r.keepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		select {
+		case received := <-result:
+			return received.event, received.err
+		case <-keepalive.C:
+			if err := emit(core.Event{Type: "gateway.keepalive"}); err != nil {
+				_ = stream.Close()
+				return core.Event{}, err
+			}
+		case <-idleTimer.C:
+			_ = stream.Close()
+			return core.Event{}, ErrProviderIdleTimeout
+		case <-ctx.Done():
+			_ = stream.Close()
+			return core.Event{}, ctx.Err()
+		}
+	}
 }
 
 func outputMessage(text string) core.Item {
@@ -239,6 +321,23 @@ func (r *Runtime) fail(ctx context.Context, tenantID string, response core.Respo
 	}
 	response.Revision++
 	return response, cause
+}
+
+func (r *Runtime) cancelled(ctx context.Context, tenantID string, response core.Response) (core.Response, error) {
+	response.Status = core.ResponseStatusCancelled
+	response.Error = nil
+	err := r.store.Update(ctx, tenantID, response, response.Revision)
+	if errors.Is(err, store.ErrConflict) {
+		current, getErr := r.store.Get(ctx, tenantID, response.ID)
+		if getErr == nil && current.Status == core.ResponseStatusCancelled {
+			return current, context.Canceled
+		}
+	}
+	if err != nil {
+		return core.Response{}, errors.Join(context.Canceled, err)
+	}
+	response.Revision++
+	return response, context.Canceled
 }
 
 func gatewayError(code string, cause error) *core.Error {

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,7 +109,19 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		Stream: payload.Stream, Background: payload.Background, Store: storeResponse,
 		PreviousResponseID: payload.PreviousResponseID, ConversationID: payload.Conversation,
 		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: []string{"text"}, Metadata: payload.Metadata,
-		HomeRegion: s.homeRegion(request),
+		HomeRegion:     s.homeRegion(request),
+		IdempotencyKey: strings.TrimSpace(request.Header.Get("Idempotency-Key")),
+	}
+	if len(canonical.IdempotencyKey) > 256 {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "Idempotency-Key exceeds 256 bytes", "Idempotency-Key")
+		return
+	}
+	if canonical.IdempotencyKey != "" {
+		if payload.Stream || !storeResponse {
+			writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "Idempotency-Key requires a stored non-streaming Response", "Idempotency-Key")
+			return
+		}
+		canonical.RequestHash = responseRequestHash(payload)
 	}
 	if payload.Stream {
 		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "streaming")
@@ -127,15 +140,7 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 	}
 	result, err := s.runtime.Execute(request.Context(), canonical)
 	if err != nil {
-		status := http.StatusBadGateway
-		if result.Error != nil && result.Error.Code == "route_not_found" {
-			status = http.StatusBadRequest
-		}
-		if result.Error != nil {
-			writeError(responseWriter, status, result.Error.Code, result.Error.Message, "")
-			return
-		}
-		writeError(responseWriter, status, "gateway_error", err.Error(), "")
+		writeRuntimeError(responseWriter, result, err)
 		return
 	}
 	writeJSON(responseWriter, http.StatusOK, result)
@@ -186,6 +191,11 @@ func (s *Server) streamResponse(responseWriter http.ResponseWriter, request *htt
 	flusher.Flush()
 
 	result, err := s.runtime.ExecuteStreaming(request.Context(), canonical, func(event core.Event) error {
+		if event.Type == "gateway.keepalive" {
+			_, writeErr := io.WriteString(responseWriter, ": keepalive\n\n")
+			flusher.Flush()
+			return writeErr
+		}
 		return writeNamedSSE(responseWriter, event.Type, event, flusher)
 	})
 	if err != nil && result.Error != nil {
@@ -324,7 +334,13 @@ func (s *Server) streamChatCompletion(responseWriter http.ResponseWriter, reques
 
 	var responseID string
 	var createdAt int64
+	toolCallOutput := false
 	emit := func(event core.Event) error {
+		if event.Type == "gateway.keepalive" {
+			_, err := io.WriteString(responseWriter, ": keepalive\n\n")
+			flusher.Flush()
+			return err
+		}
 		if event.Response != nil && responseID == "" {
 			responseID = event.Response.ID
 			createdAt = event.Response.CreatedAt
@@ -340,10 +356,30 @@ func (s *Server) streamChatCompletion(responseWriter http.ResponseWriter, reques
 				"id": responseID, "object": "chat.completion.chunk", "created": createdAt, "model": canonical.Model,
 				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": event.Delta}, "finish_reason": nil}},
 			}, flusher)
+		case "response.output_item.done":
+			if event.Item == nil || event.Item.Type != "function_call" {
+				return nil
+			}
+			toolCallOutput = true
+			return writeSSE(responseWriter, map[string]any{
+				"id": responseID, "object": "chat.completion.chunk", "created": createdAt, "model": canonical.Model,
+				"choices": []any{map[string]any{
+					"index": 0,
+					"delta": map[string]any{"tool_calls": []any{map[string]any{
+						"index": 0, "id": event.Item.CallID, "type": "function",
+						"function": map[string]any{"name": event.Item.Name, "arguments": string(event.Item.Arguments)},
+					}}},
+					"finish_reason": nil,
+				}},
+			}, flusher)
 		case "response.completed":
+			finishReason := "stop"
+			if toolCallOutput {
+				finishReason = "tool_calls"
+			}
 			chunk := map[string]any{
 				"id": responseID, "object": "chat.completion.chunk", "created": createdAt, "model": canonical.Model,
-				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+				"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
 			}
 			if options != nil && options.IncludeUsage && event.Usage != nil {
 				chunk["usage"] = chatUsage(*event.Usage)
@@ -427,6 +463,10 @@ func writeNamedSSE(responseWriter http.ResponseWriter, eventName string, value a
 }
 
 func writeRuntimeError(responseWriter http.ResponseWriter, result core.Response, err error) {
+	if errors.Is(err, store.ErrIdempotencyMismatch) {
+		writeError(responseWriter, http.StatusConflict, "idempotency_conflict", store.ErrIdempotencyMismatch.Error(), "Idempotency-Key")
+		return
+	}
 	status := http.StatusBadGateway
 	if result.Error != nil && result.Error.Code == "route_not_found" {
 		status = http.StatusBadRequest
@@ -436,6 +476,15 @@ func writeRuntimeError(responseWriter http.ResponseWriter, result core.Response,
 		return
 	}
 	writeError(responseWriter, status, "gateway_error", err.Error(), "")
+}
+
+func responseRequestHash(payload createResponseRequest) []byte {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	digest := sha256.Sum256(encoded)
+	return digest[:]
 }
 
 func decodeInput(raw json.RawMessage) ([]core.Item, error) {
