@@ -5,6 +5,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -17,6 +18,78 @@ import (
 	gatewayruntime "github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
+
+func TestPostgresStoreFalseLeavesNoResponseContentOrOutboxSecret(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("store-false-%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region) VALUES ($1, 'local')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+
+	engine := gatewayruntime.New(responseStore, provider.NewStaticRouter(provider.NewEchoExecutor()))
+	const secret = "do-not-retain-this-secret"
+	response, err := engine.Execute(ctx, core.Request{
+		TenantID: tenantID, HomeRegion: "local", ExecutionEpoch: 1, Model: "echo-v1", Store: false,
+		Input:             []core.Item{{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: secret}}}},
+		RequestedFeatures: []string{"text"}, Metadata: map[string]string{"secret": secret},
+	})
+	if err != nil || response.OutputText() != secret {
+		t.Fatalf("response/error = %#v / %v", response, err)
+	}
+	if _, err := responseStore.Get(ctx, tenantID, response.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("get error = %v, want not found", err)
+	}
+	var retained bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM responses WHERE tenant_id = $1 AND payload::text LIKE '%' || $2 || '%'
+			UNION ALL
+			SELECT 1 FROM transactional_outbox WHERE tenant_id = $1 AND payload::text LIKE '%' || $2 || '%'
+		)`, tenantID, secret).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained {
+		t.Fatal("store:false content was retained in a response or transactional outbox payload")
+	}
+}
+
+func TestPostgresExecutionEpochFencesStaleWriter(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("epoch-fence-%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region, execution_epoch) VALUES ($1, 'local', 1)`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	response := core.Response{
+		ID: "resp-epoch", Object: "response", CreatedAt: time.Now().Unix(), Status: core.ResponseStatusInProgress,
+		Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{},
+	}
+	if err := responseStore.Create(ctx, tenantID, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE tenants SET execution_epoch = 2 WHERE id = $1`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	response.Status = core.ResponseStatusFailed
+	if err := responseStore.Update(ctx, tenantID, response, 1); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale update error = %v, want revision conflict", err)
+	}
+	newEpoch := response
+	newEpoch.ID = "resp-epoch-2"
+	newEpoch.ExecutionEpoch = 2
+	if err := responseStore.Create(ctx, tenantID, newEpoch); err != nil {
+		t.Fatalf("promoted writer create: %v", err)
+	}
+}
 
 func TestPostgresConversationAndResponseCommitTogether(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -41,7 +114,7 @@ func TestPostgresConversationAndResponseCommitTogether(t *testing.T) {
 	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
 
 	engine := gatewayruntime.New(responseStore, provider.NewStaticRouter(provider.NewEchoExecutor()))
-	conversation, err := engine.CreateConversation(ctx, tenantID, "local", []core.Item{{
+	conversation, err := engine.CreateConversation(ctx, tenantID, "local", 1, []core.Item{{
 		Type: "message", Role: "system", Content: []core.Content{{Type: "input_text", Text: "system:"}},
 	}}, nil)
 	if err != nil {
@@ -114,7 +187,7 @@ func TestPostgresCompletionRecordsVerifiedProtectedHitNetSaving(t *testing.T) {
 	now := time.Now().UTC()
 	response := core.Response{
 		ID: "resp-protected", Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
-		Model: "model", HomeRegion: "local", Revision: 1, Output: []core.Item{},
+		Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{},
 	}
 	if err := responseStore.Create(ctx, tenantID, response); err != nil {
 		t.Fatal(err)
@@ -135,10 +208,11 @@ func TestPostgresCompletionRecordsVerifiedProtectedHitNetSaving(t *testing.T) {
 			CacheLeaseID: "lease-protected", OriginalLeaseExpiresAt: now.Add(-time.Minute),
 			RefreshSucceededAt: now.Add(-2 * time.Minute), RefreshExpiresAt: now.Add(3 * time.Minute),
 			CustomerRequestAt: now, RefreshCostMicros: 100_000, ForecastCostMicros: 10_000,
+			RefreshUsageID: "refresh-usage-protected", RefreshProviderUsage: []byte(`{"cache_creation_input_tokens":1000}`),
 			StorageCostMicros: 5_000, RouteLockCostMicros: 15_000,
 		},
 	}
-	if err := responseStore.CompleteWithUsage(ctx, tenantID, response, 1, usage); err != nil {
+	if err := responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, usage); err != nil {
 		t.Fatal(err)
 	}
 	var gross, net int64
@@ -174,4 +248,20 @@ func cleanupTenant(t *testing.T, db *sql.DB, tenantID string) {
 			t.Errorf("cleanup tenant: %v", err)
 		}
 	}
+}
+
+func integrationDatabase(t *testing.T) (*sql.DB, context.Context) {
+	t.Helper()
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	return db, ctx
 }

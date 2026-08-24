@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 )
 
@@ -140,6 +141,29 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		if expiresAt.IsZero() {
 			return Intent{}, errors.New("successful cache refresh did not report an expiry")
 		}
+		if err := ensureRefreshPriceSnapshot(ctx, tx, intent.Candidate.RefreshPriceSnapshot); err != nil {
+			return Intent{}, err
+		}
+		refreshCost := actualRefreshCost(intent)
+		providerUsage := intent.ProviderResult.ProviderUsage
+		if len(providerUsage) == 0 || !json.Valid(providerUsage) {
+			providerUsage = json.RawMessage(`{}`)
+		}
+		usageID := intent.ID + "_usage"
+		usage := intent.ProviderResult.Usage
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO cache_refresh_usage_ledger (
+				id, tenant_id, cache_refresh_intent_id, cache_lease_id, price_snapshot_id,
+				provider_usage, input_tokens, cached_input_tokens, cache_write_input_tokens,
+				output_tokens, amount, currency, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			usageID, intent.TenantID, intent.ID, intent.CacheLeaseID,
+			intent.Candidate.RefreshPriceSnapshot.ID, providerUsage, usage.InputTokens,
+			usage.CachedInputTokens, usage.CacheWriteInputTokens, usage.OutputTokens,
+			refreshCost, intent.Candidate.RefreshPriceSnapshot.Currency, intent.UpdatedAt,
+		); err != nil {
+			return Intent{}, fmt.Errorf("insert immutable refresh usage: %w", err)
+		}
 		result, err := tx.ExecContext(ctx, `
 			UPDATE cache_leases
 			SET revision = revision + 1, fencing_token = fencing_token + 1,
@@ -147,13 +171,15 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 			    refresh_count = refresh_count + 1, spent_micros = spent_micros + $7,
 			    last_refresh_succeeded_at = $8, last_refresh_expires_at = $6,
 			    last_refresh_cost_micros = $7, last_forecast_cost_micros = $9,
-			    last_route_lock_cost_micros = $10, updated_at = $8
+			    last_route_lock_cost_micros = $10, last_refresh_usage_id = $12,
+			    last_refresh_provider_usage = $13, updated_at = $8
 			WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND fencing_token = $4
 			  AND route_id = $5`,
 			intent.TenantID, intent.CacheLeaseID, intent.CacheLeaseRevision, intent.FencingToken,
-			intent.Anchor.RouteID, expiresAt, intent.Candidate.Economics.RefreshCostMicros,
+			intent.Anchor.RouteID, expiresAt, refreshCost,
 			intent.UpdatedAt, intent.Candidate.Forecast.CostMicros,
 			intent.Candidate.Economics.RouteLockOpportunityCostMicros, intent.Candidate.Lease.EstimatedExpiresAt,
+			usageID, providerUsage,
 		)
 		if err != nil {
 			return Intent{}, err
@@ -161,6 +187,18 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		rows, _ := result.RowsAffected()
 		if rows != 1 {
 			return Intent{}, errors.New("cache lease fencing conflict after refresh")
+		}
+		outboxPayload, _ := json.Marshal(map[string]any{
+			"usage_id": usageID, "cache_refresh_intent_id": intent.ID,
+			"cache_lease_id": intent.CacheLeaseID, "amount_micros": refreshCost,
+			"currency": intent.Candidate.RefreshPriceSnapshot.Currency,
+		})
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO transactional_outbox (
+				tenant_id, aggregate_type, aggregate_id, aggregate_revision, event_type, payload
+			) VALUES ($1,'cache_refresh',$2,$3,'cache_refresh.usage_recorded',$4)
+			ON CONFLICT DO NOTHING`, intent.TenantID, intent.ID, intent.CacheLeaseRevision, outboxPayload); err != nil {
+			return Intent{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -201,7 +239,14 @@ func (r *PostgresIntentRepository) CustomerRequest(ctx context.Context, anchor p
 		SELECT l.id, l.original_expires_at, l.last_refresh_succeeded_at,
 		       l.last_refresh_expires_at, l.last_refresh_cost_micros,
 		       l.last_forecast_cost_micros, l.last_storage_cost_micros,
-		       l.last_route_lock_cost_micros
+		       l.last_route_lock_cost_micros, COALESCE(l.last_refresh_usage_id,''),
+		       COALESCE(l.last_refresh_provider_usage,'{}'::jsonb),
+		       COALESCE((
+		           SELECT i.candidate->>'HoldoutCohort'
+		           FROM cache_refresh_intents i
+		           WHERE i.tenant_id = l.tenant_id AND i.cache_lease_id = l.id AND i.status = 'succeeded'
+		           ORDER BY i.updated_at DESC LIMIT 1
+		       ), '')
 		FROM cache_leases l
 		WHERE l.tenant_id = $1 AND l.route_id = $2 AND l.provider = $3 AND l.model = $4
 		  AND l.credential_scope = $5 AND l.region = $6 AND l.cache_key = $7 AND l.prefix_hash = $8
@@ -215,6 +260,7 @@ func (r *PostgresIntentRepository) CustomerRequest(ctx context.Context, anchor p
 		&candidate.CacheLeaseID, &candidate.OriginalLeaseExpiresAt, &candidate.RefreshSucceededAt,
 		&candidate.RefreshExpiresAt, &candidate.RefreshCostMicros, &candidate.ForecastCostMicros,
 		&candidate.StorageCostMicros, &candidate.RouteLockCostMicros,
+		&candidate.RefreshUsageID, &candidate.RefreshProviderUsage, &candidate.HoldoutCohort,
 	)
 	if err == nil {
 		requestResult.ProtectedHitCandidate = &candidate
@@ -225,6 +271,43 @@ func (r *PostgresIntentRepository) CustomerRequest(ctx context.Context, anchor p
 		return CustomerRequestResult{}, err
 	}
 	return requestResult, nil
+}
+
+func ensureRefreshPriceSnapshot(ctx context.Context, tx *sql.Tx, snapshot core.PriceSnapshot) error {
+	if snapshot.ID == "" || snapshot.Provider == "" || snapshot.Model == "" || snapshot.Region == "" ||
+		snapshot.Currency == "" || snapshot.Source == "" {
+		return errors.New("cache refresh requires an immutable price snapshot")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO provider_price_snapshots (
+			id, provider, model, region, currency, input_per_million, cached_input_per_million,
+			cache_write_per_million, output_per_million, effective_at, source
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,to_timestamp($10),$11)
+		ON CONFLICT (id) DO NOTHING`,
+		snapshot.ID, snapshot.Provider, snapshot.Model, snapshot.Region, snapshot.Currency,
+		snapshot.InputPerMillionMicros, snapshot.CachedInputPerMillionMicros,
+		snapshot.CacheWritePerMillionMicros, snapshot.OutputPerMillionMicros,
+		snapshot.EffectiveAt, snapshot.Source,
+	); err != nil {
+		return err
+	}
+	var existing core.PriceSnapshot
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id, provider, model, region, currency, input_per_million::bigint,
+		       cached_input_per_million::bigint, cache_write_per_million::bigint,
+		       output_per_million::bigint, extract(epoch FROM effective_at)::bigint, source
+		FROM provider_price_snapshots WHERE id = $1`, snapshot.ID).Scan(
+		&existing.ID, &existing.Provider, &existing.Model, &existing.Region, &existing.Currency,
+		&existing.InputPerMillionMicros, &existing.CachedInputPerMillionMicros,
+		&existing.CacheWritePerMillionMicros, &existing.OutputPerMillionMicros,
+		&existing.EffectiveAt, &existing.Source,
+	); err != nil {
+		return err
+	}
+	if existing != snapshot {
+		return errors.New("refresh price snapshot ID already has different immutable values")
+	}
+	return nil
 }
 
 func (r *PostgresIntentRepository) ClaimDue(ctx context.Context, now time.Time, limit int) ([]Intent, error) {

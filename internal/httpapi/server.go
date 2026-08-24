@@ -37,20 +37,25 @@ func (a StaticAuthenticator) Authenticate(request *http.Request) (string, error)
 }
 
 type Config struct {
-	Runtime           *runtime.Runtime
-	Authenticator     Authenticator
-	TenantHomeRegions map[string]string
+	Runtime               *runtime.Runtime
+	Authenticator         Authenticator
+	TenantHomeRegions     map[string]string
+	TenantExecutionEpochs map[string]int64
 }
 
 type Server struct {
-	runtime       *runtime.Runtime
-	authenticator Authenticator
-	homeRegions   map[string]string
-	mux           *http.ServeMux
+	runtime         *runtime.Runtime
+	authenticator   Authenticator
+	homeRegions     map[string]string
+	executionEpochs map[string]int64
+	mux             *http.ServeMux
 }
 
 func New(config Config) http.Handler {
-	server := &Server{runtime: config.Runtime, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions, mux: http.NewServeMux()}
+	server := &Server{
+		runtime: config.Runtime, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
+		executionEpochs: config.TenantExecutionEpochs, mux: http.NewServeMux(),
+	}
 	server.mux.HandleFunc("POST /v1/responses", server.createResponse)
 	server.mux.HandleFunc("GET /v1/responses/{response_id}", server.getResponse)
 	server.mux.HandleFunc("DELETE /v1/responses/{response_id}", server.deleteResponse)
@@ -110,6 +115,10 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model is required", "model")
 		return
 	}
+	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "compatibility_mode")
+		return
+	}
 	input, err := decodeInput(payload.Input)
 	if err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "input")
@@ -125,12 +134,17 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 	if payload.Store != nil {
 		storeResponse = *payload.Store
 	}
+	if !storeResponse && payload.Conversation != "" {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "store:false cannot mutate a Conversation", "store")
+		return
+	}
 	canonical := core.Request{
 		TenantID: request.Header.Get("X-Authenticated-Tenant-ID"), Model: payload.Model, Input: input,
 		Stream: payload.Stream, Background: payload.Background, Store: storeResponse,
 		PreviousResponseID: payload.PreviousResponseID, ConversationID: payload.Conversation,
-		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: []string{"text"}, Metadata: payload.Metadata,
+		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: requestedFeatures(input), Metadata: payload.Metadata,
 		HomeRegion:      s.homeRegion(request),
+		ExecutionEpoch:  s.executionEpoch(request),
 		IdempotencyKey:  strings.TrimSpace(request.Header.Get("Idempotency-Key")),
 		Tools:           payload.Tools,
 		ToolChoice:      payload.ToolChoice,
@@ -297,7 +311,9 @@ func (s *Server) createConversation(responseWriter http.ResponseWriter, request 
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "items")
 		return
 	}
-	conversation, err := s.runtime.CreateConversation(request.Context(), tenantID(request), s.homeRegion(request), payload.Items, payload.Metadata)
+	conversation, err := s.runtime.CreateConversation(
+		request.Context(), tenantID(request), s.homeRegion(request), s.executionEpoch(request), payload.Items, payload.Metadata,
+	)
 	if err != nil {
 		writeStoreError(responseWriter, err)
 		return
@@ -419,12 +435,16 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model and messages are required", "")
 		return
 	}
+	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "compatibility_mode")
+		return
+	}
 	items, err := canonicalChatMessages(payload.Messages)
 	if err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "messages")
 		return
 	}
-	features := []string{"text"}
+	features := requestedFeatures(items)
 	if payload.Stream {
 		features = append(features, "streaming")
 	}
@@ -441,8 +461,8 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 	canonical := core.Request{
 		TenantID: tenantID(request), Model: payload.Model, Input: items, Stream: payload.Stream, Store: true,
 		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: features, Metadata: payload.Metadata,
-		HomeRegion: s.homeRegion(request),
-		Tools:      payload.Tools, ToolChoice: payload.ToolChoice, Temperature: payload.Temperature,
+		HomeRegion: s.homeRegion(request), ExecutionEpoch: s.executionEpoch(request),
+		Tools: payload.Tools, ToolChoice: payload.ToolChoice, Temperature: payload.Temperature,
 		TopP: payload.TopP, MaxOutputTokens: maxOutputTokens, Stop: payload.Stop, EndUserID: payload.User,
 		CacheProtection: payload.CacheProtection,
 	}
@@ -550,8 +570,35 @@ func canonicalChatMessages(messages []chatMessage) ([]core.Item, error) {
 		}
 		var text string
 		contentPresent := hasJSONValue(message.Content)
+		var content []core.Content
 		if contentPresent && json.Unmarshal(message.Content, &text) != nil {
-			return nil, errors.New("only string chat message content is supported in this compatibility tier")
+			var parts []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text,omitempty"`
+				ImageURL *struct {
+					URL    string `json:"url"`
+					Detail string `json:"detail,omitempty"`
+				} `json:"image_url,omitempty"`
+			}
+			if err := json.Unmarshal(message.Content, &parts); err != nil || len(parts) == 0 {
+				return nil, errors.New("chat message content must be a string or a non-empty content-part array")
+			}
+			for _, part := range parts {
+				switch part.Type {
+				case "text":
+					if part.Text == "" {
+						return nil, errors.New("text content parts require text")
+					}
+					content = append(content, core.Content{Type: "input_text", Text: part.Text})
+				case "image_url":
+					if part.ImageURL == nil || part.ImageURL.URL == "" {
+						return nil, errors.New("image_url content parts require a URL")
+					}
+					content = append(content, core.Content{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: part.ImageURL.Detail})
+				default:
+					return nil, fmt.Errorf("unsupported chat content part type %q", part.Type)
+				}
+			}
 		}
 		item := core.Item{Type: "message", Role: message.Role, Name: message.Name, CallID: message.ToolCallID}
 		if message.Role == "tool" {
@@ -562,7 +609,10 @@ func canonicalChatMessages(messages []chatMessage) ([]core.Item, error) {
 			item.Output = text
 			items = append(items, item)
 		} else if contentPresent {
-			item.Content = []core.Content{{Type: "input_text", Text: text}}
+			if content == nil {
+				content = []core.Content{{Type: "input_text", Text: text}}
+			}
+			item.Content = content
 			items = append(items, item)
 		} else if len(message.ToolCalls) == 0 {
 			return nil, errors.New("chat messages require string content unless assistant tool_calls are present")
@@ -648,6 +698,10 @@ func writeNamedSSE(responseWriter http.ResponseWriter, eventName string, value a
 }
 
 func writeRuntimeError(responseWriter http.ResponseWriter, result core.Response, err error) {
+	if errors.Is(err, runtime.ErrQuotaExceeded) {
+		writeError(responseWriter, http.StatusTooManyRequests, "rate_limit_exceeded", err.Error(), "")
+		return
+	}
 	if errors.Is(err, store.ErrIdempotencyMismatch) {
 		writeError(responseWriter, http.StatusConflict, "idempotency_conflict", store.ErrIdempotencyMismatch.Error(), "Idempotency-Key")
 		return
@@ -695,8 +749,48 @@ func validateItems(items []core.Item) error {
 		if items[index].Type == "" {
 			return errors.New("every item must have a type")
 		}
+		for _, content := range items[index].Content {
+			switch content.Type {
+			case "input_text", "output_text", "text":
+				if content.Text == "" {
+					return errors.New("text content requires text")
+				}
+			case "input_image":
+				if content.ImageURL == "" && content.FileID == "" {
+					return errors.New("input_image content requires image_url or file_id")
+				}
+			case "input_file":
+				if content.FileID == "" && content.FileData == "" {
+					return errors.New("input_file content requires file_id or file_data")
+				}
+			default:
+				return fmt.Errorf("unsupported content type %q", content.Type)
+			}
+		}
 	}
 	return nil
+}
+
+func requestedFeatures(items []core.Item) []string {
+	features := []string{"text"}
+	multimodal, reasoning := false, false
+	for _, item := range items {
+		if item.Type == "reasoning" || len(item.Summary) > 0 || item.EncryptedContent != "" || len(item.ProviderMetadata) > 0 {
+			reasoning = true
+		}
+		for _, content := range item.Content {
+			if content.Type == "input_image" || content.Type == "input_file" {
+				multimodal = true
+			}
+		}
+	}
+	if multimodal {
+		features = append(features, "multimodal")
+	}
+	if reasoning {
+		features = append(features, "reasoning")
+	}
+	return features
 }
 
 func validateCacheProtection(policy *core.CacheProtectionPolicy) error {
@@ -713,6 +807,13 @@ func validateCacheProtection(policy *core.CacheProtectionPolicy) error {
 		return errors.New("cache protection bounds exceed the supported safety limits")
 	}
 	return nil
+}
+
+func validateCompatibilityMode(mode core.CompatibilityMode) error {
+	if mode == "" || mode == core.CompatibilityStrict || mode == core.CompatibilityBestEffort {
+		return nil
+	}
+	return errors.New("compatibility_mode must be strict or best_effort")
 }
 
 func decodeBody(request *http.Request, target any) error {
@@ -734,6 +835,13 @@ func (s *Server) homeRegion(request *http.Request) string {
 		return region
 	}
 	return "local"
+}
+
+func (s *Server) executionEpoch(request *http.Request) int64 {
+	if epoch := s.executionEpochs[tenantID(request)]; epoch > 0 {
+		return epoch
+	}
+	return 1
 }
 
 func writeStoreError(responseWriter http.ResponseWriter, err error) {

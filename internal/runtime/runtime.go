@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,23 +24,27 @@ import (
 )
 
 type Runtime struct {
-	store             store.ResponseStore
-	router            provider.Router
-	now               func() time.Time
-	idleTimeout       time.Duration
-	keepaliveInterval time.Duration
-	cacheCoordinator  *cacheprotection.Coordinator
-	cacheError        func(error)
-	tracer            trace.Tracer
-	responses         metric.Int64Counter
-	providerAttempts  metric.Int64Counter
-	tokens            metric.Int64Counter
-	costMicros        metric.Int64Counter
-	cacheOutcomes     metric.Int64Counter
-	providerDuration  metric.Float64Histogram
+	store               store.ResponseStore
+	router              provider.Router
+	now                 func() time.Time
+	idleTimeout         time.Duration
+	keepaliveInterval   time.Duration
+	cacheCoordinator    *cacheprotection.Coordinator
+	cacheError          func(error)
+	tracer              trace.Tracer
+	responses           metric.Int64Counter
+	providerAttempts    metric.Int64Counter
+	tokens              metric.Int64Counter
+	costMicros          metric.Int64Counter
+	cacheOutcomes       metric.Int64Counter
+	providerDuration    metric.Float64Histogram
+	cacheProtectionMode string
+	cacheHoldoutPercent int
+	tenantPolicies      map[string]core.TenantPolicy
 
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc
+	mu       sync.Mutex
+	cancels  map[string]context.CancelFunc
+	inflight map[string]int
 }
 
 type Options struct {
@@ -47,9 +52,19 @@ type Options struct {
 	KeepaliveInterval   time.Duration
 	CacheCoordinator    *cacheprotection.Coordinator
 	OnCacheError        func(error)
+	CacheProtectionMode string
+	CacheHoldoutPercent int
+	TenantPolicies      map[string]core.TenantPolicy
 }
 
+const (
+	CacheProtectionShadowMode          = "shadow"
+	CacheProtectionAnthropicCanaryMode = "anthropic-one-refresh-canary"
+)
+
 var ErrProviderIdleTimeout = errors.New("provider stream idle timeout")
+
+var ErrQuotaExceeded = errors.New("tenant concurrent Response quota exceeded")
 
 func New(responseStore store.ResponseStore, router provider.Router) *Runtime {
 	return NewWithOptions(responseStore, router, Options{})
@@ -62,6 +77,12 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 	if options.KeepaliveInterval <= 0 {
 		options.KeepaliveInterval = 15 * time.Second
 	}
+	if options.CacheProtectionMode == "" {
+		options.CacheProtectionMode = CacheProtectionShadowMode
+	}
+	if options.CacheHoldoutPercent < 0 || options.CacheHoldoutPercent > 100 {
+		options.CacheHoldoutPercent = 100
+	}
 	meter := otel.Meter("github.com/toddzheng/llm-gateway/runtime")
 	responses, _ := meter.Int64Counter("gateway.responses")
 	providerAttempts, _ := meter.Int64Counter("gateway.provider.attempts")
@@ -70,12 +91,14 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 	cacheOutcomes, _ := meter.Int64Counter("gateway.cache.outcomes")
 	providerDuration, _ := meter.Float64Histogram("gateway.provider.duration", metric.WithUnit("s"))
 	return &Runtime{
-		store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc),
+		store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc), inflight: make(map[string]int),
 		idleTimeout: options.ProviderIdleTimeout, keepaliveInterval: options.KeepaliveInterval,
 		cacheCoordinator: options.CacheCoordinator, cacheError: options.OnCacheError,
 		tracer: otel.Tracer("github.com/toddzheng/llm-gateway/runtime"), responses: responses,
 		providerAttempts: providerAttempts, tokens: tokens, costMicros: costMicros,
 		cacheOutcomes: cacheOutcomes, providerDuration: providerDuration,
+		cacheProtectionMode: options.CacheProtectionMode, cacheHoldoutPercent: options.CacheHoldoutPercent,
+		tenantPolicies: cloneTenantPolicies(options.TenantPolicies),
 	}
 }
 
@@ -100,14 +123,27 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	if request.TenantID == "" || request.Model == "" {
 		return core.Response{}, errors.New("tenant and model are required")
 	}
+	if err := r.admit(request); err != nil {
+		return core.Response{}, err
+	}
+	defer r.release(request.TenantID)
 	if request.CompatibilityMode == "" {
 		request.CompatibilityMode = core.CompatibilityStrict
+	}
+	if request.CompatibilityMode != core.CompatibilityStrict && request.CompatibilityMode != core.CompatibilityBestEffort {
+		return core.Response{}, errors.New("compatibility_mode must be strict or best_effort")
 	}
 	if request.HomeRegion == "" {
 		request.HomeRegion = "local"
 	}
+	if request.ExecutionEpoch <= 0 {
+		request.ExecutionEpoch = 1
+	}
 	if request.ConversationID != "" && request.PreviousResponseID != "" {
 		return core.Response{}, errors.New("conversation and previous_response_id cannot both be set")
+	}
+	if !request.Store && request.ConversationID != "" {
+		return core.Response{}, errors.New("store:false cannot mutate a Conversation")
 	}
 	responseInput := prepareItems(request.Input)
 	request.Input = responseInput
@@ -123,11 +159,14 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		if conversation.HomeRegion != request.HomeRegion {
 			return core.Response{}, errors.New("conversation belongs to a different home region")
 		}
+		if conversation.ExecutionEpoch != request.ExecutionEpoch {
+			return core.Response{}, errors.New("conversation belongs to a different execution epoch")
+		}
 		request.Input = append(cloneItems(conversation.Items), responseInput...)
 		request.ContextItemCount = len(conversation.Items)
 	}
 	if request.PreviousResponseID != "" {
-		chain, previous, err := r.responseChain(ctx, request.TenantID, request.PreviousResponseID, request.HomeRegion)
+		chain, previous, err := r.responseChain(ctx, request.TenantID, request.PreviousResponseID, request.HomeRegion, request.ExecutionEpoch)
 		if err != nil {
 			return core.Response{}, fmt.Errorf("previous response: %w", err)
 		}
@@ -143,6 +182,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		Model: request.Model, PreviousResponseID: request.PreviousResponseID, ConversationID: request.ConversationID,
 		Input: responseInput, Output: []core.Item{}, Metadata: request.Metadata,
 		HomeRegion: request.HomeRegion, Revision: 1,
+		ExecutionEpoch: request.ExecutionEpoch, RetainContent: request.Store,
 	}
 	responseSpan.SetAttributes(attribute.String("gateway.response.id", response.ID))
 	if request.IdempotencyKey != "" {
@@ -159,7 +199,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		if !created {
 			return existing, nil
 		}
-	} else if err := r.store.Create(ctx, request.TenantID, response); err != nil {
+	} else if err := r.store.Create(ctx, request.TenantID, responseForPersistence(response)); err != nil {
 		return core.Response{}, fmt.Errorf("create response: %w", err)
 	}
 	sequence := int64(0)
@@ -323,17 +363,17 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		if protectedHit != nil && route.CacheUsageReliable && response.Usage.CachedInputTokens > 0 {
 			usageRecord.ProtectedHit = protectedHit
 		}
-		financialStore, supportsFinancialCompletion := r.store.(store.FinancialResponseStore)
+		financialStore, supportsFinancialFinalization := r.store.(store.FinancialResponseFinalizer)
 		var persistErr error
-		if supportsFinancialCompletion {
+		if supportsFinancialFinalization {
 			if err := validatePriceSnapshot(route, usageRecord.PriceSnapshot); err != nil {
 				return core.Response{}, err
 			}
-			persistErr = financialStore.CompleteWithUsage(
-				context.WithoutCancel(executionCtx), request.TenantID, response, response.Revision, usageRecord,
+			persistErr = financialStore.FinalizeWithUsage(
+				context.WithoutCancel(executionCtx), request.TenantID, responseForPersistence(response), response.Revision, usageRecord,
 			)
 		} else {
-			persistErr = r.store.Update(context.WithoutCancel(executionCtx), request.TenantID, response, response.Revision)
+			persistErr = r.store.Update(context.WithoutCancel(executionCtx), request.TenantID, responseForPersistence(response), response.Revision)
 		}
 		if persistErr != nil {
 			return core.Response{}, fmt.Errorf("persist completed response and usage: %w", persistErr)
@@ -368,6 +408,52 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		return r.cancelled(context.WithoutCancel(executionCtx), request.TenantID, response)
 	}
 	return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "provider_unavailable", lastErr)
+}
+
+func (r *Runtime) admit(request core.Request) error {
+	policy, configured := r.tenantPolicies[request.TenantID]
+	if configured {
+		if policy.MaxInputItems > 0 && len(request.Input) > policy.MaxInputItems {
+			return fmt.Errorf("tenant input-item quota exceeded: maximum is %d", policy.MaxInputItems)
+		}
+		if request.Store && policy.AllowStoredResponses != nil && !*policy.AllowStoredResponses {
+			return errors.New("tenant policy forbids stored Responses")
+		}
+		if request.CacheProtection != nil && request.CacheProtection.Enabled {
+			if policy.AllowCacheProtection != nil && !*policy.AllowCacheProtection {
+				return errors.New("tenant policy forbids Cache Protection")
+			}
+			if request.CacheProtection.AllowContentInspection &&
+				(policy.AllowContentInspection == nil || !*policy.AllowContentInspection) {
+				return errors.New("tenant policy forbids Cache Protection content inspection")
+			}
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if configured && policy.MaxConcurrentResponses > 0 && r.inflight[request.TenantID] >= policy.MaxConcurrentResponses {
+		return ErrQuotaExceeded
+	}
+	r.inflight[request.TenantID]++
+	return nil
+}
+
+func (r *Runtime) release(tenantID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inflight[tenantID] <= 1 {
+		delete(r.inflight, tenantID)
+		return
+	}
+	r.inflight[tenantID]--
+}
+
+func cloneTenantPolicies(policies map[string]core.TenantPolicy) map[string]core.TenantPolicy {
+	cloned := make(map[string]core.TenantPolicy, len(policies))
+	for tenantID, policy := range policies {
+		cloned[tenantID] = policy
+	}
+	return cloned
 }
 
 func validatePriceSnapshot(route provider.Route, snapshot core.PriceSnapshot) error {
@@ -407,7 +493,10 @@ func (r *Runtime) observeCustomerRequest(ctx context.Context, request core.Reque
 				CacheLeaseID: candidate.CacheLeaseID, OriginalLeaseExpiresAt: candidate.OriginalLeaseExpiresAt,
 				RefreshSucceededAt: candidate.RefreshSucceededAt, RefreshExpiresAt: candidate.RefreshExpiresAt,
 				CustomerRequestAt: r.now().UTC(), RefreshCostMicros: candidate.RefreshCostMicros,
-				ForecastCostMicros: candidate.ForecastCostMicros, StorageCostMicros: candidate.StorageCostMicros,
+				RefreshUsageID:       candidate.RefreshUsageID,
+				RefreshProviderUsage: append(json.RawMessage(nil), candidate.RefreshProviderUsage...),
+				HoldoutCohort:        candidate.HoldoutCohort,
+				ForecastCostMicros:   candidate.ForecastCostMicros, StorageCostMicros: candidate.StorageCostMicros,
 				RouteLockCostMicros: candidate.RouteLockCostMicros,
 			}
 		}
@@ -457,15 +546,28 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 		refreshCost = coldCost
 	}
 	policy := request.CacheProtection
+	shadowMode := true
+	holdoutCohort := "shadow"
+	maxRefreshes := policy.MaxRefreshes
+	leaseID := cacheLeaseID(observation.Anchor)
+	if r.cacheProtectionMode == CacheProtectionAnthropicCanaryMode {
+		maxRefreshes = min(maxRefreshes, 1)
+		if stableCohortBucket(leaseID) < r.cacheHoldoutPercent {
+			holdoutCohort = "holdout"
+		} else {
+			holdoutCohort = "treatment"
+			shadowMode = policy.ShadowMode
+		}
+	}
 	candidate := cacheprotection.Candidate{
 		Policy: cacheprotection.Policy{
-			Enabled: policy.Enabled, MaxSpendMicros: policy.MaxSpendMicros, MaxRefreshes: policy.MaxRefreshes,
+			Enabled: policy.Enabled, MaxSpendMicros: policy.MaxSpendMicros, MaxRefreshes: maxRefreshes,
 			MaxProtectionWindow: time.Duration(policy.MaxProtectionWindowSec) * time.Second,
 			SafetyMarginMicros:  policy.SafetyMarginMicros, AllowContentInspection: policy.AllowContentInspection,
-			ShadowMode: policy.ShadowMode,
+			ShadowMode: shadowMode,
 		},
 		Lease: cacheprotection.Lease{
-			ID: cacheLeaseID(observation.Anchor), Revision: 1, Anchor: observation.Anchor,
+			ID: leaseID, Revision: 1, Anchor: observation.Anchor,
 			CreatedAt: now, EstimatedExpiresAt: observation.EstimatedExpiresAt, FencingToken: 1,
 			SideEffecting: observation.SideEffecting,
 		},
@@ -476,6 +578,8 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 			PredictedColdCostMicros: coldCost, PredictedHitCostMicros: hitCost,
 			RefreshCostMicros: refreshCost,
 		},
+		RefreshPriceSnapshot: route.PriceSnapshot,
+		HoldoutCohort:        holdoutCohort,
 	}
 	intent, err := r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
 	status := string(intent.Status)
@@ -489,6 +593,11 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 	if err != nil && r.cacheError != nil {
 		r.cacheError(err)
 	}
+}
+
+func stableCohortBucket(identity string) int {
+	digest := sha256.Sum256([]byte(identity))
+	return int(digest[0]) * 100 / 256
 }
 
 func hasToolWork(items []core.Item) bool {
@@ -508,7 +617,7 @@ func cacheLeaseID(anchor provider.CacheAnchor) string {
 	return "lease_" + hex.EncodeToString(digest[:16])
 }
 
-func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeRegion string) ([]core.Item, core.Response, error) {
+func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeRegion string, executionEpoch int64) ([]core.Item, core.Response, error) {
 	seen := make(map[string]struct{})
 	var reversed []core.Response
 	currentID := responseID
@@ -527,6 +636,9 @@ func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeR
 		if response.HomeRegion != "" && response.HomeRegion != homeRegion {
 			return nil, core.Response{}, errors.New("response chain crosses home regions")
 		}
+		if response.ExecutionEpoch != executionEpoch {
+			return nil, core.Response{}, errors.New("response chain crosses execution epochs")
+		}
 		if response.Status != core.ResponseStatusCompleted {
 			return nil, core.Response{}, errors.New("previous response is not completed")
 		}
@@ -539,6 +651,27 @@ func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeR
 		items = append(items, cloneItems(reversed[index].Output)...)
 	}
 	return items, reversed[0], nil
+}
+
+func responseForPersistence(response core.Response) core.Response {
+	if response.RetainContent {
+		return response
+	}
+	redacted := response
+	redacted.Input = nil
+	redacted.Output = nil
+	redacted.Metadata = nil
+	if redacted.Error != nil {
+		redacted.Error = &core.Error{Code: redacted.Error.Code, Type: redacted.Error.Type, Param: redacted.Error.Param, Message: "redacted by store:false"}
+	}
+	redacted.Attempts = append([]core.Attempt(nil), response.Attempts...)
+	for index := range redacted.Attempts {
+		if redacted.Attempts[index].Error != nil {
+			errorValue := redacted.Attempts[index].Error
+			redacted.Attempts[index].Error = &core.Error{Code: errorValue.Code, Type: errorValue.Type, Param: errorValue.Param, Message: "redacted by store:false"}
+		}
+	}
+	return redacted
 }
 
 func prepareItems(items []core.Item) []core.Item {
@@ -610,14 +743,14 @@ func (r *Runtime) InputItems(ctx context.Context, tenantID, responseID string) (
 	return r.store.ListInputItems(ctx, tenantID, responseID)
 }
 
-func (r *Runtime) CreateConversation(ctx context.Context, tenantID, homeRegion string, items []core.Item, metadata map[string]string) (core.Conversation, error) {
+func (r *Runtime) CreateConversation(ctx context.Context, tenantID, homeRegion string, executionEpoch int64, items []core.Item, metadata map[string]string) (core.Conversation, error) {
 	conversationStore, ok := r.store.(store.ConversationStore)
 	if !ok {
 		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
 	}
 	conversation := core.Conversation{
 		ID: newID("conv"), Object: "conversation", CreatedAt: r.now().UTC().Unix(), HomeRegion: homeRegion,
-		Items: prepareItems(items), Metadata: metadata, Revision: 1,
+		ExecutionEpoch: executionEpoch, Items: prepareItems(items), Metadata: metadata, Revision: 1,
 	}
 	if err := conversationStore.CreateConversation(ctx, tenantID, conversation); err != nil {
 		return core.Conversation{}, err
@@ -672,10 +805,15 @@ func (r *Runtime) Cancel(ctx context.Context, tenantID, responseID string) (core
 		cancel()
 	}
 	response.Status = core.ResponseStatusCancelled
-	if err := r.store.Update(ctx, tenantID, response, response.Revision); err != nil {
+	if err := r.store.Update(ctx, tenantID, responseForPersistence(response), response.Revision); err != nil {
 		return core.Response{}, err
 	}
 	response.Revision++
+	if !response.RetainContent {
+		if err := r.store.Delete(ctx, tenantID, response.ID, response.Revision); err != nil {
+			return core.Response{}, err
+		}
+	}
 	return response, nil
 }
 
@@ -686,10 +824,15 @@ func (r *Runtime) fail(ctx context.Context, tenantID string, response core.Respo
 	r.responses.Add(ctx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "failed"), attribute.String("gateway.error.code", code)))
 	response.Status = core.ResponseStatusFailed
 	response.Error = gatewayError(code, cause)
-	if err := r.store.Update(ctx, tenantID, response, response.Revision); err != nil {
+	if err := r.store.Update(ctx, tenantID, responseForPersistence(response), response.Revision); err != nil {
 		return core.Response{}, errors.Join(cause, err)
 	}
 	response.Revision++
+	if !response.RetainContent {
+		if err := r.store.Delete(ctx, tenantID, response.ID, response.Revision); err != nil {
+			return core.Response{}, errors.Join(cause, err)
+		}
+	}
 	return response, cause
 }
 
@@ -698,7 +841,7 @@ func (r *Runtime) cancelled(ctx context.Context, tenantID string, response core.
 	r.responses.Add(ctx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "cancelled")))
 	response.Status = core.ResponseStatusCancelled
 	response.Error = nil
-	err := r.store.Update(ctx, tenantID, response, response.Revision)
+	err := r.store.Update(ctx, tenantID, responseForPersistence(response), response.Revision)
 	if errors.Is(err, store.ErrConflict) {
 		current, getErr := r.store.Get(ctx, tenantID, response.ID)
 		if getErr == nil && current.Status == core.ResponseStatusCancelled {
@@ -709,6 +852,11 @@ func (r *Runtime) cancelled(ctx context.Context, tenantID string, response core.
 		return core.Response{}, errors.Join(context.Canceled, err)
 	}
 	response.Revision++
+	if !response.RetainContent {
+		if deleteErr := r.store.Delete(ctx, tenantID, response.ID, response.Revision); deleteErr != nil {
+			return core.Response{}, errors.Join(context.Canceled, deleteErr)
+		}
+	}
 	return response, context.Canceled
 }
 

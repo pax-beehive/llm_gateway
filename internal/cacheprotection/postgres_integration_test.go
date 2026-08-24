@@ -14,6 +14,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
+	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
@@ -37,16 +38,20 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region) VALUES ($1, 'local')`, tenantID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = db.Exec(`DELETE FROM cache_refresh_intents WHERE tenant_id = $1`, tenantID)
-		_, _ = db.Exec(`DELETE FROM cache_leases WHERE tenant_id = $1`, tenantID)
-		_, _ = db.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)
-	})
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	candidate := eligibleCandidate(now)
 	candidate.Lease.Anchor.TenantID = tenantID
 	candidate.Lease.EstimatedExpiresAt = now.Add(5 * time.Minute)
 	candidate.Forecast.ExpectedAt = now.Add(30 * time.Minute)
+	candidate.HoldoutCohort = "treatment"
+	t.Cleanup(func() {
+		_, _ = db.Exec(`DELETE FROM transactional_outbox WHERE tenant_id = $1`, tenantID)
+		_, _ = db.Exec(`DELETE FROM cache_refresh_usage_ledger WHERE tenant_id = $1`, tenantID)
+		_, _ = db.Exec(`DELETE FROM cache_refresh_intents WHERE tenant_id = $1`, tenantID)
+		_, _ = db.Exec(`DELETE FROM cache_leases WHERE tenant_id = $1`, tenantID)
+		_, _ = db.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)
+		_, _ = db.Exec(`DELETE FROM provider_price_snapshots WHERE id = $1`, candidate.RefreshPriceSnapshot.ID)
+	})
 	repository := cacheprotection.NewPostgresIntentRepository(db)
 	planner := cacheprotection.NewCoordinator(repository, func() time.Time { return now })
 	var refreshCalls atomic.Int64
@@ -54,7 +59,11 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 		inspect: provider.CacheCapability{Supported: true},
 		refresh: func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
 			refreshCalls.Add(1)
-			return provider.RefreshResult{Status: "succeeded", ExpiresAt: now.Add(10 * time.Minute)}, nil
+			return provider.RefreshResult{
+				Status: "succeeded", ExpiresAt: now.Add(10 * time.Minute),
+				Usage:         core.Usage{InputTokens: 100_000, CacheWriteInputTokens: 100_000},
+				ProviderUsage: []byte(`{"cache_creation_input_tokens":100000}`),
+			}, nil
 		},
 	}
 	planned, err := planner.Run(ctx, candidate, protector)
@@ -86,6 +95,18 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	if revision != candidate.Lease.Revision+1 || fencingToken != candidate.Lease.FencingToken+1 || status != "refreshed" {
 		t.Fatalf("lease revision/fence/status = %d/%d/%s", revision, fencingToken, status)
 	}
+	var refreshAmount int64
+	var refreshProviderUsage []byte
+	if err := db.QueryRowContext(ctx, `
+		SELECT amount::bigint, provider_usage
+		FROM cache_refresh_usage_ledger
+		WHERE tenant_id = $1 AND cache_refresh_intent_id = $2`, tenantID, completed[0].ID,
+	).Scan(&refreshAmount, &refreshProviderUsage); err != nil {
+		t.Fatal(err)
+	}
+	if refreshAmount != 1_250_000 || string(refreshProviderUsage) != `{"cache_creation_input_tokens": 100000}` {
+		t.Fatalf("refresh financial evidence = %d / %s", refreshAmount, refreshProviderUsage)
+	}
 	requestObserver := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(6 * time.Minute) })
 	requestResult, err := requestObserver.CustomerRequest(ctx, candidate.Lease.Anchor)
 	if err != nil {
@@ -93,6 +114,7 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	}
 	evidence := requestResult.ProtectedHitCandidate
 	if evidence == nil || evidence.CacheLeaseID != candidate.Lease.ID ||
+		evidence.RefreshUsageID != completed[0].ID+"_usage" || evidence.HoldoutCohort != "treatment" ||
 		!evidence.OriginalLeaseExpiresAt.Equal(now.Add(5*time.Minute)) ||
 		!evidence.RefreshExpiresAt.Equal(now.Add(10*time.Minute)) {
 		t.Fatalf("protected hit candidate = %#v", evidence)

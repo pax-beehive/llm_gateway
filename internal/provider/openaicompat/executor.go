@@ -115,14 +115,11 @@ func messagesFromItems(items []core.Item) ([]map[string]any, error) {
 	for _, item := range items {
 		switch item.Type {
 		case "message":
-			var content strings.Builder
-			for _, part := range item.Content {
-				if part.Type != "input_text" && part.Type != "text" {
-					return nil, fmt.Errorf("unsupported message content type %q", part.Type)
-				}
-				content.WriteString(part.Text)
+			content, err := openAIContent(item.Content)
+			if err != nil {
+				return nil, err
 			}
-			messages = append(messages, map[string]any{"role": item.Role, "content": content.String()})
+			messages = append(messages, map[string]any{"role": item.Role, "content": content})
 		case "function_call_output":
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": item.CallID, "content": item.Output})
 		default:
@@ -130,6 +127,35 @@ func messagesFromItems(items []core.Item) ([]map[string]any, error) {
 		}
 	}
 	return messages, nil
+}
+
+func openAIContent(parts []core.Content) (any, error) {
+	textOnly := true
+	var text strings.Builder
+	content := make([]map[string]any, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case "input_text", "output_text", "text":
+			text.WriteString(part.Text)
+			content = append(content, map[string]any{"type": "text", "text": part.Text})
+		case "input_image":
+			if part.ImageURL == "" {
+				return nil, errors.New("OpenAI-compatible Chat adapter requires image_url for input_image")
+			}
+			textOnly = false
+			image := map[string]any{"url": part.ImageURL}
+			if part.Detail != "" {
+				image["detail"] = part.Detail
+			}
+			content = append(content, map[string]any{"type": "image_url", "image_url": image})
+		default:
+			return nil, fmt.Errorf("unsupported message content type %q", part.Type)
+		}
+	}
+	if textOnly {
+		return text.String(), nil
+	}
+	return content, nil
 }
 
 type sseStream struct {

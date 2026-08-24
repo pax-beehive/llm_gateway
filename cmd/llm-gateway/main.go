@@ -53,6 +53,7 @@ type routeConfig struct {
 	PriceSource        string                                `json:"price_source"`
 	Currency           string                                `json:"currency"`
 	CacheUsageReliable bool                                  `json:"cache_usage_reliable"`
+	Healthy            *bool                                 `json:"healthy,omitempty"`
 	CacheRefresh       *cacheRefreshConfig                   `json:"cache_refresh,omitempty"`
 }
 
@@ -113,8 +114,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("GATEWAY_TENANT_HOME_REGIONS_JSON: %w", err)
 	}
+	executionEpochs, err := parseInt64MapEnv("GATEWAY_TENANT_EXECUTION_EPOCHS_JSON")
+	if err != nil {
+		return fmt.Errorf("GATEWAY_TENANT_EXECUTION_EPOCHS_JSON: %w", err)
+	}
+	tenantPolicies, err := parseTenantPoliciesEnv("GATEWAY_TENANT_POLICIES_JSON")
+	if err != nil {
+		return fmt.Errorf("GATEWAY_TENANT_POLICIES_JSON: %w", err)
+	}
 
-	responseStore, database, cleanup, err := configureStore(apiKeys, homeRegions)
+	responseStore, database, cleanup, err := configureStore(apiKeys, homeRegions, executionEpochs, tenantPolicies)
 	if err != nil {
 		return err
 	}
@@ -130,13 +139,24 @@ func run() error {
 		intentRepository = cacheprotection.NewMemoryIntentRepository()
 	}
 	cacheCoordinator := cacheprotection.NewCoordinator(intentRepository, time.Now)
+	cacheProtectionMode := envOr("GATEWAY_CACHE_PROTECTION_MODE", runtime.CacheProtectionShadowMode)
+	if cacheProtectionMode != runtime.CacheProtectionShadowMode && cacheProtectionMode != runtime.CacheProtectionAnthropicCanaryMode {
+		return errors.New("GATEWAY_CACHE_PROTECTION_MODE must be shadow or anthropic-one-refresh-canary")
+	}
+	holdoutPercent, err := strconv.Atoi(envOr("GATEWAY_CACHE_PROTECTION_HOLDOUT_PERCENT", "10"))
+	if err != nil || holdoutPercent < 0 || holdoutPercent > 100 {
+		return errors.New("GATEWAY_CACHE_PROTECTION_HOLDOUT_PERCENT must be an integer from 0 to 100")
+	}
 	engine := runtime.NewWithOptions(responseStore, router, runtime.Options{
-		CacheCoordinator: cacheCoordinator,
-		OnCacheError:     func(err error) { slog.Warn("cache protection degraded", "error", err) },
+		CacheCoordinator:    cacheCoordinator,
+		OnCacheError:        func(err error) { slog.Warn("cache protection degraded", "error", err) },
+		CacheProtectionMode: cacheProtectionMode, CacheHoldoutPercent: holdoutPercent,
+		TenantPolicies: tenantPolicies,
 	})
 	go runCacheWorker(ctx, cacheCoordinator, router)
 	handler := httpapi.New(httpapi.Config{
 		Runtime: engine, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
+		TenantExecutionEpochs: executionEpochs,
 	})
 
 	address := envOr("GATEWAY_ADDR", ":8080")
@@ -162,7 +182,7 @@ func run() error {
 	}
 }
 
-func configureStore(apiKeys, homeRegions map[string]string) (store.ResponseStore, *sql.DB, func(), error) {
+func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[string]int64, tenantPolicies map[string]core.TenantPolicy) (store.ResponseStore, *sql.DB, func(), error) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		if os.Getenv("GATEWAY_DEV_MEMORY_STORE") != "true" {
@@ -191,7 +211,7 @@ func configureStore(apiKeys, homeRegions map[string]string) (store.ResponseStore
 			return nil, nil, func() {}, err
 		}
 	}
-	if err := ensureTenants(ctx, db, apiKeys, homeRegions); err != nil {
+	if err := ensureTenants(ctx, db, apiKeys, homeRegions, executionEpochs, tenantPolicies); err != nil {
 		cleanup()
 		return nil, nil, func() {}, err
 	}
@@ -289,7 +309,7 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		}
 		routes = append(routes, provider.Route{
 			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
-			HomeRegion: config.HomeRegion, CredentialScope: config.CredentialScope, Healthy: true,
+			HomeRegion: config.HomeRegion, CredentialScope: config.CredentialScope, Healthy: config.Healthy == nil || *config.Healthy,
 			InputCost: config.InputCost, OutputCost: config.OutputCost, Executor: executor,
 			Profile: provider.CapabilityProfile{Revision: max(config.CapabilityRevision, 1), Features: config.Capabilities},
 			PriceSnapshot: core.PriceSnapshot{
@@ -403,7 +423,7 @@ func validNonNegativeCost(amount float64) bool {
 	return !math.IsNaN(amount) && !math.IsInf(amount, 0) && amount >= 0
 }
 
-func ensureTenants(ctx context.Context, db *sql.DB, apiKeys, homeRegions map[string]string) error {
+func ensureTenants(ctx context.Context, db *sql.DB, apiKeys, homeRegions map[string]string, executionEpochs map[string]int64, tenantPolicies map[string]core.TenantPolicy) error {
 	seen := make(map[string]struct{})
 	for _, tenantID := range apiKeys {
 		if _, exists := seen[tenantID]; exists {
@@ -414,13 +434,55 @@ func ensureTenants(ctx context.Context, db *sql.DB, apiKeys, homeRegions map[str
 		if homeRegion == "" {
 			return fmt.Errorf("tenant %q has no configured home region", tenantID)
 		}
+		executionEpoch := executionEpochs[tenantID]
+		if executionEpoch == 0 {
+			executionEpoch = 1
+		}
+		if executionEpoch < 0 {
+			return fmt.Errorf("tenant %q has an invalid execution epoch", tenantID)
+		}
+		policy := tenantPolicies[tenantID]
+		if policy.Revision == 0 {
+			policy.Revision = 1
+		}
+		policyDocument := policy
+		policyDocument.Revision = 0
+		policyPayload, err := json.Marshal(policyDocument)
+		if err != nil {
+			return fmt.Errorf("encode tenant %q policy: %w", tenantID, err)
+		}
 		if _, err := db.ExecContext(ctx, `
-			INSERT INTO tenants (id, home_region) VALUES ($1, $2)
-			ON CONFLICT (id) DO UPDATE SET home_region = EXCLUDED.home_region, updated_at = now()`, tenantID, homeRegion); err != nil {
+			INSERT INTO tenants (id, home_region, execution_epoch, policy_revision, policy) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (id) DO NOTHING`, tenantID, homeRegion, executionEpoch, policy.Revision, policyPayload); err != nil {
 			return fmt.Errorf("ensure tenant %q: %w", tenantID, err)
+		}
+		var storedRegion string
+		var storedEpoch, storedPolicyRevision int64
+		var policyMatches bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT home_region, execution_epoch, policy_revision, policy = $2::jsonb
+			FROM tenants WHERE id = $1`, tenantID, policyPayload).Scan(
+			&storedRegion, &storedEpoch, &storedPolicyRevision, &policyMatches,
+		); err != nil {
+			return err
+		}
+		if storedRegion != homeRegion || storedEpoch != executionEpoch || storedPolicyRevision != policy.Revision || !policyMatches {
+			return fmt.Errorf("tenant %q configuration does not match durable home region, execution epoch, or policy revision", tenantID)
 		}
 	}
 	return nil
+}
+
+func parseInt64MapEnv(name string) (map[string]int64, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return map[string]int64{}, nil
+	}
+	var result map[string]int64
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func parseStringMapEnv(name string) (map[string]string, error) {
@@ -431,6 +493,27 @@ func parseStringMapEnv(name string) (map[string]string, error) {
 	var result map[string]string
 	if err := json.Unmarshal([]byte(value), &result); err != nil {
 		return nil, err
+	}
+	return result, nil
+}
+
+func parseTenantPoliciesEnv(name string) (map[string]core.TenantPolicy, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return map[string]core.TenantPolicy{}, nil
+	}
+	var result map[string]core.TenantPolicy
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		return nil, err
+	}
+	for tenantID, policy := range result {
+		if policy.Revision == 0 {
+			policy.Revision = 1
+			result[tenantID] = policy
+		}
+		if tenantID == "" || policy.Revision < 1 || policy.MaxConcurrentResponses < 0 || policy.MaxInputItems < 0 {
+			return nil, errors.New("tenant IDs must be non-empty, policy revisions positive, and quotas non-negative")
+		}
 	}
 	return result, nil
 }

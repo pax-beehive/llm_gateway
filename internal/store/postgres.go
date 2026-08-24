@@ -30,6 +30,12 @@ var protectedHitMigration string
 //go:embed migrations/000006_cache_write_usage.sql
 var cacheWriteUsageMigration string
 
+//go:embed migrations/000007_retention_and_epoch.sql
+var retentionAndEpochMigration string
+
+//go:embed migrations/000008_refresh_financial_evidence.sql
+var refreshFinancialEvidenceMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -57,6 +63,12 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, cacheWriteUsageMigration); err != nil {
 		return fmt.Errorf("migrate cache write usage: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, retentionAndEpochMigration); err != nil {
+		return fmt.Errorf("migrate retention and execution epoch: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, refreshFinancialEvidenceMigration); err != nil {
+		return fmt.Errorf("migrate refresh financial evidence: %w", err)
+	}
 	return nil
 }
 
@@ -70,15 +82,19 @@ func (s *PostgresResponseStore) Create(ctx context.Context, tenantID string, res
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := assertTenantWriter(ctx, tx, tenantID, response.HomeRegion, response.ExecutionEpoch); err != nil {
+		return err
+	}
 	if err := s.beginConversationTx(ctx, tx, tenantID, response); err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO responses (
-			tenant_id, id, conversation_id, previous_response_id, status, home_region, revision, payload
-		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8)`,
+			tenant_id, id, conversation_id, previous_response_id, status, home_region,
+			execution_epoch, revision, retain_content, payload
+		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10)`,
 		tenantID, response.ID, response.ConversationID, response.PreviousResponseID, response.Status,
-		response.HomeRegion, response.Revision, payload,
+		response.HomeRegion, response.ExecutionEpoch, response.Revision, response.RetainContent, payload,
 	)
 	if err != nil {
 		return fmt.Errorf("insert response: %w", err)
@@ -99,6 +115,9 @@ func (s *PostgresResponseStore) CreateIdempotent(ctx context.Context, tenantID s
 		return core.Response{}, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := assertTenantWriter(ctx, tx, tenantID, response.HomeRegion, response.ExecutionEpoch); err != nil {
+		return core.Response{}, false, err
+	}
 	lockIdentity := tenantID + "\x1f" + operation + "\x1f" + key
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockIdentity); err != nil {
 		return core.Response{}, false, fmt.Errorf("lock idempotency key: %w", err)
@@ -131,10 +150,11 @@ func (s *PostgresResponseStore) CreateIdempotent(ctx context.Context, tenantID s
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO responses (
-			tenant_id, id, conversation_id, previous_response_id, status, home_region, revision, payload
-		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8)`,
+			tenant_id, id, conversation_id, previous_response_id, status, home_region,
+			execution_epoch, revision, retain_content, payload
+		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10)`,
 		tenantID, response.ID, response.ConversationID, response.PreviousResponseID, response.Status,
-		response.HomeRegion, response.Revision, payload,
+		response.HomeRegion, response.ExecutionEpoch, response.Revision, response.RetainContent, payload,
 	)
 	if err != nil {
 		return core.Response{}, false, fmt.Errorf("insert idempotent response: %w", err)
@@ -190,9 +210,10 @@ func (s *PostgresResponseStore) CreateIdempotent(ctx context.Context, tenantID s
 
 func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID string) (core.Response, error) {
 	var payload []byte
+	var retainContent bool
 	err := s.db.QueryRowContext(ctx, `
-		SELECT payload FROM responses
-		WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL`, tenantID, responseID).Scan(&payload)
+		SELECT payload, retain_content FROM responses
+		WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL`, tenantID, responseID).Scan(&payload, &retainContent)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.Response{}, ErrNotFound
 	}
@@ -203,6 +224,7 @@ func (s *PostgresResponseStore) Get(ctx context.Context, tenantID, responseID st
 	if err := json.Unmarshal(payload, &response); err != nil {
 		return core.Response{}, fmt.Errorf("decode response: %w", err)
 	}
+	response.RetainContent = retainContent
 	return response, nil
 }
 
@@ -220,8 +242,11 @@ func (s *PostgresResponseStore) Update(ctx context.Context, tenantID string, res
 	result, err := tx.ExecContext(ctx, `
 		UPDATE responses
 		SET status = $4, revision = $5, payload = $6, updated_at = now()
-		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL`,
+		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
+		  AND execution_epoch = $7
+		  AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = $1 AND t.home_region = $8 AND t.execution_epoch = $7)`,
 		tenantID, response.ID, expectedRevision, response.Status, response.Revision, payload,
+		response.ExecutionEpoch, response.HomeRegion,
 	)
 	if err != nil {
 		return err
@@ -252,9 +277,9 @@ func (s *PostgresResponseStore) Update(ctx context.Context, tenantID string, res
 	return tx.Commit()
 }
 
-func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID string, response core.Response, expectedRevision int64, usage core.UsageRecord) error {
+func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID string, response core.Response, expectedRevision int64, usage core.UsageRecord) error {
 	if response.Status != core.ResponseStatusCompleted {
-		return errors.New("financial completion requires completed response")
+		return errors.New("financial finalization requires a completed Response")
 	}
 	response.Revision = expectedRevision + 1
 	payload, err := json.Marshal(response)
@@ -269,8 +294,11 @@ func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE responses
 		SET status = $4, revision = $5, payload = $6, updated_at = now()
-		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL`,
+		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
+		  AND execution_epoch = $7
+		  AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = $1 AND t.home_region = $8 AND t.execution_epoch = $7)`,
 		tenantID, response.ID, expectedRevision, response.Status, response.Revision, payload,
+		response.ExecutionEpoch, response.HomeRegion,
 	)
 	if err != nil {
 		return err
@@ -323,12 +351,14 @@ func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID 
 			INSERT INTO savings_ledger (
 				id, tenant_id, response_id, cache_lease_id, measure, attribution,
 				price_snapshot_id, provider_usage, gross_saving, refresh_cost, forecast_cost,
-				storage_cost, route_lock_cost, net_saving, currency, created_at
-			) VALUES ($1,$2,$3,$4,'estimated_protected_saving','estimated',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+				storage_cost, route_lock_cost, net_saving, currency, holdout_cohort, created_at,
+				refresh_usage_id, refresh_provider_usage
+			) VALUES ($1,$2,$3,$4,'estimated_protected_saving','estimated',$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,NULLIF($16,''),$17)`,
 			usage.ID+"_protected", tenantID, response.ID, protected.CacheLeaseID,
 			usage.PriceSnapshot.ID, providerUsage, grossSaving, protected.RefreshCostMicros,
 			protected.ForecastCostMicros, protected.StorageCostMicros,
-			protected.RouteLockCostMicros, netSaving, usage.Currency, usage.CreatedAt,
+			protected.RouteLockCostMicros, netSaving, usage.Currency, protected.HoldoutCohort, usage.CreatedAt,
+			protected.RefreshUsageID, nullJSON(protected.RefreshProviderUsage),
 		); err != nil {
 			return fmt.Errorf("insert protected hit evidence: %w", err)
 		}
@@ -345,10 +375,18 @@ func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID 
 
 func protectedHitVerified(evidence core.ProtectedHitEvidence, reliable bool, cachedInputTokens int64) bool {
 	return reliable && cachedInputTokens > 0 && evidence.CacheLeaseID != "" &&
+		evidence.RefreshUsageID != "" && len(evidence.RefreshProviderUsage) > 0 && json.Valid(evidence.RefreshProviderUsage) &&
 		!evidence.RefreshSucceededAt.IsZero() &&
 		evidence.RefreshSucceededAt.Before(evidence.OriginalLeaseExpiresAt) &&
 		evidence.CustomerRequestAt.After(evidence.OriginalLeaseExpiresAt) &&
 		evidence.CustomerRequestAt.Before(evidence.RefreshExpiresAt)
+}
+
+func nullJSON(value json.RawMessage) json.RawMessage {
+	if len(value) == 0 || !json.Valid(value) {
+		return json.RawMessage(`{}`)
+	}
+	return value
 }
 
 func ensurePriceSnapshot(ctx context.Context, tx *sql.Tx, snapshot core.PriceSnapshot) error {
@@ -413,7 +451,8 @@ func (s *PostgresResponseStore) Delete(ctx context.Context, tenantID, responseID
 	result, err := tx.ExecContext(ctx, `
 		UPDATE responses
 		SET status = $4, revision = $5, payload = $6, deleted_at = now(), updated_at = now()
-		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL`,
+		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
+		  AND execution_epoch = (SELECT execution_epoch FROM tenants WHERE id = $1)`,
 		tenantID, responseID, expectedRevision, core.ResponseStatusDeleted, newRevision, payload,
 	)
 	if err != nil {
@@ -450,11 +489,15 @@ func (s *PostgresResponseStore) CreateConversation(ctx context.Context, tenantID
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := assertTenantWriter(ctx, tx, tenantID, conversation.HomeRegion, conversation.ExecutionEpoch); err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO conversations (
-			tenant_id, id, home_region, revision, metadata, active_response_id, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, NULL, to_timestamp($6), to_timestamp($6))`,
-		tenantID, conversation.ID, conversation.HomeRegion, conversation.Revision, metadata, conversation.CreatedAt,
+			tenant_id, id, home_region, execution_epoch, revision, metadata, active_response_id, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, NULL, to_timestamp($7), to_timestamp($7))`,
+		tenantID, conversation.ID, conversation.HomeRegion, conversation.ExecutionEpoch,
+		conversation.Revision, metadata, conversation.CreatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert conversation: %w", err)
@@ -473,11 +516,11 @@ func (s *PostgresResponseStore) GetConversation(ctx context.Context, tenantID, c
 	var conversation core.Conversation
 	var metadata []byte
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, extract(epoch FROM created_at)::bigint, home_region, revision,
+		SELECT id, extract(epoch FROM created_at)::bigint, home_region, execution_epoch, revision,
 		       COALESCE(active_response_id, ''), metadata
 		FROM conversations
 		WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL`, tenantID, conversationID).Scan(
-		&conversation.ID, &conversation.CreatedAt, &conversation.HomeRegion, &conversation.Revision,
+		&conversation.ID, &conversation.CreatedAt, &conversation.HomeRegion, &conversation.ExecutionEpoch, &conversation.Revision,
 		&conversation.ActiveResponseID, &metadata,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -593,6 +636,9 @@ func (s *PostgresResponseStore) beginConversationTx(ctx context.Context, tx *sql
 	if conversation.HomeRegion != response.HomeRegion {
 		return ErrConflict
 	}
+	if conversation.ExecutionEpoch != response.ExecutionEpoch {
+		return ErrConflict
+	}
 	if conversation.ActiveResponseID != "" {
 		return ErrConversationBusy
 	}
@@ -631,12 +677,13 @@ func lockConversation(ctx context.Context, tx *sql.Tx, tenantID, conversationID 
 	var conversation core.Conversation
 	var metadata []byte
 	err := tx.QueryRowContext(ctx, `
-		SELECT id, extract(epoch FROM created_at)::bigint, home_region, revision,
+		SELECT c.id, extract(epoch FROM c.created_at)::bigint, c.home_region, c.execution_epoch, c.revision,
 		       COALESCE(active_response_id, ''), metadata
-		FROM conversations
-		WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+		FROM conversations c
+		JOIN tenants t ON t.id = c.tenant_id AND t.home_region = c.home_region AND t.execution_epoch = c.execution_epoch
+		WHERE c.tenant_id = $1 AND c.id = $2 AND c.deleted_at IS NULL
 		FOR UPDATE`, tenantID, conversationID).Scan(
-		&conversation.ID, &conversation.CreatedAt, &conversation.HomeRegion, &conversation.Revision,
+		&conversation.ID, &conversation.CreatedAt, &conversation.HomeRegion, &conversation.ExecutionEpoch, &conversation.Revision,
 		&conversation.ActiveResponseID, &metadata,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -668,6 +715,21 @@ func lockConversation(ctx context.Context, tx *sql.Tx, tenantID, conversationID 
 		conversation.Items = append(conversation.Items, item)
 	}
 	return conversation, rows.Err()
+}
+
+func assertTenantWriter(ctx context.Context, tx *sql.Tx, tenantID, homeRegion string, executionEpoch int64) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM tenants
+			WHERE id = $1 AND home_region = $2 AND execution_epoch = $3
+		)`, tenantID, homeRegion, executionEpoch).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("tenant home-region writer fencing conflict")
+	}
+	return nil
 }
 
 func insertConversationItems(ctx context.Context, tx *sql.Tx, tenantID, conversationID, responseID, direction string, offset int64, items []core.Item) error {

@@ -34,8 +34,8 @@ type ConversationStore interface {
 	DeleteConversation(context.Context, string, string, int64) error
 }
 
-type FinancialResponseStore interface {
-	CompleteWithUsage(context.Context, string, core.Response, int64, core.UsageRecord) error
+type FinancialResponseFinalizer interface {
+	FinalizeWithUsage(context.Context, string, core.Response, int64, core.UsageRecord) error
 }
 
 type idempotencyRecord struct {
@@ -60,7 +60,7 @@ func NewMemoryResponseStore() *MemoryResponseStore {
 	}
 }
 
-func (s *MemoryResponseStore) CompleteWithUsage(_ context.Context, tenantID string, response core.Response, expectedRevision int64, usage core.UsageRecord) error {
+func (s *MemoryResponseStore) FinalizeWithUsage(_ context.Context, tenantID string, response core.Response, expectedRevision int64, usage core.UsageRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, exists := s.responses[tenantID][response.ID]
@@ -71,7 +71,7 @@ func (s *MemoryResponseStore) CompleteWithUsage(_ context.Context, tenantID stri
 		return ErrConflict
 	}
 	if response.Status != core.ResponseStatusCompleted {
-		return errors.New("financial completion requires completed response")
+		return errors.New("financial finalization requires a completed Response")
 	}
 	if err := s.finishConversationLocked(tenantID, response); err != nil {
 		return err

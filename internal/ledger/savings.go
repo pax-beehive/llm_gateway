@@ -89,17 +89,17 @@ func CalculateProtectedSaving(observedDiscountMicros int64, costs CostComponents
 }
 
 type ExperimentCohort struct {
-	Sessions   int64
+	Responses  int64
 	CostMicros int64
 }
 
 func CalculateExperimentSaving(treatment, holdout ExperimentCohort) (int64, Attribution) {
-	if treatment.Sessions <= 0 || holdout.Sessions <= 0 {
+	if treatment.Responses <= 0 || holdout.Responses <= 0 {
 		return 0, AttributionUnavailable
 	}
-	holdoutPerSession := holdout.CostMicros / holdout.Sessions
-	treatmentPerSession := treatment.CostMicros / treatment.Sessions
-	return (holdoutPerSession - treatmentPerSession) * treatment.Sessions, AttributionExperiment
+	holdoutPerResponse := holdout.CostMicros / holdout.Responses
+	treatmentPerResponse := treatment.CostMicros / treatment.Responses
+	return (holdoutPerResponse - treatmentPerResponse) * treatment.Responses, AttributionExperiment
 }
 
 type SavingsStore interface {

@@ -267,10 +267,19 @@ func anthropicBlocks(item core.Item) ([]map[string]any, string, error) {
 	case "message":
 		blocks := make([]map[string]any, 0, len(item.Content))
 		for _, content := range item.Content {
-			if content.Type != "input_text" && content.Type != "output_text" && content.Type != "text" {
-				return nil, "", fmt.Errorf("Anthropic text adapter does not support content type %q", content.Type)
+			switch content.Type {
+			case "input_text", "output_text", "text":
+				blocks = append(blocks, map[string]any{"type": "text", "text": content.Text})
+			case "input_image":
+				if content.ImageURL == "" {
+					return nil, "", errors.New("Anthropic adapter requires image_url for input_image")
+				}
+				blocks = append(blocks, map[string]any{
+					"type": "image", "source": map[string]any{"type": "url", "url": content.ImageURL},
+				})
+			default:
+				return nil, "", fmt.Errorf("Anthropic adapter does not support content type %q", content.Type)
 			}
-			blocks = append(blocks, map[string]any{"type": "text", "text": content.Text})
 		}
 		role := item.Role
 		if role == "system" || role == "developer" {

@@ -24,19 +24,27 @@ const (
 )
 
 type Content struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	FileData string `json:"file_data,omitempty"`
+	Filename string `json:"filename,omitempty"`
 }
 
 type Item struct {
-	ID        string          `json:"id,omitempty"`
-	Type      string          `json:"type"`
-	Role      string          `json:"role,omitempty"`
-	Content   []Content       `json:"content,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments json.RawMessage `json:"arguments,omitempty"`
-	Output    string          `json:"output,omitempty"`
+	ID               string          `json:"id,omitempty"`
+	Type             string          `json:"type"`
+	Role             string          `json:"role,omitempty"`
+	Content          []Content       `json:"content,omitempty"`
+	CallID           string          `json:"call_id,omitempty"`
+	Name             string          `json:"name,omitempty"`
+	Arguments        json.RawMessage `json:"arguments,omitempty"`
+	Output           string          `json:"output,omitempty"`
+	Summary          []Content       `json:"summary,omitempty"`
+	EncryptedContent string          `json:"encrypted_content,omitempty"`
+	ProviderMetadata json.RawMessage `json:"provider_metadata,omitempty"`
 }
 
 type Usage struct {
@@ -64,6 +72,7 @@ type Request struct {
 	PreviousResponseID string
 	ConversationID     string
 	HomeRegion         string
+	ExecutionEpoch     int64
 	CompatibilityMode  CompatibilityMode
 	RequestedFeatures  []string
 	Metadata           map[string]string
@@ -89,6 +98,15 @@ type CacheProtectionPolicy struct {
 	SafetyMarginMicros     int64 `json:"safety_margin_micros"`
 	AllowContentInspection bool  `json:"allow_content_inspection,omitempty"`
 	ShadowMode             bool  `json:"shadow_mode,omitempty"`
+}
+
+type TenantPolicy struct {
+	Revision               int64 `json:"revision,omitempty"`
+	MaxConcurrentResponses int   `json:"max_concurrent_responses,omitempty"`
+	MaxInputItems          int   `json:"max_input_items,omitempty"`
+	AllowStoredResponses   *bool `json:"allow_stored_responses,omitempty"`
+	AllowCacheProtection   *bool `json:"allow_cache_protection,omitempty"`
+	AllowContentInspection *bool `json:"allow_content_inspection,omitempty"`
 }
 
 type Attempt struct {
@@ -120,7 +138,9 @@ type Response struct {
 	Metadata           map[string]string `json:"metadata,omitempty"`
 	Attempts           []Attempt         `json:"attempts,omitempty"`
 	HomeRegion         string            `json:"home_region,omitempty"`
+	ExecutionEpoch     int64             `json:"execution_epoch,omitempty"`
 	Revision           int64             `json:"revision"`
+	RetainContent      bool              `json:"-"`
 }
 
 type Conversation struct {
@@ -128,6 +148,7 @@ type Conversation struct {
 	Object           string            `json:"object"`
 	CreatedAt        int64             `json:"created_at"`
 	HomeRegion       string            `json:"home_region"`
+	ExecutionEpoch   int64             `json:"execution_epoch"`
 	Items            []Item            `json:"items"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 	Revision         int64             `json:"revision"`
@@ -196,6 +217,9 @@ type ProtectedHitEvidence struct {
 	RefreshExpiresAt       time.Time
 	CustomerRequestAt      time.Time
 	RefreshCostMicros      int64
+	RefreshUsageID         string
+	RefreshProviderUsage   json.RawMessage
+	HoldoutCohort          string
 	ForecastCostMicros     int64
 	StorageCostMicros      int64
 	RouteLockCostMicros    int64

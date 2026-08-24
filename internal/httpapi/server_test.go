@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -143,6 +144,41 @@ func TestStoreFalseReturnsFinalResponseWithoutRetainingIt(t *testing.T) {
 	retrieved := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/responses/"+response.ID, nil)
 	if retrieved.Code != http.StatusNotFound {
 		t.Fatalf("retrieve status = %d, want 404 for store:false", retrieved.Code)
+	}
+}
+
+func TestUnknownCompatibilityModeIsRejected(t *testing.T) {
+	t.Parallel()
+	response := performJSON(t, newTestHandler(), "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "input": "hello", "compatibility_mode": "permissive",
+	})
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "strict or best_effort") {
+		t.Fatalf("status/body = %d / %s", response.Code, response.Body.String())
+	}
+}
+
+func TestChatMultimodalContentBecomesTypedCanonicalInput(t *testing.T) {
+	t.Parallel()
+	captured := make(chan core.Request, 1)
+	handler := handlerForExecutor(captureExecutor{capture: captured, delegate: provider.NewEchoExecutor()})
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "gateway-model",
+		"messages": []any{map[string]any{
+			"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "describe"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.test/image.png", "detail": "low"}},
+			},
+		}},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status/body = %d / %s", response.Code, response.Body.String())
+	}
+	request := <-captured
+	if len(request.Input) != 1 || len(request.Input[0].Content) != 2 ||
+		request.Input[0].Content[1].Type != "input_image" ||
+		request.Input[0].Content[1].ImageURL != "https://example.test/image.png" ||
+		!slices.Contains(request.RequestedFeatures, "multimodal") {
+		t.Fatalf("canonical multimodal request = %#v", request)
 	}
 }
 
@@ -347,7 +383,7 @@ func handlerForExecutor(executor provider.ResponseExecutor) http.Handler {
 		CredentialScope: "test", Healthy: true, Executor: executor, CacheUsageReliable: true,
 		Profile: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{
 			"text": provider.CapabilityNative, "streaming": provider.CapabilityNative,
-			"tools": provider.CapabilityNative, "sampling": provider.CapabilityNative,
+			"tools": provider.CapabilityNative, "sampling": provider.CapabilityNative, "multimodal": provider.CapabilityNative,
 		}},
 		PriceSnapshot: core.PriceSnapshot{
 			ID: "test-price", Provider: "test-provider", Model: "provider-model", Region: "local",

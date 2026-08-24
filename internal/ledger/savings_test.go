@@ -37,3 +37,14 @@ func TestProtectionSavingRequiresAHitBeyondOriginalExpiry(t *testing.T) {
 		t.Fatalf("ordinary cache hit was over-attributed: %d/%s", beforeOriginalExpiry, attribution)
 	}
 }
+
+func TestExperimentSavingComparesTreatmentAgainstHoldoutPerResponse(t *testing.T) {
+	t.Parallel()
+	saving, attribution := ledger.CalculateExperimentSaving(
+		ledger.ExperimentCohort{Responses: 100, CostMicros: 400_000},
+		ledger.ExperimentCohort{Responses: 50, CostMicros: 300_000},
+	)
+	if saving != 200_000 || attribution != ledger.AttributionExperiment {
+		t.Fatalf("experiment saving = %d/%s, want 200000/experiment", saving, attribution)
+	}
+}

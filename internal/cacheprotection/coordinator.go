@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -54,6 +55,9 @@ type ProtectedHitCandidate struct {
 	RefreshSucceededAt     time.Time
 	RefreshExpiresAt       time.Time
 	RefreshCostMicros      int64
+	RefreshUsageID         string
+	RefreshProviderUsage   json.RawMessage
+	HoldoutCohort          string
 	ForecastCostMicros     int64
 	StorageCostMicros      int64
 	RouteLockCostMicros    int64
@@ -223,7 +227,7 @@ func (r *MemoryIntentRepository) CurrentLease(_ context.Context, tenantID, lease
 			lease.Revision++
 			lease.FencingToken++
 			lease.RefreshCount++
-			lease.SpentMicros += intent.Candidate.Economics.RefreshCostMicros
+			lease.SpentMicros += actualRefreshCost(intent)
 			lease.EstimatedExpiresAt = intent.ProviderResult.ExpiresAt
 		}
 		if !found || lease.Revision > current.Revision ||
@@ -289,13 +293,35 @@ func (r *MemoryIntentRepository) CustomerRequest(_ context.Context, anchor provi
 			result.ProtectedHitCandidate = &ProtectedHitCandidate{
 				CacheLeaseID: intent.CacheLeaseID, OriginalLeaseExpiresAt: intent.Candidate.Lease.EstimatedExpiresAt,
 				RefreshSucceededAt: intent.UpdatedAt, RefreshExpiresAt: intent.ProviderResult.ExpiresAt,
-				RefreshCostMicros:   intent.Candidate.Economics.RefreshCostMicros,
-				ForecastCostMicros:  intent.Candidate.Forecast.CostMicros,
-				RouteLockCostMicros: intent.Candidate.Economics.RouteLockOpportunityCostMicros,
+				RefreshCostMicros:    actualRefreshCost(intent),
+				RefreshUsageID:       intent.ID + "_usage",
+				RefreshProviderUsage: append(json.RawMessage(nil), intent.ProviderResult.ProviderUsage...),
+				HoldoutCohort:        intent.Candidate.HoldoutCohort,
+				ForecastCostMicros:   intent.Candidate.Forecast.CostMicros,
+				RouteLockCostMicros:  intent.Candidate.Economics.RouteLockOpportunityCostMicros,
 			}
 		}
 	}
 	return result, nil
+}
+
+func actualRefreshCost(intent Intent) int64 {
+	usage := intent.ProviderResult.Usage
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.CachedInputTokens == 0 && usage.CacheWriteInputTokens == 0 {
+		return intent.Candidate.Economics.RefreshCostMicros
+	}
+	snapshot := intent.Candidate.RefreshPriceSnapshot
+	cached := min(max(usage.CachedInputTokens, 0), max(usage.InputTokens, 0))
+	cacheWrite := min(max(usage.CacheWriteInputTokens, 0), max(usage.InputTokens-cached, 0))
+	uncached := max(usage.InputTokens-cached-cacheWrite, 0)
+	return refreshPerMillion(uncached, snapshot.InputPerMillionMicros) +
+		refreshPerMillion(cached, snapshot.CachedInputPerMillionMicros) +
+		refreshPerMillion(cacheWrite, snapshot.CacheWritePerMillionMicros) +
+		refreshPerMillion(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros)
+}
+
+func refreshPerMillion(tokens, rate int64) int64 {
+	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
 }
 
 func (r *MemoryIntentRepository) ClaimDue(_ context.Context, now time.Time, limit int) ([]Intent, error) {

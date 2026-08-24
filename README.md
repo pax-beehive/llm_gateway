@@ -40,6 +40,8 @@ GATEWAY_ENV=production
 GATEWAY_DURABILITY_ATTESTATION=sync-multi-az
 GATEWAY_API_KEYS_JSON={"secret-token":"tenant-id"}
 GATEWAY_TENANT_HOME_REGIONS_JSON={"tenant-id":"us-west"}
+GATEWAY_TENANT_EXECUTION_EPOCHS_JSON={"tenant-id":1}
+GATEWAY_TENANT_POLICIES_JSON={"tenant-id":{"revision":1,"max_concurrent_responses":32,"max_input_items":256,"allow_stored_responses":true,"allow_cache_protection":true,"allow_content_inspection":false}}
 GATEWAY_ROUTES_JSON=[...]
 ```
 
@@ -61,6 +63,7 @@ Example route:
     "region": "us-west",
     "home_region": "us-west",
     "credential_scope": "tenant-primary",
+    "healthy": true,
     "capability_revision": 1,
     "capabilities": {
       "text": "native",
@@ -112,6 +115,8 @@ The direct adapter uses one serializer for live execution, Cache Anchors, and ze
 
 Strict compatibility is the default. A feature classified as `translated` is considered only when the request sets `compatibility_mode` to `best_effort`; `unsupported` or undeclared features are rejected instead of silently dropped.
 
+Tenant policies bound concurrent Responses and input-item counts, and can independently allow stored Responses, Cache Protection, and content inspection. PostgreSQL startup checks the configured policy revision/document, Home Region, and execution epoch against durable Tenant state; promotion requires an explicit epoch change, so a stale process cannot silently reclaim the writer role. Model Routes can be drained with `"healthy": false` without deleting their versioned configuration.
+
 ## Verification
 
 ```sh
@@ -128,11 +133,15 @@ Responses can continue a branch with `previous_response_id`, or use a mutable Co
 
 Every successful execution records the normalized token counts, original provider usage payload, immutable price snapshot, calculated amount, observed cache-discount evidence, and transactional outbox events. Provider cache discounts are not labeled as Cache Protection savings unless separate Protected Hit evidence exists.
 
-Responses accepts typed input plus `instructions`, client function `tools`, `tool_choice`, sampling controls, and streaming/background lifecycle controls. Chat Completions preserves assistant tool-call history and returns tool calls in both streaming and non-streaming forms. Unsupported fields and undeclared Capability Profile behavior are rejected rather than discarded.
+Responses accepts typed text, image, file, and reasoning items plus `instructions`, client function `tools`, `tool_choice`, sampling controls, and streaming/background lifecycle controls. Chat Completions translates text/image content arrays and preserves assistant tool-call history in both streaming and non-streaming forms. Reasoning summaries, encrypted reasoning, and provider metadata remain typed canonical fields; adapters must declare support and reject unsupported replay rather than dropping them.
+
+`store:false` uses a redacted transactional lifecycle so provider execution and financial usage can still complete atomically, then deletes the Response tombstone. Input, output, metadata, and provider error text are never written to Response or outbox payloads for ephemeral requests; `store:false` is rejected for mutable Conversations.
 
 Cache refresh intents are durable PostgreSQL work, not process-local timers. Due work is claimed with `FOR UPDATE SKIP LOCKED`; lease revision and fencing tokens are checked on every transition, successful refreshes advance both values, and ambiguous outcomes become terminal `uncertain` intents rather than automatic retries.
 
 Requests opt in with a bounded `cache_protection` object (`enabled`, `max_spend_micros`, `max_refreshes`, `max_protection_window_seconds`, and `safety_margin_micros`). Missing or excessive bounds are rejected. The worker re-evaluates expiry and ROI when work is claimed, so delayed work is not refreshed after its lease expires.
+
+Production Cache Protection defaults to `GATEWAY_CACHE_PROTECTION_MODE=shadow`. The only active treatment is `anthropic-one-refresh-canary`; it caps a Cache Lease at one refresh and assigns a stable holdout using `GATEWAY_CACHE_PROTECTION_HOLDOUT_PERCENT` (default 10). Successful refreshes write their own immutable usage/price record, actual refresh cost, raw Provider usage, and cohort before any later Protected Hit can be attributed.
 
 ## OpenTelemetry
 

@@ -4,6 +4,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 )
 
@@ -45,10 +46,12 @@ type Economics struct {
 }
 
 type Candidate struct {
-	Policy    Policy
-	Lease     Lease
-	Forecast  Forecast
-	Economics Economics
+	Policy               Policy
+	Lease                Lease
+	Forecast             Forecast
+	Economics            Economics
+	RefreshPriceSnapshot core.PriceSnapshot
+	HoldoutCohort        string
 }
 
 type Decision struct {

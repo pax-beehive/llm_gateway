@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,6 +80,30 @@ func TestVisibleProviderEOFWithoutTerminalUsageIsFailure(t *testing.T) {
 	}
 }
 
+func TestStoreFalseFailureReturnsContentButDoesNotRetainIt(t *testing.T) {
+	t.Parallel()
+
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{
+			{event: core.Event{Type: "response.output_text.delta", Delta: "sensitive partial"}},
+			{err: errors.New("sensitive provider failure")},
+		}}, nil
+	})
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.New(responseStore, provider.NewRouter(testRoute("ephemeral-failure", executor)))
+	response, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: false,
+		Input:             []core.Item{{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "sensitive prompt"}}}},
+		RequestedFeatures: []string{"text"},
+	})
+	if err == nil || response.OutputText() != "sensitive partial" || response.Error == nil || response.Error.Message != "sensitive provider failure" {
+		t.Fatalf("ephemeral failed response/error = %#v / %v", response, err)
+	}
+	if _, getErr := engine.Get(context.Background(), "tenant-a", response.ID); !errors.Is(getErr, store.ErrNotFound) {
+		t.Fatalf("get error = %v, want not found after store:false failure", getErr)
+	}
+}
+
 func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
 	t.Parallel()
 
@@ -110,7 +136,54 @@ func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
 	}
 }
 
-func TestCompletionRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testing.T) {
+func TestTenantPolicyEnforcesConcurrentResponseQuota(t *testing.T) {
+	t.Parallel()
+	stream := newSignalledBlockingStream()
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) { return stream, nil })
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(testRoute("quota", executor)), gatewayruntime.Options{
+		ProviderIdleTimeout: time.Second,
+		TenantPolicies: map[string]core.TenantPolicy{
+			"tenant-a": {MaxConcurrentResponses: 1},
+		},
+	})
+	finished := make(chan error, 1)
+	go func() {
+		_, err := engine.Execute(context.Background(), core.Request{
+			TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		})
+		finished <- err
+	}()
+	<-stream.started
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	})
+	if !errors.Is(err, gatewayruntime.ErrQuotaExceeded) {
+		t.Fatalf("second execute error = %v, want quota exceeded", err)
+	}
+	_ = stream.Close()
+	if err := <-finished; err == nil {
+		t.Fatal("first blocked execution unexpectedly completed")
+	}
+}
+
+func TestTenantPolicyRejectsDisallowedCacheContentInspection(t *testing.T) {
+	t.Parallel()
+	allowCache := true
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(testRoute("policy", provider.NewEchoExecutor())), gatewayruntime.Options{
+		TenantPolicies: map[string]core.TenantPolicy{
+			"tenant-a": {AllowCacheProtection: &allowCache},
+		},
+	})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		CacheProtection: &core.CacheProtectionPolicy{Enabled: true, AllowContentInspection: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "content inspection") {
+		t.Fatalf("execute error = %v, want tenant content-inspection policy rejection", err)
+	}
+}
+
+func TestResponseFinalizationRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testing.T) {
 	t.Parallel()
 
 	usage := core.Usage{
@@ -185,7 +258,9 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	repository := cacheprotection.NewMemoryIntentRepository()
 	coordinator := cacheprotection.NewCoordinator(repository, time.Now)
 	responseStore := store.NewMemoryResponseStore()
-	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(route), gatewayruntime.Options{CacheCoordinator: coordinator})
+	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(route), gatewayruntime.Options{
+		CacheCoordinator: coordinator, CacheProtectionMode: gatewayruntime.CacheProtectionAnthropicCanaryMode,
+	})
 	_, err := engine.Execute(context.Background(), core.Request{
 		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
 		CacheProtection: &core.CacheProtectionPolicy{
@@ -203,6 +278,58 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	}
 	if len(completed) != 1 || completed[0].Status != cacheprotection.IntentSucceeded || adapter.refreshCalls.Load() != 1 {
 		t.Fatalf("cache protection completion = %#v, refresh calls = %d", completed, adapter.refreshCalls.Load())
+	}
+}
+
+func TestCacheProtectionDefaultsToShadowAndNeverRefreshes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	usage := core.Usage{InputTokens: 1_000_000, OutputTokens: 10, TotalTokens: 1_000_010}
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{{event: core.Event{Type: "response.completed", Usage: &usage}}}}, nil
+	})
+	anchor := provider.CacheAnchor{
+		TenantID: "tenant-shadow", RouteID: "cache-route", Provider: "cache-provider", Model: "gateway-model",
+		CredentialScope: "tenant-primary", Region: "local", CacheKey: "cache-key", PrefixHash: "sha256:shadow",
+	}
+	adapter := &cacheAdapterStub{
+		observation: provider.CacheObservation{
+			Anchor: anchor, EstimatedExpiresAt: now.Add(5 * time.Minute), PrefixTokens: 1_000_000, RefreshCostMicros: 100_000,
+		},
+		refreshResult: provider.RefreshResult{Status: "succeeded", ExpiresAt: now.Add(10 * time.Minute)},
+	}
+	route := testRoute("cache-route", executor)
+	route.Provider = "cache-provider"
+	route.CacheProtector = adapter
+	route.CacheAnchorBuilder = adapter
+	route.PriceSnapshot = core.PriceSnapshot{
+		ID: "cache-price-shadow", Provider: "cache-provider", Model: "gateway-model", Region: "local", Currency: "USD",
+		InputPerMillionMicros: 10_000_000, CachedInputPerMillionMicros: 1_000_000,
+		OutputPerMillionMicros: 1_000_000, EffectiveAt: 1, Source: "test",
+	}
+	repository := cacheprotection.NewMemoryIntentRepository()
+	coordinator := cacheprotection.NewCoordinator(repository, time.Now)
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(route), gatewayruntime.Options{
+		CacheCoordinator: coordinator,
+	})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-shadow", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		CacheProtection: &core.CacheProtectionPolicy{
+			Enabled: true, MaxSpendMicros: 1_000_000, MaxRefreshes: 3,
+			MaxProtectionWindowSec: 3600, SafetyMarginMicros: 100_000,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(10 * time.Minute) })
+	completed, err := worker.RunDue(context.Background(), 10, func(provider.CacheAnchor) provider.CacheProtector { return adapter })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completed) != 0 || adapter.refreshCalls.Load() != 0 {
+		t.Fatalf("shadow completions/refresh calls = %d/%d, want 0/0", len(completed), adapter.refreshCalls.Load())
 	}
 }
 
@@ -237,6 +364,12 @@ type blockingStream struct {
 	closed chan struct{}
 }
 
+type signalledBlockingStream struct {
+	started chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
 type cacheAdapterStub struct {
 	observation   provider.CacheObservation
 	refreshResult provider.RefreshResult
@@ -262,6 +395,25 @@ func (s *cacheAdapterStub) BuildCacheAnchor(context.Context, core.Request, core.
 
 func newBlockingStream() *blockingStream {
 	return &blockingStream{closed: make(chan struct{})}
+}
+
+func newSignalledBlockingStream() *signalledBlockingStream {
+	return &signalledBlockingStream{started: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (s *signalledBlockingStream) Recv() (core.Event, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.closed
+	return core.Event{}, io.EOF
+}
+
+func (s *signalledBlockingStream) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
 }
 
 func (s *blockingStream) Recv() (core.Event, error) {

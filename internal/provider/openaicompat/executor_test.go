@@ -2,6 +2,7 @@ package openaicompat_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +11,38 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
 )
+
+func TestExecutorSerializesTypedMultimodalContent(t *testing.T) {
+	t.Parallel()
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		encoded, _ := json.Marshal(body["messages"])
+		for _, expected := range []string{`"type":"text"`, `"type":"image_url"`, `"url":"https://example.test/image.png"`, `"detail":"low"`} {
+			if !strings.Contains(string(encoded), expected) {
+				t.Fatalf("messages missing %s: %s", expected, encoded)
+			}
+		}
+		stream := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream)), Request: request}, nil
+	})}
+	executor, err := openaicompat.New(openaicompat.Config{BaseURL: "https://provider.test/v1", Model: "upstream", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := executor.Execute(context.Background(), core.Request{Input: []core.Item{{
+		Type: "message", Role: "user", Content: []core.Content{
+			{Type: "input_text", Text: "describe"},
+			{Type: "input_image", ImageURL: "https://example.test/image.png", Detail: "low"},
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+}
 
 func TestExecutorPreservesStreamedFunctionCallAndUsage(t *testing.T) {
 	t.Parallel()

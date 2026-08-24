@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
+	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 )
 
@@ -96,6 +97,12 @@ func eligibleCandidate(now time.Time) cacheprotection.Candidate {
 		Forecast: cacheprotection.Forecast{Probability: 0.9, ExpectedAt: now.Add(10 * time.Minute)},
 		Economics: cacheprotection.Economics{
 			PredictedColdCostMicros: 10_000_000, PredictedHitCostMicros: 1_000_000, RefreshCostMicros: 2_000_000,
+		},
+		RefreshPriceSnapshot: core.PriceSnapshot{
+			ID: "anthropic-price-v1", Provider: "anthropic", Model: "claude-opus-5", Region: "us-west",
+			Currency: "USD", InputPerMillionMicros: 10_000_000, CachedInputPerMillionMicros: 1_000_000,
+			CacheWritePerMillionMicros: 12_500_000, OutputPerMillionMicros: 20_000_000,
+			EffectiveAt: 1, Source: "test",
 		},
 	}
 }
