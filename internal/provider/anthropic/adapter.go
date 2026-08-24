@@ -29,6 +29,7 @@ type AdapterConfig struct {
 	CredentialScope            string
 	Region                     string
 	CacheWritePerMillionMicros int64
+	EnablePromptCaching        bool
 }
 
 type Adapter struct {
@@ -38,6 +39,7 @@ type Adapter struct {
 	credentialScope            string
 	region                     string
 	cacheWritePerMillionMicros int64
+	promptCaching              bool
 }
 
 func NewAdapter(config AdapterConfig) (*Adapter, error) {
@@ -55,6 +57,7 @@ func NewAdapter(config AdapterConfig) (*Adapter, error) {
 		CacheProtector: protector, model: config.Model, routeID: config.RouteID,
 		credentialScope: config.CredentialScope, region: config.Region,
 		cacheWritePerMillionMicros: config.CacheWritePerMillionMicros,
+		promptCaching:              config.EnablePromptCaching,
 	}, nil
 }
 
@@ -63,7 +66,11 @@ func (a *Adapter) Execute(ctx context.Context, request core.Request) (provider.E
 	if request.MaxOutputTokens != nil && *request.MaxOutputTokens > 0 {
 		maxTokens = *request.MaxOutputTokens
 	}
-	payload, err := a.payload(request.Input, request.ContextItemCount, request.Tools, request.ToolChoice, maxTokens, true, false)
+	stableCount := 0
+	if a.promptCaching {
+		stableCount = stablePrefixItemCount(request.Input)
+	}
+	payload, err := a.payload(request.Input, stableCount, request.Tools, request.ToolChoice, maxTokens, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -109,11 +116,15 @@ func (a *Adapter) Execute(ctx context.Context, request core.Request) (provider.E
 }
 
 func (a *Adapter) CurrentCacheAnchor(_ context.Context, request core.Request) (provider.CacheAnchor, bool, error) {
-	if request.ContextItemCount <= 0 || request.ContextItemCount > len(request.Input) {
+	if !a.promptCaching {
+		return provider.CacheAnchor{}, false, nil
+	}
+	stableCount := stablePrefixItemCount(request.Input)
+	if stableCount == 0 && len(request.Tools) == 0 {
 		return provider.CacheAnchor{}, false, nil
 	}
 	payload, err := a.payload(
-		request.Input[:request.ContextItemCount], request.ContextItemCount, request.Tools, nil, 0, false, true,
+		request.Input[:stableCount], stableCount, request.Tools, nil, 0, false, true,
 	)
 	if err != nil {
 		return provider.CacheAnchor{}, false, err
@@ -123,8 +134,18 @@ func (a *Adapter) CurrentCacheAnchor(_ context.Context, request core.Request) (p
 }
 
 func (a *Adapter) BuildCacheAnchor(_ context.Context, request core.Request, response core.Response) (provider.CacheObservation, error) {
-	items := append(cloneItems(request.Input), response.Output...)
-	payload, err := a.payload(items, len(items), request.Tools, nil, 0, false, true)
+	if !a.promptCaching {
+		return provider.CacheObservation{}, errors.New("Anthropic prompt caching is disabled for this route")
+	}
+	stableCount := stablePrefixItemCount(request.Input)
+	if stableCount == 0 && len(request.Tools) == 0 {
+		return provider.CacheObservation{}, errors.New("Anthropic cache protection requires a stable system or tools prefix")
+	}
+	prefixTokens := max(response.Usage.CacheWriteInputTokens, response.Usage.CachedInputTokens)
+	if prefixTokens <= 0 {
+		return provider.CacheObservation{}, errors.New("Anthropic did not confirm creation or reuse of the stable prompt cache prefix")
+	}
+	payload, err := a.payload(request.Input[:stableCount], stableCount, request.Tools, nil, 0, false, true)
 	if err != nil {
 		return provider.CacheObservation{}, err
 	}
@@ -132,7 +153,6 @@ func (a *Adapter) BuildCacheAnchor(_ context.Context, request core.Request, resp
 	if err != nil {
 		return provider.CacheObservation{}, err
 	}
-	prefixTokens := max(response.Usage.InputTokens, 0)
 	return provider.CacheObservation{
 		Anchor: anchor, EstimatedExpiresAt: time.Now().UTC().Add(a.ttl), PrefixTokens: prefixTokens,
 		RefreshCostMicros: perMillion(prefixTokens, a.cacheWritePerMillionMicros),
@@ -203,6 +223,9 @@ func (a *Adapter) payload(items []core.Item, stableCount int, tools []json.RawMe
 		return nil, err
 	}
 	if len(translatedTools) > 0 {
+		if a.promptCaching && lastStable == nil {
+			translatedTools[len(translatedTools)-1]["cache_control"] = map[string]any{"type": "ephemeral", "ttl": ttlName(a.ttl)}
+		}
 		payload["tools"] = translatedTools
 	}
 	if len(toolChoice) > 0 {
@@ -317,10 +340,15 @@ func perMillion(tokens, rate int64) int64 {
 	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
 }
 
-func cloneItems(items []core.Item) []core.Item {
-	cloned := make([]core.Item, len(items))
-	copy(cloned, items)
-	return cloned
+func stablePrefixItemCount(items []core.Item) int {
+	count := 0
+	for _, item := range items {
+		if item.Type != "message" || (item.Role != "system" && item.Role != "developer") {
+			break
+		}
+		count++
+	}
+	return count
 }
 
 type anthropicStream struct {
@@ -444,6 +472,7 @@ func (s *anthropicStream) applyUsage(usage anthropicUsage) {
 		s.rawUsage.CacheCreationInputTokens = usage.CacheCreationInputTokens
 		s.usage.InputTokens = usage.InputTokens + usage.CacheReadInputTokens + usage.CacheCreationInputTokens
 		s.usage.CachedInputTokens = usage.CacheReadInputTokens
+		s.usage.CacheWriteInputTokens = usage.CacheCreationInputTokens
 	}
 	if usage.OutputTokens != 0 {
 		s.rawUsage.OutputTokens = usage.OutputTokens

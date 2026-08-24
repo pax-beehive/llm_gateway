@@ -24,10 +24,11 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
-	"github.com/toddzheng/llm-gateway/internal/provider/gemini"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type routeConfig struct {
@@ -46,6 +47,7 @@ type routeConfig struct {
 	InputCost          float64                               `json:"input_cost_per_million"`
 	OutputCost         float64                               `json:"output_cost_per_million"`
 	CachedInputCost    float64                               `json:"cached_input_cost_per_million"`
+	CacheWriteCost     float64                               `json:"cache_write_cost_per_million"`
 	PriceSnapshotID    string                                `json:"price_snapshot_id"`
 	PriceEffectiveAt   string                                `json:"price_effective_at"`
 	PriceSource        string                                `json:"price_source"`
@@ -92,6 +94,17 @@ func healthcheck() error {
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	shutdownTelemetry, err := telemetry.Configure(ctx, envOr("OTEL_SERVICE_NAME", "llm-gateway"))
+	if err != nil {
+		return fmt.Errorf("configure OpenTelemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			slog.Warn("OpenTelemetry shutdown failed", "error", err)
+		}
+	}()
 	apiKeys, err := parseStringMapEnv("GATEWAY_API_KEYS_JSON")
 	if err != nil || len(apiKeys) == 0 {
 		return fmt.Errorf("GATEWAY_API_KEYS_JSON: configure at least one token-to-tenant mapping: %w", err)
@@ -128,7 +141,7 @@ func run() error {
 
 	address := envOr("GATEWAY_ADDR", ":8080")
 	server := &http.Server{
-		Addr: address, Handler: handler, ReadHeaderTimeout: 10 * time.Second,
+		Addr: address, Handler: otelhttp.NewHandler(handler, "gateway.http"), ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20,
 	}
 	serveErrors := make(chan error, 1)
@@ -259,6 +272,9 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		if config.ID == "" || config.PublicModel == "" || config.Provider == "" || config.Region == "" || config.HomeRegion == "" {
 			return nil, fmt.Errorf("route %d requires id, provider, public_model, region, and home_region", index)
 		}
+		if !validNonNegativeCost(config.InputCost) || !validNonNegativeCost(config.OutputCost) || !validNonNegativeCost(config.CachedInputCost) {
+			return nil, fmt.Errorf("route %q prices must be finite and non-negative", config.ID)
+		}
 		executor, cacheProtector, cacheAnchorBuilder, err := buildProviderComponents(config)
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", config.ID, err)
@@ -266,6 +282,10 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		effectiveAt, err := time.Parse(time.RFC3339, config.PriceEffectiveAt)
 		if err != nil || config.PriceSnapshotID == "" || config.PriceSource == "" || config.Currency == "" {
 			return nil, fmt.Errorf("route %q requires immutable price_snapshot_id, RFC3339 price_effective_at, price_source, and currency", config.ID)
+		}
+		cacheWriteCost, err := cacheWriteCostPerMillion(config)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: %w", config.ID, err)
 		}
 		routes = append(routes, provider.Route{
 			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
@@ -275,7 +295,8 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 			PriceSnapshot: core.PriceSnapshot{
 				ID: config.PriceSnapshotID, Provider: config.Provider, Model: config.ProviderModel, Region: config.Region,
 				Currency: config.Currency, InputPerMillionMicros: currencyMicros(config.InputCost),
-				CachedInputPerMillionMicros: currencyMicros(config.CachedInputCost), OutputPerMillionMicros: currencyMicros(config.OutputCost),
+				CachedInputPerMillionMicros: currencyMicros(config.CachedInputCost),
+				CacheWritePerMillionMicros:  currencyMicros(cacheWriteCost), OutputPerMillionMicros: currencyMicros(config.OutputCost),
 				EffectiveAt: effectiveAt.Unix(), Source: config.PriceSource,
 			},
 			CacheUsageReliable: config.CacheUsageReliable,
@@ -306,13 +327,21 @@ func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, pro
 			}
 			ttl = time.Duration(refresh.TTLSeconds) * time.Second
 			apiVersion = refresh.APIVersion
-			writeCostMicros = currencyMicros(refresh.WriteCostPerMillion)
+			cacheWriteCost, err := cacheWriteCostPerMillion(config)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if cacheWriteCost <= 0 {
+				return nil, nil, nil, errors.New("Anthropic prompt caching requires positive cache_write_cost_per_million")
+			}
+			writeCostMicros = currencyMicros(cacheWriteCost)
 		}
 		adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
 			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), APIVersion: apiVersion,
 			TTL: ttl, Model: config.ProviderModel, RouteID: config.ID,
 			CredentialScope: config.CredentialScope, Region: config.Region,
 			CacheWritePerMillionMicros: writeCostMicros,
+			EnablePromptCaching:        config.CacheRefresh != nil,
 		})
 		if err != nil {
 			return nil, nil, nil, err
@@ -322,6 +351,9 @@ func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, pro
 		}
 		return adapter, adapter, adapter, nil
 	}
+	if config.CacheRefresh != nil {
+		return nil, nil, nil, errors.New("proactive cache refresh is enabled only for conformance-tested direct Anthropic routes")
+	}
 
 	executor, err := openaicompat.New(openaicompat.Config{
 		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
@@ -330,26 +362,21 @@ func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, pro
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	cacheProtector, err := buildCacheProtector(config)
-	return executor, cacheProtector, nil, err
+	return executor, nil, nil, nil
 }
 
-func buildCacheProtector(config routeConfig) (provider.CacheProtector, error) {
-	if config.CacheRefresh == nil {
-		return nil, nil
+func cacheWriteCostPerMillion(config routeConfig) (float64, error) {
+	value := config.CacheWriteCost
+	if config.CacheRefresh != nil && config.CacheRefresh.WriteCostPerMillion != 0 {
+		if value != 0 && value != config.CacheRefresh.WriteCostPerMillion {
+			return 0, errors.New("cache write price is declared inconsistently")
+		}
+		value = config.CacheRefresh.WriteCostPerMillion
 	}
-	refresh := config.CacheRefresh
-	if refresh.TTLSeconds <= 0 {
-		return nil, errors.New("positive ttl_seconds is required")
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, errors.New("cache_write_cost_per_million must be finite and non-negative")
 	}
-	switch refresh.Kind {
-	case "gemini":
-		return gemini.NewCacheProtector(
-			refresh.BaseURL, os.Getenv(refresh.APIKeyEnv), time.Duration(refresh.TTLSeconds)*time.Second, nil,
-		)
-	default:
-		return nil, fmt.Errorf("unsupported cache refresh kind %q", refresh.Kind)
-	}
+	return value, nil
 }
 
 func runCacheWorker(ctx context.Context, coordinator *cacheprotection.Coordinator, router *provider.StaticRouter) {
@@ -370,6 +397,10 @@ func runCacheWorker(ctx context.Context, coordinator *cacheprotection.Coordinato
 
 func currencyMicros(amount float64) int64 {
 	return int64(math.Round(amount * 1_000_000))
+}
+
+func validNonNegativeCost(amount float64) bool {
+	return !math.IsNaN(amount) && !math.IsInf(amount, 0) && amount >= 0
 }
 
 func ensureTenants(ctx context.Context, db *sql.DB, apiKeys, homeRegions map[string]string) error {

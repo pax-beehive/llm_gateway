@@ -27,6 +27,9 @@ var cacheProtectionMigration string
 //go:embed migrations/000005_protected_hit_evidence.sql
 var protectedHitMigration string
 
+//go:embed migrations/000006_cache_write_usage.sql
+var cacheWriteUsageMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -50,6 +53,9 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, protectedHitMigration); err != nil {
 		return fmt.Errorf("migrate protected hit evidence: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, cacheWriteUsageMigration); err != nil {
+		return fmt.Errorf("migrate cache write usage: %w", err)
 	}
 	return nil
 }
@@ -289,10 +295,10 @@ func (s *PostgresResponseStore) CompleteWithUsage(ctx context.Context, tenantID 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO usage_ledger (
 			id, tenant_id, response_id, attempt_id, price_snapshot_id, provider_usage,
-			input_tokens, cached_input_tokens, output_tokens, amount, currency, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, amount, currency, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		usage.ID, tenantID, response.ID, usage.AttemptID, usage.PriceSnapshot.ID, providerUsage,
-		usage.Usage.InputTokens, usage.Usage.CachedInputTokens, usage.Usage.OutputTokens,
+		usage.Usage.InputTokens, usage.Usage.CachedInputTokens, usage.Usage.CacheWriteInputTokens, usage.Usage.OutputTokens,
 		usage.AmountMicros, usage.Currency, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert immutable usage: %w", err)
@@ -349,23 +355,25 @@ func ensurePriceSnapshot(ctx context.Context, tx *sql.Tx, snapshot core.PriceSna
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO provider_price_snapshots (
 			id, provider, model, region, currency, input_per_million, cached_input_per_million,
-			output_per_million, effective_at, source
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9), $10)
+			cache_write_per_million, output_per_million, effective_at, source
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10), $11)
 		ON CONFLICT (id) DO NOTHING`,
 		snapshot.ID, snapshot.Provider, snapshot.Model, snapshot.Region, snapshot.Currency,
 		snapshot.InputPerMillionMicros, snapshot.CachedInputPerMillionMicros,
-		snapshot.OutputPerMillionMicros, snapshot.EffectiveAt, snapshot.Source,
+		snapshot.CacheWritePerMillionMicros, snapshot.OutputPerMillionMicros, snapshot.EffectiveAt, snapshot.Source,
 	); err != nil {
 		return fmt.Errorf("insert price snapshot: %w", err)
 	}
 	var existing core.PriceSnapshot
 	err := tx.QueryRowContext(ctx, `
 		SELECT id, provider, model, region, currency,
-		       input_per_million::bigint, cached_input_per_million::bigint, output_per_million::bigint,
+		       input_per_million::bigint, cached_input_per_million::bigint, cache_write_per_million::bigint,
+		       output_per_million::bigint,
 		       extract(epoch FROM effective_at)::bigint, source
 		FROM provider_price_snapshots WHERE id = $1`, snapshot.ID).Scan(
 		&existing.ID, &existing.Provider, &existing.Model, &existing.Region, &existing.Currency,
-		&existing.InputPerMillionMicros, &existing.CachedInputPerMillionMicros, &existing.OutputPerMillionMicros,
+		&existing.InputPerMillionMicros, &existing.CachedInputPerMillionMicros,
+		&existing.CacheWritePerMillionMicros, &existing.OutputPerMillionMicros,
 		&existing.EffectiveAt, &existing.Source,
 	)
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type CacheProtector struct {
@@ -31,7 +32,7 @@ func NewCacheProtector(baseURL, apiKey string, ttl time.Duration, client *http.C
 		return nil, errors.New("Gemini API key and positive cache TTL are required")
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: 30 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport)}
 	}
 	return &CacheProtector{baseURL: strings.TrimRight(baseURL, "/"), apiKey: apiKey, ttl: ttl, httpClient: client}, nil
 }

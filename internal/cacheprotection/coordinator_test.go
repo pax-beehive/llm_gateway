@@ -47,6 +47,38 @@ func TestAmbiguousRefreshIsRecordedUncertainAndNeverRetried(t *testing.T) {
 	}
 }
 
+func TestSuccessfulRefreshHydratesNextLeaseRevisionAndPolicyTotals(t *testing.T) {
+	t.Parallel()
+	clock := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	repository := cacheprotection.NewMemoryIntentRepository()
+	protector := cacheProtectorStub{
+		inspect: provider.CacheCapability{Supported: true},
+		refresh: func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
+			return provider.RefreshResult{Status: "succeeded", ExpiresAt: clock.Add(5 * time.Minute)}, nil
+		},
+	}
+	candidate := eligibleCandidate(clock)
+	candidate.Policy.MaxRefreshes = 2
+	candidate.Policy.MaxSpendMicros = 5_000_000
+	coordinator := cacheprotection.NewCoordinator(repository, func() time.Time { return clock })
+	first, err := coordinator.Run(context.Background(), candidate, protector)
+	if err != nil || first.Status != cacheprotection.IntentSucceeded {
+		t.Fatalf("first refresh = %#v, err = %v", first, err)
+	}
+	clock = clock.Add(4*time.Minute + 55*time.Second)
+	second, err := coordinator.Run(context.Background(), candidate, protector)
+	if err != nil || second.Status != cacheprotection.IntentSucceeded {
+		t.Fatalf("second refresh = %#v, err = %v", second, err)
+	}
+	if second.CacheLeaseRevision != candidate.Lease.Revision+1 || second.FencingToken != candidate.Lease.FencingToken+1 {
+		t.Fatalf("second lease revision/fence = %d/%d", second.CacheLeaseRevision, second.FencingToken)
+	}
+	limited, err := coordinator.Run(context.Background(), candidate, protector)
+	if err != nil || limited.Status != cacheprotection.IntentRejected || limited.Error != "max_refreshes_reached" {
+		t.Fatalf("policy-limited third refresh = %#v, err = %v", limited, err)
+	}
+}
+
 func eligibleCandidate(now time.Time) cacheprotection.Candidate {
 	return cacheprotection.Candidate{
 		Policy: cacheprotection.Policy{

@@ -41,6 +41,7 @@ type Intent struct {
 }
 
 type IntentRepository interface {
+	CurrentLease(context.Context, string, string) (Lease, bool, error)
 	Reserve(context.Context, Intent) (Intent, bool, error)
 	Update(context.Context, Intent, IntentStatus) (Intent, error)
 	CustomerRequest(context.Context, provider.CacheAnchor, time.Time) (CustomerRequestResult, error)
@@ -77,6 +78,18 @@ func NewCoordinator(repository IntentRepository, now func() time.Time) *Coordina
 
 func (c *Coordinator) Run(ctx context.Context, candidate Candidate, protector provider.CacheProtector) (Intent, error) {
 	now := c.now().UTC()
+	current, exists, err := c.repository.CurrentLease(ctx, candidate.Lease.Anchor.TenantID, candidate.Lease.ID)
+	if err != nil {
+		return Intent{}, err
+	}
+	if exists {
+		candidate.Lease.Revision = current.Revision
+		candidate.Lease.CreatedAt = current.CreatedAt
+		candidate.Lease.EstimatedExpiresAt = current.EstimatedExpiresAt
+		candidate.Lease.RefreshCount = current.RefreshCount
+		candidate.Lease.SpentMicros = current.SpentMicros
+		candidate.Lease.FencingToken = current.FencingToken
+	}
 	decision := Evaluate(now, candidate)
 	if !decision.Eligible {
 		return Intent{
@@ -194,6 +207,31 @@ type MemoryIntentRepository struct {
 	mu      sync.Mutex
 	intents map[string]Intent
 	unique  map[string]string
+}
+
+func (r *MemoryIntentRepository) CurrentLease(_ context.Context, tenantID, leaseID string) (Lease, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var current Lease
+	found := false
+	for _, intent := range r.intents {
+		if intent.TenantID != tenantID || intent.CacheLeaseID != leaseID {
+			continue
+		}
+		lease := intent.Candidate.Lease
+		if intent.Status == IntentSucceeded {
+			lease.Revision++
+			lease.FencingToken++
+			lease.RefreshCount++
+			lease.SpentMicros += intent.Candidate.Economics.RefreshCostMicros
+			lease.EstimatedExpiresAt = intent.ProviderResult.ExpiresAt
+		}
+		if !found || lease.Revision > current.Revision ||
+			(lease.Revision == current.Revision && lease.EstimatedExpiresAt.After(current.EstimatedExpiresAt)) {
+			current, found = lease, true
+		}
+	}
+	return current, found, nil
 }
 
 func NewMemoryIntentRepository() *MemoryIntentRepository {

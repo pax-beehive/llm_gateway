@@ -19,6 +19,24 @@ func NewPostgresIntentRepository(db *sql.DB) *PostgresIntentRepository {
 	return &PostgresIntentRepository{db: db}
 }
 
+func (r *PostgresIntentRepository) CurrentLease(ctx context.Context, tenantID, leaseID string) (Lease, bool, error) {
+	var lease Lease
+	err := r.db.QueryRowContext(ctx, `
+		SELECT revision, created_at, estimated_expires_at, refresh_count, spent_micros::bigint, fencing_token
+		FROM cache_leases WHERE tenant_id = $1 AND id = $2`, tenantID, leaseID).Scan(
+		&lease.Revision, &lease.CreatedAt, &lease.EstimatedExpiresAt,
+		&lease.RefreshCount, &lease.SpentMicros, &lease.FencingToken,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Lease{}, false, nil
+	}
+	if err != nil {
+		return Lease{}, false, err
+	}
+	lease.ID = leaseID
+	return lease, true, nil
+}
+
 func (r *PostgresIntentRepository) Reserve(ctx context.Context, intent Intent) (Intent, bool, error) {
 	candidate, err := json.Marshal(intent.Candidate)
 	if err != nil {
@@ -125,7 +143,7 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		result, err := tx.ExecContext(ctx, `
 			UPDATE cache_leases
 			SET revision = revision + 1, fencing_token = fencing_token + 1,
-			    estimated_expires_at = $6, status = 'refreshed',
+			    original_expires_at = $11, estimated_expires_at = $6, status = 'refreshed',
 			    refresh_count = refresh_count + 1, spent_micros = spent_micros + $7,
 			    last_refresh_succeeded_at = $8, last_refresh_expires_at = $6,
 			    last_refresh_cost_micros = $7, last_forecast_cost_micros = $9,
@@ -135,7 +153,7 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 			intent.TenantID, intent.CacheLeaseID, intent.CacheLeaseRevision, intent.FencingToken,
 			intent.Anchor.RouteID, expiresAt, intent.Candidate.Economics.RefreshCostMicros,
 			intent.UpdatedAt, intent.Candidate.Forecast.CostMicros,
-			intent.Candidate.Economics.RouteLockOpportunityCostMicros,
+			intent.Candidate.Economics.RouteLockOpportunityCostMicros, intent.Candidate.Lease.EstimatedExpiresAt,
 		)
 		if err != nil {
 			return Intent{}, err

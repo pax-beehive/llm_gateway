@@ -82,6 +82,7 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 type createResponseRequest struct {
 	Model              string                      `json:"model"`
 	Input              json.RawMessage             `json:"input"`
+	Instructions       string                      `json:"instructions,omitempty"`
 	Stream             bool                        `json:"stream"`
 	Background         bool                        `json:"background"`
 	Store              *bool                       `json:"store"`
@@ -89,6 +90,13 @@ type createResponseRequest struct {
 	Conversation       string                      `json:"conversation"`
 	Metadata           map[string]string           `json:"metadata"`
 	CompatibilityMode  core.CompatibilityMode      `json:"compatibility_mode"`
+	Tools              []json.RawMessage           `json:"tools,omitempty"`
+	ToolChoice         json.RawMessage             `json:"tool_choice,omitempty"`
+	Temperature        *float64                    `json:"temperature,omitempty"`
+	TopP               *float64                    `json:"top_p,omitempty"`
+	MaxOutputTokens    *int                        `json:"max_output_tokens,omitempty"`
+	Stop               json.RawMessage             `json:"stop,omitempty"`
+	User               string                      `json:"user,omitempty"`
 	CacheProtection    *core.CacheProtectionPolicy `json:"cache_protection,omitempty"`
 }
 
@@ -107,6 +115,12 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "input")
 		return
 	}
+	if payload.Instructions != "" {
+		input = append([]core.Item{{
+			Type: "message", Role: "system",
+			Content: []core.Content{{Type: "input_text", Text: payload.Instructions}},
+		}}, input...)
+	}
 	storeResponse := true
 	if payload.Store != nil {
 		storeResponse = *payload.Store
@@ -118,7 +132,20 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: []string{"text"}, Metadata: payload.Metadata,
 		HomeRegion:      s.homeRegion(request),
 		IdempotencyKey:  strings.TrimSpace(request.Header.Get("Idempotency-Key")),
+		Tools:           payload.Tools,
+		ToolChoice:      payload.ToolChoice,
+		Temperature:     payload.Temperature,
+		TopP:            payload.TopP,
+		MaxOutputTokens: payload.MaxOutputTokens,
+		Stop:            payload.Stop,
+		EndUserID:       payload.User,
 		CacheProtection: payload.CacheProtection,
+	}
+	if len(payload.Tools) > 0 || hasJSONValue(payload.ToolChoice) {
+		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "tools")
+	}
+	if payload.Temperature != nil || payload.TopP != nil || payload.MaxOutputTokens != nil || hasJSONValue(payload.Stop) {
+		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "sampling")
 	}
 	if err := validateCacheProtection(payload.CacheProtection); err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
@@ -366,6 +393,16 @@ type chatMessage struct {
 	Content    json.RawMessage `json:"content"`
 	Name       string          `json:"name,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCalls  []chatToolCall  `json:"tool_calls,omitempty"`
+}
+
+type chatToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type chatStreamOptions struct {
@@ -391,10 +428,10 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 	if payload.Stream {
 		features = append(features, "streaming")
 	}
-	if len(payload.Tools) > 0 || len(payload.ToolChoice) > 0 {
+	if len(payload.Tools) > 0 || hasJSONValue(payload.ToolChoice) {
 		features = append(features, "tools")
 	}
-	if payload.Temperature != nil || payload.TopP != nil || payload.MaxTokens != nil || payload.MaxCompletionTokens != nil || len(payload.Stop) > 0 {
+	if payload.Temperature != nil || payload.TopP != nil || payload.MaxTokens != nil || payload.MaxCompletionTokens != nil || hasJSONValue(payload.Stop) {
 		features = append(features, "sampling")
 	}
 	maxOutputTokens := payload.MaxCompletionTokens
@@ -441,6 +478,7 @@ func (s *Server) streamChatCompletion(responseWriter http.ResponseWriter, reques
 	var responseID string
 	var createdAt int64
 	toolCallOutput := false
+	toolCallIndex := 0
 	emit := func(event core.Event) error {
 		if event.Type == "gateway.keepalive" {
 			_, err := io.WriteString(responseWriter, ": keepalive\n\n")
@@ -467,12 +505,14 @@ func (s *Server) streamChatCompletion(responseWriter http.ResponseWriter, reques
 				return nil
 			}
 			toolCallOutput = true
+			index := toolCallIndex
+			toolCallIndex++
 			return writeSSE(responseWriter, map[string]any{
 				"id": responseID, "object": "chat.completion.chunk", "created": createdAt, "model": canonical.Model,
 				"choices": []any{map[string]any{
 					"index": 0,
 					"delta": map[string]any{"tool_calls": []any{map[string]any{
-						"index": 0, "id": event.Item.CallID, "type": "function",
+						"index": index, "id": event.Item.CallID, "type": "function",
 						"function": map[string]any{"name": event.Item.Name, "arguments": string(event.Item.Arguments)},
 					}}},
 					"finish_reason": nil,
@@ -509,36 +549,75 @@ func canonicalChatMessages(messages []chatMessage) ([]core.Item, error) {
 			return nil, errors.New("message role is required")
 		}
 		var text string
-		if err := json.Unmarshal(message.Content, &text); err != nil {
+		contentPresent := hasJSONValue(message.Content)
+		if contentPresent && json.Unmarshal(message.Content, &text) != nil {
 			return nil, errors.New("only string chat message content is supported in this compatibility tier")
 		}
-		itemType := "message"
-		contentType := "input_text"
-		item := core.Item{Type: itemType, Role: message.Role, Name: message.Name, CallID: message.ToolCallID}
+		item := core.Item{Type: "message", Role: message.Role, Name: message.Name, CallID: message.ToolCallID}
 		if message.Role == "tool" {
+			if !contentPresent || message.ToolCallID == "" {
+				return nil, errors.New("tool messages require string content and tool_call_id")
+			}
 			item.Type = "function_call_output"
 			item.Output = text
-		} else {
-			item.Content = []core.Content{{Type: contentType, Text: text}}
+			items = append(items, item)
+		} else if contentPresent {
+			item.Content = []core.Content{{Type: "input_text", Text: text}}
+			items = append(items, item)
+		} else if len(message.ToolCalls) == 0 {
+			return nil, errors.New("chat messages require string content unless assistant tool_calls are present")
 		}
-		items = append(items, item)
+		for _, call := range message.ToolCalls {
+			arguments := json.RawMessage(call.Function.Arguments)
+			if message.Role != "assistant" || call.Type != "function" || call.ID == "" || call.Function.Name == "" || !json.Valid(arguments) {
+				return nil, errors.New("assistant tool_calls require id, function name, and JSON arguments")
+			}
+			items = append(items, core.Item{
+				Type: "function_call", CallID: call.ID, Name: call.Function.Name, Arguments: arguments,
+			})
+		}
 	}
 	return items, nil
 }
 
 func chatCompletion(response core.Response) map[string]any {
+	message := map[string]any{"role": "assistant", "content": response.OutputText()}
+	finishReason := "stop"
+	var toolCalls []any
+	for _, item := range response.Output {
+		if item.Type != "function_call" {
+			continue
+		}
+		toolCalls = append(toolCalls, map[string]any{
+			"id": item.CallID, "type": "function",
+			"function": map[string]any{"name": item.Name, "arguments": string(item.Arguments)},
+		})
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+		finishReason = "tool_calls"
+		if response.OutputText() == "" {
+			message["content"] = nil
+		}
+	}
 	return map[string]any{
 		"id": response.ID, "object": "chat.completion", "created": response.CreatedAt, "model": response.Model,
 		"choices": []any{map[string]any{
-			"index": 0, "message": map[string]any{"role": "assistant", "content": response.OutputText()}, "finish_reason": "stop",
+			"index": 0, "message": message, "finish_reason": finishReason,
 		}},
 		"usage": chatUsage(response.Usage),
 	}
 }
 
-func chatUsage(usage core.Usage) map[string]int64 {
-	return map[string]int64{
+func hasJSONValue(value json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(value)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func chatUsage(usage core.Usage) map[string]any {
+	return map[string]any{
 		"prompt_tokens": usage.InputTokens, "completion_tokens": usage.OutputTokens, "total_tokens": usage.TotalTokens,
+		"prompt_tokens_details": map[string]int64{"cached_tokens": usage.CachedInputTokens},
 	}
 }
 
@@ -627,7 +706,10 @@ func validateCacheProtection(policy *core.CacheProtectionPolicy) error {
 	if policy.MaxSpendMicros <= 0 || policy.MaxRefreshes <= 0 || policy.MaxProtectionWindowSec <= 0 {
 		return errors.New("enabled cache protection requires positive max_spend_micros, max_refreshes, and max_protection_window_seconds")
 	}
-	if policy.MaxRefreshes > 100 || policy.MaxProtectionWindowSec > int64((24*time.Hour)/time.Second) {
+	if policy.SafetyMarginMicros < 0 {
+		return errors.New("cache protection safety_margin_micros cannot be negative")
+	}
+	if policy.MaxSpendMicros > 1_000_000_000 || policy.MaxRefreshes > 100 || policy.MaxProtectionWindowSec > int64((24*time.Hour)/time.Second) {
 		return errors.New("cache protection bounds exceed the supported safety limits")
 	}
 	return nil

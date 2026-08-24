@@ -14,6 +14,7 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type CacheConfig struct {
@@ -45,7 +46,7 @@ func NewCacheProtector(config CacheConfig) (*CacheProtector, error) {
 		config.APIVersion = "2023-06-01"
 	}
 	if config.HTTPClient == nil {
-		config.HTTPClient = &http.Client{Timeout: 60 * time.Second}
+		config.HTTPClient = &http.Client{Timeout: 60 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport)}
 	}
 	if config.TTL == 0 {
 		config.TTL = 5 * time.Minute
@@ -136,6 +137,7 @@ func (p *CacheProtector) Refresh(ctx context.Context, anchor provider.CacheAncho
 	usage := core.Usage{
 		InputTokens:  response.Usage.InputTokens + response.Usage.CacheCreationInputTokens + response.Usage.CacheReadInputTokens,
 		OutputTokens: response.Usage.OutputTokens, CachedInputTokens: response.Usage.CacheReadInputTokens,
+		CacheWriteInputTokens: response.Usage.CacheCreationInputTokens,
 	}
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	return provider.RefreshResult{

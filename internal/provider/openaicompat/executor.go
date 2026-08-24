@@ -16,6 +16,7 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type Config struct {
@@ -45,7 +46,7 @@ func New(config Config) (*Executor, error) {
 	}
 	client := config.HTTPClient
 	if client == nil {
-		client = &http.Client{Transport: http.DefaultTransport}
+		client = &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}
 	}
 	return &Executor{
 		endpoint: baseURL.String(), apiKey: config.APIKey, model: config.Model,

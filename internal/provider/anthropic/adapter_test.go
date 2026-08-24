@@ -22,7 +22,8 @@ func TestAdapterSharesExactSerializationAcrossStreamingAndCacheRefresh(t *testin
 		BaseURL: "https://api.anthropic.test/v1", APIKey: "test-key", APIVersion: "2023-06-01",
 		Model: "claude-test", RouteID: "anthropic-us", CredentialScope: "tenant-primary", Region: "us-west",
 		TTL: 5 * time.Minute, CacheWritePerMillionMicros: 12_500_000,
-		HTTPClient: &http.Client{Transport: transport},
+		EnablePromptCaching: true,
+		HTTPClient:          &http.Client{Transport: transport},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +55,7 @@ func TestAdapterSharesExactSerializationAcrossStreamingAndCacheRefresh(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.Anchor.RouteID != "anthropic-us" || observation.Anchor.PrefixHash == "" || observation.RefreshCostMicros != 1_250 {
+	if observation.Anchor.RouteID != "anthropic-us" || observation.Anchor.PrefixHash == "" || observation.RefreshCostMicros != 1_125 {
 		t.Fatalf("observation = %#v", observation)
 	}
 	if capability := adapter.Inspect(context.Background(), observation.Anchor); !capability.Supported {
@@ -79,6 +80,25 @@ func TestAdapterSharesExactSerializationAcrossStreamingAndCacheRefresh(t *testin
 	}
 	if !strings.Contains(string(transport.requests[0]), `"cache_control"`) || !strings.Contains(string(transport.requests[1]), `"cache_control"`) {
 		t.Fatal("live and refresh payloads must share explicit cache breakpoints")
+	}
+}
+
+func TestAdapterDoesNotInventCacheLeaseWithoutProviderUsageEvidence(t *testing.T) {
+	t.Parallel()
+	adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
+		BaseURL: "https://api.anthropic.test/v1", APIKey: "test-key", Model: "claude-test",
+		RouteID: "anthropic-us", CredentialScope: "tenant-primary", Region: "us-west",
+		EnablePromptCaching: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := core.Request{TenantID: "tenant-a", Input: []core.Item{
+		{Type: "message", Role: "system", Content: []core.Content{{Type: "input_text", Text: "short system"}}},
+		{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "question"}}},
+	}}
+	if _, err := adapter.BuildCacheAnchor(context.Background(), request, core.Response{}); err == nil {
+		t.Fatal("expected missing provider cache evidence to reject lease creation")
 	}
 }
 

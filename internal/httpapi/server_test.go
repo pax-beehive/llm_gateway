@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -207,6 +208,79 @@ func TestResponsesCreateIsIdempotentPerTenantAndRequestHash(t *testing.T) {
 	}
 }
 
+func TestResponsesExposesCanonicalToolsAndSamplingFields(t *testing.T) {
+	t.Parallel()
+	captured := make(chan core.Request, 1)
+	executor := captureExecutor{capture: captured, delegate: provider.NewEchoExecutor()}
+	handler := handlerForExecutor(executor)
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "gateway-model", "instructions": "system:", "input": "user",
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+			"name": "lookup", "parameters": map[string]any{"type": "object"},
+		}}},
+		"tool_choice": "required", "temperature": 0.2, "top_p": 0.9,
+		"max_output_tokens": 42, "stop": []string{"END"}, "user": "end-user",
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	request := <-captured
+	if len(request.Tools) != 1 || string(request.ToolChoice) != `"required"` || request.MaxOutputTokens == nil || *request.MaxOutputTokens != 42 || request.EndUserID != "end-user" {
+		t.Fatalf("canonical request fields = %#v", request)
+	}
+	if len(request.Input) != 2 || request.Input[0].Role != "system" || request.Input[1].Role != "user" {
+		t.Fatalf("canonical instructions/input = %#v", request.Input)
+	}
+	if strings.Join(request.RequestedFeatures, ",") != "text,tools,sampling" {
+		t.Fatalf("requested features = %#v", request.RequestedFeatures)
+	}
+}
+
+func TestChatCompletionPreservesToolCallRoundTrip(t *testing.T) {
+	t.Parallel()
+	captured := make(chan core.Request, 1)
+	usage := core.Usage{InputTokens: 20, OutputTokens: 3, TotalTokens: 23}
+	executor := captureExecutor{capture: captured, delegate: fixedExecutor{events: []core.Event{
+		{Type: "response.output_item.done", Item: &core.Item{
+			Type: "function_call", CallID: "call-next", Name: "lookup", Arguments: json.RawMessage(`{"q":"next"}`),
+		}},
+		{Type: "response.completed", Usage: &usage, ProviderUsage: json.RawMessage(`{"input_tokens":20}`)},
+	}}}
+	handler := handlerForExecutor(executor)
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model": "gateway-model",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "first"},
+			map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{map[string]any{
+				"id": "call-old", "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"q":"old"}`},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": "call-old", "content": "old result"},
+		},
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	request := <-captured
+	if len(request.Input) != 3 || request.Input[1].Type != "function_call" || request.Input[2].Type != "function_call_output" {
+		t.Fatalf("canonical tool history = %#v", request.Input)
+	}
+	var body struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   any                `json:"content"`
+				ToolCalls []wireChatToolCall `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	decodeJSON(t, response, &body)
+	if len(body.Choices) != 1 || body.Choices[0].FinishReason != "tool_calls" || body.Choices[0].Message.Content != nil ||
+		len(body.Choices[0].Message.ToolCalls) != 1 || body.Choices[0].Message.ToolCalls[0].ID != "call-next" {
+		t.Fatalf("chat tool response = %#v", body)
+	}
+}
+
 func TestConversationOrdersInitialInputAndResponseOutput(t *testing.T) {
 	t.Parallel()
 
@@ -266,6 +340,66 @@ func newTestHandler() http.Handler {
 		},
 	})
 }
+
+func handlerForExecutor(executor provider.ResponseExecutor) http.Handler {
+	route := provider.Route{
+		ID: "test-route", Provider: "test-provider", Model: "gateway-model", Region: "local", HomeRegion: "local",
+		CredentialScope: "test", Healthy: true, Executor: executor, CacheUsageReliable: true,
+		Profile: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{
+			"text": provider.CapabilityNative, "streaming": provider.CapabilityNative,
+			"tools": provider.CapabilityNative, "sampling": provider.CapabilityNative,
+		}},
+		PriceSnapshot: core.PriceSnapshot{
+			ID: "test-price", Provider: "test-provider", Model: "provider-model", Region: "local",
+			Currency: "USD", EffectiveAt: 1, Source: "test",
+		},
+	}
+	return httpapi.New(httpapi.Config{
+		Runtime:       runtime.New(store.NewMemoryResponseStore(), provider.NewRouter(route)),
+		Authenticator: httpapi.StaticAuthenticator{"tenant-a-key": "tenant-a"},
+	})
+}
+
+type captureExecutor struct {
+	capture  chan<- core.Request
+	delegate provider.ResponseExecutor
+}
+
+type wireChatToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+func (e captureExecutor) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {
+	e.capture <- request
+	return e.delegate.Execute(ctx, request)
+}
+
+type fixedExecutor struct{ events []core.Event }
+
+func (e fixedExecutor) Execute(context.Context, core.Request) (provider.EventStream, error) {
+	return &fixedEventStream{events: append([]core.Event(nil), e.events...)}, nil
+}
+
+type fixedEventStream struct {
+	events []core.Event
+	index  int
+}
+
+func (s *fixedEventStream) Recv() (core.Event, error) {
+	if s.index >= len(s.events) {
+		return core.Event{}, io.EOF
+	}
+	event := s.events[s.index]
+	s.index++
+	return event, nil
+}
+
+func (s *fixedEventStream) Close() error { return nil }
 
 func performJSON(t *testing.T, handler http.Handler, token, method, target string, body any) *httptest.ResponseRecorder {
 	t.Helper()

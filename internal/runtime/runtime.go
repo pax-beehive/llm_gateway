@@ -15,6 +15,11 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/store"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Runtime struct {
@@ -25,6 +30,13 @@ type Runtime struct {
 	keepaliveInterval time.Duration
 	cacheCoordinator  *cacheprotection.Coordinator
 	cacheError        func(error)
+	tracer            trace.Tracer
+	responses         metric.Int64Counter
+	providerAttempts  metric.Int64Counter
+	tokens            metric.Int64Counter
+	costMicros        metric.Int64Counter
+	cacheOutcomes     metric.Int64Counter
+	providerDuration  metric.Float64Histogram
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -50,10 +62,20 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 	if options.KeepaliveInterval <= 0 {
 		options.KeepaliveInterval = 15 * time.Second
 	}
+	meter := otel.Meter("github.com/toddzheng/llm-gateway/runtime")
+	responses, _ := meter.Int64Counter("gateway.responses")
+	providerAttempts, _ := meter.Int64Counter("gateway.provider.attempts")
+	tokens, _ := meter.Int64Counter("gateway.tokens")
+	costMicros, _ := meter.Int64Counter("gateway.cost.micros")
+	cacheOutcomes, _ := meter.Int64Counter("gateway.cache.outcomes")
+	providerDuration, _ := meter.Float64Histogram("gateway.provider.duration", metric.WithUnit("s"))
 	return &Runtime{
 		store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc),
 		idleTimeout: options.ProviderIdleTimeout, keepaliveInterval: options.KeepaliveInterval,
 		cacheCoordinator: options.CacheCoordinator, cacheError: options.OnCacheError,
+		tracer: otel.Tracer("github.com/toddzheng/llm-gateway/runtime"), responses: responses,
+		providerAttempts: providerAttempts, tokens: tokens, costMicros: costMicros,
+		cacheOutcomes: cacheOutcomes, providerDuration: providerDuration,
 	}
 }
 
@@ -69,6 +91,12 @@ func (r *Runtime) ExecuteStreaming(ctx context.Context, request core.Request, em
 }
 
 func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(core.Event) error) (core.Response, error) {
+	ctx, responseSpan := r.tracer.Start(ctx, "gateway.response.execute", trace.WithAttributes(
+		attribute.String("gen_ai.request.model", request.Model),
+		attribute.String("gateway.home_region", request.HomeRegion),
+		attribute.Bool("gateway.background", request.Background),
+	))
+	defer responseSpan.End()
 	if request.TenantID == "" || request.Model == "" {
 		return core.Response{}, errors.New("tenant and model are required")
 	}
@@ -116,6 +144,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		Input: responseInput, Output: []core.Item{}, Metadata: request.Metadata,
 		HomeRegion: request.HomeRegion, Revision: 1,
 	}
+	responseSpan.SetAttributes(attribute.String("gateway.response.id", response.ID))
 	if request.IdempotencyKey != "" {
 		idempotentStore, ok := r.store.(store.IdempotentResponseStore)
 		if !ok {
@@ -166,25 +195,48 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	for _, route := range routes {
 		lastErr = nil
 		attemptStart := r.now().UTC()
+		attemptAttributes := []attribute.KeyValue{
+			attribute.String("gen_ai.provider.name", route.Provider),
+			attribute.String("gateway.route.id", route.ID),
+			attribute.String("cloud.region", route.Region),
+		}
+		r.providerAttempts.Add(executionCtx, 1, metric.WithAttributes(attemptAttributes...))
+		attemptRecorded := false
+		recordAttempt := func(outcome string) {
+			if attemptRecorded {
+				return
+			}
+			attemptRecorded = true
+			attributes := append(append([]attribute.KeyValue(nil), attemptAttributes...), attribute.String("gateway.outcome", outcome))
+			r.providerDuration.Record(executionCtx, r.now().UTC().Sub(attemptStart).Seconds(), metric.WithAttributes(attributes...))
+			responseSpan.AddEvent("provider.attempt", trace.WithAttributes(attributes...))
+		}
 		attempt := core.Attempt{
-			ID: newID("attempt"), RouteID: route.ID, Provider: route.Provider, ProviderModel: route.Model,
+			ID: newID("attempt"), RouteID: route.ID, Provider: route.Provider, ProviderModel: route.PriceSnapshot.Model,
 			Region: route.Region, StartedAt: attemptStart, PriceSnapshotID: route.PriceSnapshot.ID,
 		}
 		response.Attempts = append(response.Attempts, attempt)
 		protectedHit := r.observeCustomerRequest(executionCtx, request, route)
 		stream, executeErr := route.Executor.Execute(executionCtx, request)
 		if executeErr != nil {
+			recordAttempt("request_error")
 			lastErr = executeErr
 			response.Attempts[len(response.Attempts)-1].Error = gatewayError("provider_error", executeErr)
 			continue
 		}
 
 		visible := false
+		providerCompleted := false
 		var outputText string
 		var providerUsage []byte
 		for {
 			event, recvErr := r.recv(executionCtx, stream, emitEvent)
 			if recvErr == io.EOF {
+				if !providerCompleted {
+					lastErr = io.ErrUnexpectedEOF
+					response.Attempts[len(response.Attempts)-1].Error = gatewayError("provider_stream_error", lastErr)
+					recordAttempt("incomplete_stream")
+				}
 				break
 			}
 			if recvErr != nil {
@@ -192,12 +244,14 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 				response.Attempts[len(response.Attempts)-1].Error = gatewayError("provider_stream_error", recvErr)
 				_ = stream.Close()
 				if executionCtx.Err() != nil {
+					recordAttempt("cancelled")
 					if outputText != "" {
 						response.Output = append(response.Output, outputMessage(outputText))
 					}
 					return r.cancelled(context.WithoutCancel(executionCtx), request.TenantID, response)
 				}
 				if visible {
+					recordAttempt("stream_error")
 					if outputText != "" {
 						response.Output = append(response.Output, outputMessage(outputText))
 					}
@@ -228,14 +282,26 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			if event.Usage != nil {
 				response.Usage = *event.Usage
 			}
+			if event.Type == "response.completed" {
+				providerCompleted = true
+			}
 			if len(event.ProviderUsage) > 0 {
 				providerUsage = append(providerUsage[:0], event.ProviderUsage...)
 			}
 		}
 		_ = stream.Close()
 		if lastErr != nil && !visible {
+			recordAttempt("failed_before_output")
 			continue
 		}
+		if lastErr != nil {
+			recordAttempt("stream_error")
+			if outputText != "" {
+				response.Output = append(response.Output, outputMessage(outputText))
+			}
+			return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "stream_interrupted", lastErr)
+		}
+		recordAttempt("completed")
 		if outputText != "" {
 			response.Output = append(response.Output, outputMessage(outputText))
 		}
@@ -273,6 +339,16 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			return core.Response{}, fmt.Errorf("persist completed response and usage: %w", persistErr)
 		}
 		response.Revision++
+		r.responses.Add(executionCtx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "completed")))
+		r.tokens.Add(executionCtx, response.Usage.InputTokens, metric.WithAttributes(attribute.String("gateway.token.type", "input"), attribute.String("gen_ai.provider.name", route.Provider)))
+		r.tokens.Add(executionCtx, response.Usage.CachedInputTokens, metric.WithAttributes(attribute.String("gateway.token.type", "cached_input"), attribute.String("gen_ai.provider.name", route.Provider)))
+		r.tokens.Add(executionCtx, response.Usage.OutputTokens, metric.WithAttributes(attribute.String("gateway.token.type", "output"), attribute.String("gen_ai.provider.name", route.Provider)))
+		r.costMicros.Add(executionCtx, usageRecord.AmountMicros, metric.WithAttributes(attribute.String("currency", usageRecord.Currency), attribute.String("gen_ai.provider.name", route.Provider)))
+		if usageRecord.ProtectedHit != nil {
+			r.cacheOutcomes.Add(executionCtx, 1, metric.WithAttributes(attribute.String("gateway.cache.outcome", "protected_hit"), attribute.String("gen_ai.provider.name", route.Provider)))
+		}
+		responseSpan.SetStatus(codes.Ok, "completed")
+		responseSpan.SetAttributes(attribute.String("gen_ai.provider.name", route.Provider), attribute.String("gateway.route.id", route.ID))
 		r.planCacheProtection(context.WithoutCancel(executionCtx), request, response, route)
 		if !request.Store {
 			if err := r.store.Delete(context.WithoutCancel(executionCtx), request.TenantID, response.ID, response.Revision); err != nil {
@@ -297,7 +373,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 func validatePriceSnapshot(route provider.Route, snapshot core.PriceSnapshot) error {
 	if snapshot.ID == "" || snapshot.Provider != route.Provider || snapshot.Model == "" || snapshot.Region != route.Region ||
 		snapshot.Currency == "" || snapshot.Source == "" || snapshot.InputPerMillionMicros < 0 ||
-		snapshot.CachedInputPerMillionMicros < 0 || snapshot.OutputPerMillionMicros < 0 {
+		snapshot.CachedInputPerMillionMicros < 0 || snapshot.CacheWritePerMillionMicros < 0 || snapshot.OutputPerMillionMicros < 0 {
 		return fmt.Errorf("model route %q has an invalid immutable price snapshot", route.ID)
 	}
 	return nil
@@ -305,9 +381,11 @@ func validatePriceSnapshot(route provider.Route, snapshot core.PriceSnapshot) er
 
 func calculateUsageAmount(usage core.Usage, snapshot core.PriceSnapshot) int64 {
 	cached := min(max(usage.CachedInputTokens, 0), max(usage.InputTokens, 0))
-	uncached := max(usage.InputTokens-cached, 0)
+	cacheWrite := min(max(usage.CacheWriteInputTokens, 0), max(usage.InputTokens-cached, 0))
+	uncached := max(usage.InputTokens-cached-cacheWrite, 0)
 	return perMillionCost(uncached, snapshot.InputPerMillionMicros) +
 		perMillionCost(cached, snapshot.CachedInputPerMillionMicros) +
+		perMillionCost(cacheWrite, snapshot.CacheWritePerMillionMicros) +
 		perMillionCost(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros)
 }
 
@@ -372,8 +450,8 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 	if expectedDelay > 2*time.Minute {
 		expectedDelay = 2 * time.Minute
 	}
-	coldCost := perMillionCost(max(response.Usage.InputTokens, 0), route.PriceSnapshot.InputPerMillionMicros)
-	hitCost := perMillionCost(max(response.Usage.InputTokens, 0), route.PriceSnapshot.CachedInputPerMillionMicros)
+	coldCost := perMillionCost(max(observation.PrefixTokens, 0), route.PriceSnapshot.InputPerMillionMicros)
+	hitCost := perMillionCost(max(observation.PrefixTokens, 0), route.PriceSnapshot.CachedInputPerMillionMicros)
 	refreshCost := observation.RefreshCostMicros
 	if refreshCost <= 0 {
 		refreshCost = coldCost
@@ -399,7 +477,15 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 			RefreshCostMicros: refreshCost,
 		},
 	}
-	_, err = r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
+	intent, err := r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
+	status := string(intent.Status)
+	if err != nil {
+		status = "error"
+	}
+	r.cacheOutcomes.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("gateway.cache.outcome", "protection_"+status),
+		attribute.String("gen_ai.provider.name", route.Provider),
+	))
 	if err != nil && r.cacheError != nil {
 		r.cacheError(err)
 	}
@@ -594,6 +680,10 @@ func (r *Runtime) Cancel(ctx context.Context, tenantID, responseID string) (core
 }
 
 func (r *Runtime) fail(ctx context.Context, tenantID string, response core.Response, code string, cause error) (core.Response, error) {
+	span := trace.SpanFromContext(ctx)
+	span.RecordError(cause)
+	span.SetStatus(codes.Error, code)
+	r.responses.Add(ctx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "failed"), attribute.String("gateway.error.code", code)))
 	response.Status = core.ResponseStatusFailed
 	response.Error = gatewayError(code, cause)
 	if err := r.store.Update(ctx, tenantID, response, response.Revision); err != nil {
@@ -604,6 +694,8 @@ func (r *Runtime) fail(ctx context.Context, tenantID string, response core.Respo
 }
 
 func (r *Runtime) cancelled(ctx context.Context, tenantID string, response core.Response) (core.Response, error) {
+	trace.SpanFromContext(ctx).SetStatus(codes.Error, "cancelled")
+	r.responses.Add(ctx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "cancelled")))
 	response.Status = core.ResponseStatusCancelled
 	response.Error = nil
 	err := r.store.Update(ctx, tenantID, response, response.Revision)

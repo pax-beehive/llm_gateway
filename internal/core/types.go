@@ -40,10 +40,11 @@ type Item struct {
 }
 
 type Usage struct {
-	InputTokens       int64 `json:"input_tokens"`
-	OutputTokens      int64 `json:"output_tokens"`
-	TotalTokens       int64 `json:"total_tokens"`
-	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
+	InputTokens           int64 `json:"input_tokens"`
+	OutputTokens          int64 `json:"output_tokens"`
+	TotalTokens           int64 `json:"total_tokens"`
+	CachedInputTokens     int64 `json:"cached_input_tokens,omitempty"`
+	CacheWriteInputTokens int64 `json:"cache_write_input_tokens,omitempty"`
 }
 
 type Error struct {
@@ -167,6 +168,7 @@ type PriceSnapshot struct {
 	Currency                    string `json:"currency"`
 	InputPerMillionMicros       int64  `json:"input_per_million_micros"`
 	CachedInputPerMillionMicros int64  `json:"cached_input_per_million_micros"`
+	CacheWritePerMillionMicros  int64  `json:"cache_write_per_million_micros"`
 	OutputPerMillionMicros      int64  `json:"output_per_million_micros"`
 	EffectiveAt                 int64  `json:"effective_at"`
 	Source                      string `json:"source"`

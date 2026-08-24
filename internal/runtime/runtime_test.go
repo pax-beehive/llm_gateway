@@ -63,6 +63,21 @@ func TestVisibleProviderFailureIsPersistedWithoutFallback(t *testing.T) {
 	}
 }
 
+func TestVisibleProviderEOFWithoutTerminalUsageIsFailure(t *testing.T) {
+	t.Parallel()
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{{event: core.Event{Type: "response.output_text.delta", Delta: "partial"}}}}, nil
+	})
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.New(responseStore, provider.NewRouter(testRoute("incomplete", executor)))
+	response, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) || response.Status != core.ResponseStatusFailed || response.OutputText() != "partial" {
+		t.Fatalf("response/status/error = %#v / %v", response, err)
+	}
+}
+
 func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
 	t.Parallel()
 
@@ -98,7 +113,10 @@ func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
 func TestCompletionRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testing.T) {
 	t.Parallel()
 
-	usage := core.Usage{InputTokens: 1_000_000, CachedInputTokens: 800_000, OutputTokens: 100_000, TotalTokens: 1_100_000}
+	usage := core.Usage{
+		InputTokens: 1_000_000, CachedInputTokens: 800_000, CacheWriteInputTokens: 100_000,
+		OutputTokens: 100_000, TotalTokens: 1_100_000,
+	}
 	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
 		return &scriptedStream{steps: []streamStep{
 			{event: core.Event{Type: "response.output_text.delta", Delta: "done"}},
@@ -109,7 +127,8 @@ func TestCompletionRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testin
 	route.PriceSnapshot = core.PriceSnapshot{
 		ID: "price-v1", Provider: "priced", Model: "gateway-model", Region: "local", Currency: "USD",
 		InputPerMillionMicros: 10_000_000, CachedInputPerMillionMicros: 1_000_000,
-		OutputPerMillionMicros: 20_000_000, EffectiveAt: 1, Source: "test-contract",
+		CacheWritePerMillionMicros: 12_000_000, OutputPerMillionMicros: 20_000_000,
+		EffectiveAt: 1, Source: "test-contract",
 	}
 	route.CacheUsageReliable = true
 	responseStore := store.NewMemoryResponseStore()
@@ -125,8 +144,8 @@ func TestCompletionRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testin
 		t.Fatalf("usage records = %#v, want one", records)
 	}
 	record := records[0]
-	if record.AmountMicros != 4_800_000 || record.PriceSnapshot.ID != "price-v1" {
-		t.Fatalf("usage amount/snapshot = %d/%q, want 4800000/price-v1", record.AmountMicros, record.PriceSnapshot.ID)
+	if record.AmountMicros != 5_000_000 || record.PriceSnapshot.ID != "price-v1" {
+		t.Fatalf("usage amount/snapshot = %d/%q, want 5000000/price-v1", record.AmountMicros, record.PriceSnapshot.ID)
 	}
 	if string(record.ProviderUsage) != `{"cache":"reported"}` {
 		t.Fatalf("provider usage = %s", record.ProviderUsage)
