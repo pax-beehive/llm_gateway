@@ -51,6 +51,19 @@ type CacheProtector interface {
 	Refresh(context.Context, CacheAnchor) (RefreshResult, error)
 }
 
+type CacheObservation struct {
+	Anchor             CacheAnchor
+	EstimatedExpiresAt time.Time
+	PrefixTokens       int64
+	RefreshCostMicros  int64
+	SideEffecting      bool
+}
+
+type CacheAnchorBuilder interface {
+	CurrentCacheAnchor(context.Context, core.Request) (CacheAnchor, bool, error)
+	BuildCacheAnchor(context.Context, core.Request, core.Response) (CacheObservation, error)
+}
+
 type CapabilitySupport string
 
 const (
@@ -77,6 +90,7 @@ type Route struct {
 	Profile            CapabilityProfile
 	Executor           ResponseExecutor
 	CacheProtector     CacheProtector
+	CacheAnchorBuilder CacheAnchorBuilder
 	PriceSnapshot      core.PriceSnapshot
 	CacheUsageReliable bool
 }
@@ -140,6 +154,20 @@ func (r *StaticRouter) Revision() int64 {
 		return snapshot.revision
 	}
 	return 0
+}
+
+func (r *StaticRouter) ResolveCacheProtector(anchor CacheAnchor) CacheProtector {
+	snapshot := r.snapshot.Load()
+	if snapshot == nil {
+		return nil
+	}
+	for _, route := range snapshot.routes {
+		if route.ID == anchor.RouteID && route.Provider == anchor.Provider && route.Region == anchor.Region &&
+			route.CredentialScope == anchor.CredentialScope && route.CacheProtector != nil {
+			return route.CacheProtector
+		}
+	}
+	return nil
 }
 
 func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Route, error) {

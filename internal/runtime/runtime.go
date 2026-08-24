@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/store"
@@ -21,6 +23,8 @@ type Runtime struct {
 	now               func() time.Time
 	idleTimeout       time.Duration
 	keepaliveInterval time.Duration
+	cacheCoordinator  *cacheprotection.Coordinator
+	cacheError        func(error)
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -29,6 +33,8 @@ type Runtime struct {
 type Options struct {
 	ProviderIdleTimeout time.Duration
 	KeepaliveInterval   time.Duration
+	CacheCoordinator    *cacheprotection.Coordinator
+	OnCacheError        func(error)
 }
 
 var ErrProviderIdleTimeout = errors.New("provider stream idle timeout")
@@ -47,6 +53,7 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 	return &Runtime{
 		store: responseStore, router: router, now: time.Now, cancels: make(map[string]context.CancelFunc),
 		idleTimeout: options.ProviderIdleTimeout, keepaliveInterval: options.KeepaliveInterval,
+		cacheCoordinator: options.CacheCoordinator, cacheError: options.OnCacheError,
 	}
 }
 
@@ -89,6 +96,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			return core.Response{}, errors.New("conversation belongs to a different home region")
 		}
 		request.Input = append(cloneItems(conversation.Items), responseInput...)
+		request.ContextItemCount = len(conversation.Items)
 	}
 	if request.PreviousResponseID != "" {
 		chain, previous, err := r.responseChain(ctx, request.TenantID, request.PreviousResponseID, request.HomeRegion)
@@ -96,6 +104,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			return core.Response{}, fmt.Errorf("previous response: %w", err)
 		}
 		request.Input = append(chain, responseInput...)
+		request.ContextItemCount = len(chain)
 		if len(previous.Attempts) > 0 {
 			request.PreferredRouteID = previous.Attempts[len(previous.Attempts)-1].RouteID
 		}
@@ -162,6 +171,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			Region: route.Region, StartedAt: attemptStart, PriceSnapshotID: route.PriceSnapshot.ID,
 		}
 		response.Attempts = append(response.Attempts, attempt)
+		r.cancelPendingCacheProtection(executionCtx, request, route)
 		stream, executeErr := route.Executor.Execute(executionCtx, request)
 		if executeErr != nil {
 			lastErr = executeErr
@@ -260,6 +270,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			return core.Response{}, fmt.Errorf("persist completed response and usage: %w", persistErr)
 		}
 		response.Revision++
+		r.planCacheProtection(context.WithoutCancel(executionCtx), request, response, route)
 		if !request.Store {
 			if err := r.store.Delete(context.WithoutCancel(executionCtx), request.TenantID, response.ID, response.Revision); err != nil {
 				return core.Response{}, fmt.Errorf("apply store:false retention: %w", err)
@@ -299,6 +310,101 @@ func calculateUsageAmount(usage core.Usage, snapshot core.PriceSnapshot) int64 {
 
 func perMillionCost(tokens, rate int64) int64 {
 	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
+}
+
+func (r *Runtime) cancelPendingCacheProtection(ctx context.Context, request core.Request, route provider.Route) {
+	if r.cacheCoordinator == nil || request.CacheProtection == nil || !request.CacheProtection.Enabled || route.CacheAnchorBuilder == nil {
+		return
+	}
+	anchor, exists, err := route.CacheAnchorBuilder.CurrentCacheAnchor(ctx, request)
+	if err == nil && exists {
+		_, err = r.cacheCoordinator.CustomerRequest(ctx, anchor)
+	}
+	if err != nil && r.cacheError != nil {
+		r.cacheError(err)
+	}
+}
+
+func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request, response core.Response, route provider.Route) {
+	if r.cacheCoordinator == nil || request.CacheProtection == nil || !request.CacheProtection.Enabled ||
+		route.CacheAnchorBuilder == nil || route.CacheProtector == nil {
+		return
+	}
+	observation, err := route.CacheAnchorBuilder.BuildCacheAnchor(ctx, request, response)
+	if err != nil {
+		if r.cacheError != nil {
+			r.cacheError(err)
+		}
+		return
+	}
+	now := r.now().UTC()
+	ttl := observation.EstimatedExpiresAt.Sub(now)
+	if ttl <= 0 {
+		return
+	}
+	probability := 0.25
+	source := "stateless_recent_request"
+	if request.Background {
+		probability, source = 0.90, "open_background_response"
+	} else if hasToolWork(response.Output) {
+		probability, source = 0.85, "active_tool_work"
+	} else if request.ConversationID != "" {
+		probability, source = 0.65, "conversation_continuity"
+	} else if request.PreviousResponseID != "" {
+		probability, source = 0.60, "response_chain_continuity"
+	}
+	expectedDelay := ttl / 2
+	if expectedDelay > 2*time.Minute {
+		expectedDelay = 2 * time.Minute
+	}
+	coldCost := perMillionCost(max(response.Usage.InputTokens, 0), route.PriceSnapshot.InputPerMillionMicros)
+	hitCost := perMillionCost(max(response.Usage.InputTokens, 0), route.PriceSnapshot.CachedInputPerMillionMicros)
+	refreshCost := observation.RefreshCostMicros
+	if refreshCost <= 0 {
+		refreshCost = coldCost
+	}
+	policy := request.CacheProtection
+	candidate := cacheprotection.Candidate{
+		Policy: cacheprotection.Policy{
+			Enabled: policy.Enabled, MaxSpendMicros: policy.MaxSpendMicros, MaxRefreshes: policy.MaxRefreshes,
+			MaxProtectionWindow: time.Duration(policy.MaxProtectionWindowSec) * time.Second,
+			SafetyMarginMicros:  policy.SafetyMarginMicros, AllowContentInspection: policy.AllowContentInspection,
+			ShadowMode: policy.ShadowMode,
+		},
+		Lease: cacheprotection.Lease{
+			ID: cacheLeaseID(observation.Anchor), Revision: 1, Anchor: observation.Anchor,
+			CreatedAt: now, EstimatedExpiresAt: observation.EstimatedExpiresAt, FencingToken: 1,
+			SideEffecting: observation.SideEffecting,
+		},
+		Forecast: cacheprotection.Forecast{
+			Probability: probability, ExpectedAt: now.Add(expectedDelay), Source: source,
+		},
+		Economics: cacheprotection.Economics{
+			PredictedColdCostMicros: coldCost, PredictedHitCostMicros: hitCost,
+			RefreshCostMicros: refreshCost,
+		},
+	}
+	_, err = r.cacheCoordinator.Run(ctx, candidate, route.CacheProtector)
+	if err != nil && r.cacheError != nil {
+		r.cacheError(err)
+	}
+}
+
+func hasToolWork(items []core.Item) bool {
+	for _, item := range items {
+		if item.Type == "function_call" {
+			return true
+		}
+	}
+	return false
+}
+
+func cacheLeaseID(anchor provider.CacheAnchor) string {
+	digest := sha256.Sum256([]byte(
+		anchor.TenantID + "\x1f" + anchor.RouteID + "\x1f" + anchor.Provider + "\x1f" + anchor.Model + "\x1f" +
+			anchor.CredentialScope + "\x1f" + anchor.Region + "\x1f" + anchor.CacheKey + "\x1f" + anchor.PrefixHash,
+	))
+	return "lease_" + hex.EncodeToString(digest[:16])
 }
 
 func (r *Runtime) responseChain(ctx context.Context, tenantID, responseID, homeRegion string) ([]core.Item, core.Response, error) {

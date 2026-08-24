@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	gatewayruntime "github.com/toddzheng/llm-gateway/internal/runtime"
@@ -132,6 +133,60 @@ func TestCompletionRecordsNormalizedUsageAgainstImmutablePriceSnapshot(t *testin
 	}
 }
 
+func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	usage := core.Usage{InputTokens: 1_000_000, OutputTokens: 10, TotalTokens: 1_000_010}
+	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{
+			{event: core.Event{Type: "response.output_text.delta", Delta: "done"}},
+			{event: core.Event{Type: "response.completed", Usage: &usage}},
+		}}, nil
+	})
+	anchor := provider.CacheAnchor{
+		TenantID: "tenant-a", RouteID: "cache-route", Provider: "cache-provider", Model: "gateway-model",
+		CredentialScope: "tenant-primary", Region: "local", CacheKey: "cache-key", PrefixHash: "sha256:prefix",
+	}
+	adapter := &cacheAdapterStub{
+		observation: provider.CacheObservation{
+			Anchor: anchor, EstimatedExpiresAt: now.Add(5 * time.Minute), PrefixTokens: 1_000_000, RefreshCostMicros: 100_000,
+		},
+		refreshResult: provider.RefreshResult{Status: "succeeded", ExpiresAt: now.Add(10 * time.Minute)},
+	}
+	route := testRoute("cache-route", executor)
+	route.Provider = "cache-provider"
+	route.CacheProtector = adapter
+	route.CacheAnchorBuilder = adapter
+	route.PriceSnapshot = core.PriceSnapshot{
+		ID: "cache-price-v1", Provider: "cache-provider", Model: "gateway-model", Region: "local", Currency: "USD",
+		InputPerMillionMicros: 10_000_000, CachedInputPerMillionMicros: 1_000_000,
+		OutputPerMillionMicros: 1_000_000, EffectiveAt: 1, Source: "test",
+	}
+	repository := cacheprotection.NewMemoryIntentRepository()
+	coordinator := cacheprotection.NewCoordinator(repository, time.Now)
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(route), gatewayruntime.Options{CacheCoordinator: coordinator})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		CacheProtection: &core.CacheProtectionPolicy{
+			Enabled: true, MaxSpendMicros: 1_000_000, MaxRefreshes: 1,
+			MaxProtectionWindowSec: 3600, SafetyMarginMicros: 100_000,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(4*time.Minute + 55*time.Second) })
+	completed, err := worker.RunDue(context.Background(), 10, func(provider.CacheAnchor) provider.CacheProtector { return adapter })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completed) != 1 || completed[0].Status != cacheprotection.IntentSucceeded || adapter.refreshCalls.Load() != 1 {
+		t.Fatalf("cache protection completion = %#v, refresh calls = %d", completed, adapter.refreshCalls.Load())
+	}
+}
+
 type executorFunc func(context.Context, core.Request) (provider.EventStream, error)
 
 func (f executorFunc) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {
@@ -161,6 +216,29 @@ func (s *scriptedStream) Close() error { return nil }
 
 type blockingStream struct {
 	closed chan struct{}
+}
+
+type cacheAdapterStub struct {
+	observation   provider.CacheObservation
+	refreshResult provider.RefreshResult
+	refreshCalls  atomic.Int64
+}
+
+func (s *cacheAdapterStub) Inspect(context.Context, provider.CacheAnchor) provider.CacheCapability {
+	return provider.CacheCapability{Supported: true}
+}
+
+func (s *cacheAdapterStub) Refresh(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
+	s.refreshCalls.Add(1)
+	return s.refreshResult, nil
+}
+
+func (s *cacheAdapterStub) CurrentCacheAnchor(context.Context, core.Request) (provider.CacheAnchor, bool, error) {
+	return s.observation.Anchor, false, nil
+}
+
+func (s *cacheAdapterStub) BuildCacheAnchor(context.Context, core.Request, core.Response) (provider.CacheObservation, error) {
+	return s.observation, nil
 }
 
 func newBlockingStream() *blockingStream {

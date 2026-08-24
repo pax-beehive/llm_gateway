@@ -115,6 +115,16 @@ func (c *Coordinator) RunDue(ctx context.Context, limit int, resolve ProtectorRe
 	}
 	results := make([]Intent, 0, len(claimed))
 	for _, intent := range claimed {
+		decision := Evaluate(c.now().UTC(), intent.Candidate)
+		if !decision.Eligible {
+			intent.Error = "worker revalidation: " + decision.Reason
+			updated, updateErr := c.repository.Update(ctx, intent, IntentRejected)
+			if updateErr != nil {
+				return results, updateErr
+			}
+			results = append(results, updated)
+			continue
+		}
 		protector := resolve(intent.Anchor)
 		if protector == nil {
 			intent.Error = "cache protector disabled by current route configuration"

@@ -76,6 +76,18 @@ type Request struct {
 	PreferredRouteID   string
 	IdempotencyKey     string
 	RequestHash        []byte
+	ContextItemCount   int
+	CacheProtection    *CacheProtectionPolicy
+}
+
+type CacheProtectionPolicy struct {
+	Enabled                bool  `json:"enabled"`
+	MaxSpendMicros         int64 `json:"max_spend_micros"`
+	MaxRefreshes           int   `json:"max_refreshes"`
+	MaxProtectionWindowSec int64 `json:"max_protection_window_seconds"`
+	SafetyMarginMicros     int64 `json:"safety_margin_micros"`
+	AllowContentInspection bool  `json:"allow_content_inspection,omitempty"`
+	ShadowMode             bool  `json:"shadow_mode,omitempty"`
 }
 
 type Attempt struct {

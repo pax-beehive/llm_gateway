@@ -45,7 +45,7 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	candidate := eligibleCandidate(now)
 	candidate.Lease.Anchor.TenantID = tenantID
-	candidate.Lease.EstimatedExpiresAt = now.Add(time.Minute)
+	candidate.Lease.EstimatedExpiresAt = now.Add(5 * time.Minute)
 	candidate.Forecast.ExpectedAt = now.Add(30 * time.Minute)
 	repository := cacheprotection.NewPostgresIntentRepository(db)
 	planner := cacheprotection.NewCoordinator(repository, func() time.Time { return now })
@@ -64,7 +64,7 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	if planned.Status != cacheprotection.IntentPlanned {
 		t.Fatalf("planned status = %q", planned.Status)
 	}
-	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(2 * time.Minute) })
+	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(4*time.Minute + 55*time.Second) })
 	completed, err := worker.RunDue(ctx, 10, func(provider.CacheAnchor) provider.CacheProtector { return protector })
 	if err != nil {
 		t.Fatal(err)

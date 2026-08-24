@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
@@ -79,15 +80,16 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 }
 
 type createResponseRequest struct {
-	Model              string                 `json:"model"`
-	Input              json.RawMessage        `json:"input"`
-	Stream             bool                   `json:"stream"`
-	Background         bool                   `json:"background"`
-	Store              *bool                  `json:"store"`
-	PreviousResponseID string                 `json:"previous_response_id"`
-	Conversation       string                 `json:"conversation"`
-	Metadata           map[string]string      `json:"metadata"`
-	CompatibilityMode  core.CompatibilityMode `json:"compatibility_mode"`
+	Model              string                      `json:"model"`
+	Input              json.RawMessage             `json:"input"`
+	Stream             bool                        `json:"stream"`
+	Background         bool                        `json:"background"`
+	Store              *bool                       `json:"store"`
+	PreviousResponseID string                      `json:"previous_response_id"`
+	Conversation       string                      `json:"conversation"`
+	Metadata           map[string]string           `json:"metadata"`
+	CompatibilityMode  core.CompatibilityMode      `json:"compatibility_mode"`
+	CacheProtection    *core.CacheProtectionPolicy `json:"cache_protection,omitempty"`
 }
 
 func (s *Server) createResponse(responseWriter http.ResponseWriter, request *http.Request) {
@@ -114,8 +116,13 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		Stream: payload.Stream, Background: payload.Background, Store: storeResponse,
 		PreviousResponseID: payload.PreviousResponseID, ConversationID: payload.Conversation,
 		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: []string{"text"}, Metadata: payload.Metadata,
-		HomeRegion:     s.homeRegion(request),
-		IdempotencyKey: strings.TrimSpace(request.Header.Get("Idempotency-Key")),
+		HomeRegion:      s.homeRegion(request),
+		IdempotencyKey:  strings.TrimSpace(request.Header.Get("Idempotency-Key")),
+		CacheProtection: payload.CacheProtection,
+	}
+	if err := validateCacheProtection(payload.CacheProtection); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
+		return
 	}
 	if len(canonical.IdempotencyKey) > 256 {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "Idempotency-Key exceeds 256 bytes", "Idempotency-Key")
@@ -337,20 +344,21 @@ func (s *Server) deleteConversation(responseWriter http.ResponseWriter, request 
 }
 
 type chatCompletionRequest struct {
-	Model               string                 `json:"model"`
-	Messages            []chatMessage          `json:"messages"`
-	Stream              bool                   `json:"stream"`
-	StreamOptions       *chatStreamOptions     `json:"stream_options,omitempty"`
-	Tools               []json.RawMessage      `json:"tools,omitempty"`
-	ToolChoice          json.RawMessage        `json:"tool_choice,omitempty"`
-	Temperature         *float64               `json:"temperature,omitempty"`
-	TopP                *float64               `json:"top_p,omitempty"`
-	MaxTokens           *int                   `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int                   `json:"max_completion_tokens,omitempty"`
-	Stop                json.RawMessage        `json:"stop,omitempty"`
-	User                string                 `json:"user,omitempty"`
-	Metadata            map[string]string      `json:"metadata,omitempty"`
-	CompatibilityMode   core.CompatibilityMode `json:"compatibility_mode,omitempty"`
+	Model               string                      `json:"model"`
+	Messages            []chatMessage               `json:"messages"`
+	Stream              bool                        `json:"stream"`
+	StreamOptions       *chatStreamOptions          `json:"stream_options,omitempty"`
+	Tools               []json.RawMessage           `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage             `json:"tool_choice,omitempty"`
+	Temperature         *float64                    `json:"temperature,omitempty"`
+	TopP                *float64                    `json:"top_p,omitempty"`
+	MaxTokens           *int                        `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int                        `json:"max_completion_tokens,omitempty"`
+	Stop                json.RawMessage             `json:"stop,omitempty"`
+	User                string                      `json:"user,omitempty"`
+	Metadata            map[string]string           `json:"metadata,omitempty"`
+	CompatibilityMode   core.CompatibilityMode      `json:"compatibility_mode,omitempty"`
+	CacheProtection     *core.CacheProtectionPolicy `json:"cache_protection,omitempty"`
 }
 
 type chatMessage struct {
@@ -399,6 +407,11 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 		HomeRegion: s.homeRegion(request),
 		Tools:      payload.Tools, ToolChoice: payload.ToolChoice, Temperature: payload.Temperature,
 		TopP: payload.TopP, MaxOutputTokens: maxOutputTokens, Stop: payload.Stop, EndUserID: payload.User,
+		CacheProtection: payload.CacheProtection,
+	}
+	if err := validateCacheProtection(payload.CacheProtection); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
+		return
 	}
 	if payload.Stream {
 		s.streamChatCompletion(responseWriter, request, canonical, payload.StreamOptions)
@@ -603,6 +616,19 @@ func validateItems(items []core.Item) error {
 		if items[index].Type == "" {
 			return errors.New("every item must have a type")
 		}
+	}
+	return nil
+}
+
+func validateCacheProtection(policy *core.CacheProtectionPolicy) error {
+	if policy == nil || !policy.Enabled {
+		return nil
+	}
+	if policy.MaxSpendMicros <= 0 || policy.MaxRefreshes <= 0 || policy.MaxProtectionWindowSec <= 0 {
+		return errors.New("enabled cache protection requires positive max_spend_micros, max_refreshes, and max_protection_window_seconds")
+	}
+	if policy.MaxRefreshes > 100 || policy.MaxProtectionWindowSec > int64((24*time.Hour)/time.Second) {
+		return errors.New("cache protection bounds exceed the supported safety limits")
 	}
 	return nil
 }

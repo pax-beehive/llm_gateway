@@ -18,10 +18,13 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
+	"github.com/toddzheng/llm-gateway/internal/provider/gemini"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
@@ -48,6 +51,15 @@ type routeConfig struct {
 	PriceSource        string                                `json:"price_source"`
 	Currency           string                                `json:"currency"`
 	CacheUsageReliable bool                                  `json:"cache_usage_reliable"`
+	CacheRefresh       *cacheRefreshConfig                   `json:"cache_refresh,omitempty"`
+}
+
+type cacheRefreshConfig struct {
+	Kind       string `json:"kind"`
+	BaseURL    string `json:"base_url"`
+	APIKeyEnv  string `json:"api_key_env"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+	APIVersion string `json:"api_version,omitempty"`
 }
 
 func main() {
@@ -97,7 +109,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	engine := runtime.New(responseStore, router)
+	var intentRepository cacheprotection.IntentRepository
+	if database != nil {
+		intentRepository = cacheprotection.NewPostgresIntentRepository(database)
+	} else {
+		intentRepository = cacheprotection.NewMemoryIntentRepository()
+	}
+	cacheCoordinator := cacheprotection.NewCoordinator(intentRepository, time.Now)
+	engine := runtime.NewWithOptions(responseStore, router, runtime.Options{
+		CacheCoordinator: cacheCoordinator,
+		OnCacheError:     func(err error) { slog.Warn("cache protection degraded", "error", err) },
+	})
+	go runCacheWorker(ctx, cacheCoordinator, router)
 	handler := httpapi.New(httpapi.Config{
 		Runtime: engine, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
 	})
@@ -246,6 +269,10 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		if err != nil || config.PriceSnapshotID == "" || config.PriceSource == "" || config.Currency == "" {
 			return nil, fmt.Errorf("route %q requires immutable price_snapshot_id, RFC3339 price_effective_at, price_source, and currency", config.ID)
 		}
+		cacheProtector, err := buildCacheProtector(config)
+		if err != nil {
+			return nil, fmt.Errorf("route %q cache refresh: %w", config.ID, err)
+		}
 		routes = append(routes, provider.Route{
 			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
 			HomeRegion: config.HomeRegion, CredentialScope: config.CredentialScope, Healthy: true,
@@ -258,9 +285,49 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 				EffectiveAt: effectiveAt.Unix(), Source: config.PriceSource,
 			},
 			CacheUsageReliable: config.CacheUsageReliable,
+			CacheProtector:     cacheProtector,
 		})
 	}
 	return routes, nil
+}
+
+func buildCacheProtector(config routeConfig) (provider.CacheProtector, error) {
+	if config.CacheRefresh == nil {
+		return nil, nil
+	}
+	refresh := config.CacheRefresh
+	if refresh.TTLSeconds <= 0 {
+		return nil, errors.New("positive ttl_seconds is required")
+	}
+	switch refresh.Kind {
+	case "anthropic":
+		return anthropic.NewCacheProtector(anthropic.CacheConfig{
+			BaseURL: refresh.BaseURL, APIKey: os.Getenv(refresh.APIKeyEnv), APIVersion: refresh.APIVersion,
+			TTL: time.Duration(refresh.TTLSeconds) * time.Second,
+		})
+	case "gemini":
+		return gemini.NewCacheProtector(
+			refresh.BaseURL, os.Getenv(refresh.APIKeyEnv), time.Duration(refresh.TTLSeconds)*time.Second, nil,
+		)
+	default:
+		return nil, fmt.Errorf("unsupported cache refresh kind %q", refresh.Kind)
+	}
+}
+
+func runCacheWorker(ctx context.Context, coordinator *cacheprotection.Coordinator, router *provider.StaticRouter) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, err := coordinator.RunDue(ctx, 32, router.ResolveCacheProtector)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("cache protection worker iteration failed", "error", err)
+			}
+		}
+	}
 }
 
 func currencyMicros(amount float64) int64 {
