@@ -37,12 +37,14 @@ type Intent struct {
 	Error                   string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+	Candidate               Candidate
 }
 
 type IntentRepository interface {
 	Reserve(context.Context, Intent) (Intent, bool, error)
 	Update(context.Context, Intent, IntentStatus) (Intent, error)
 	CancelPending(context.Context, provider.CacheAnchor) (int, error)
+	ClaimDue(context.Context, time.Time, int) ([]Intent, error)
 }
 
 type Coordinator struct {
@@ -86,6 +88,7 @@ func (c *Coordinator) Run(ctx context.Context, candidate Candidate, protector pr
 		Anchor: candidate.Lease.Anchor, Status: IntentPlanned,
 		ExpectedNetSavingMicros: decision.ExpectedNetSavingMicros, ScheduledFor: decision.ScheduledFor,
 		CreatedAt: now, UpdatedAt: now,
+		Candidate: candidate,
 	}
 	reserved, created, err := c.repository.Reserve(ctx, intent)
 	if err != nil || !created {
@@ -97,11 +100,51 @@ func (c *Coordinator) Run(ctx context.Context, candidate Candidate, protector pr
 	if reserved.ScheduledFor.After(now) {
 		return reserved, nil
 	}
-	running, err := c.repository.Update(ctx, reserved, IntentRunning)
+	return c.execute(ctx, reserved, protector)
+}
+
+type ProtectorResolver func(provider.CacheAnchor) provider.CacheProtector
+
+func (c *Coordinator) RunDue(ctx context.Context, limit int, resolve ProtectorResolver) ([]Intent, error) {
+	if limit <= 0 || resolve == nil {
+		return nil, errors.New("positive worker limit and protector resolver are required")
+	}
+	claimed, err := c.repository.ClaimDue(ctx, c.now().UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]Intent, 0, len(claimed))
+	for _, intent := range claimed {
+		protector := resolve(intent.Anchor)
+		if protector == nil {
+			intent.Error = "cache protector disabled by current route configuration"
+			updated, updateErr := c.repository.Update(ctx, intent, IntentRejected)
+			if updateErr != nil {
+				return results, updateErr
+			}
+			results = append(results, updated)
+			continue
+		}
+		updated, executeErr := c.executeClaimed(ctx, intent, protector)
+		results = append(results, updated)
+		if executeErr != nil {
+			// The terminal uncertain/rejected intent is durable. Continue other independent work.
+			continue
+		}
+	}
+	return results, nil
+}
+
+func (c *Coordinator) execute(ctx context.Context, intent Intent, protector provider.CacheProtector) (Intent, error) {
+	running, err := c.repository.Update(ctx, intent, IntentRunning)
 	if err != nil {
 		return Intent{}, err
 	}
-	result, refreshErr := protector.Refresh(ctx, candidate.Lease.Anchor)
+	return c.executeClaimed(ctx, running, protector)
+}
+
+func (c *Coordinator) executeClaimed(ctx context.Context, running Intent, protector provider.CacheProtector) (Intent, error) {
+	result, refreshErr := protector.Refresh(ctx, running.Anchor)
 	running.ProviderResult = result
 	if refreshErr != nil {
 		running.Error = refreshErr.Error()
@@ -173,6 +216,25 @@ func (r *MemoryIntentRepository) CancelPending(_ context.Context, anchor provide
 		}
 	}
 	return cancelled, nil
+}
+
+func (r *MemoryIntentRepository) ClaimDue(_ context.Context, now time.Time, limit int) ([]Intent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claimed := make([]Intent, 0, limit)
+	for id, intent := range r.intents {
+		if len(claimed) >= limit {
+			break
+		}
+		if intent.Status != IntentPlanned || intent.ScheduledFor.After(now) {
+			continue
+		}
+		intent.Status = IntentRunning
+		intent.UpdatedAt = now
+		r.intents[id] = intent
+		claimed = append(claimed, intent)
+	}
+	return claimed, nil
 }
 
 func newIntentID() string {

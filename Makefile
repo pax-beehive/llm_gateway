@@ -12,7 +12,7 @@ test-race:
 	GOCACHE=$(GOCACHE) go test -race ./...
 
 test-integration:
-	GOCACHE=$(GOCACHE) go test -tags=integration ./internal/store ./internal/configuration
+	GOCACHE=$(GOCACHE) go test -tags=integration ./internal/store ./internal/configuration ./internal/cacheprotection
 
 vet:
 	GOCACHE=$(GOCACHE) go vet ./...

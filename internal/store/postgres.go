@@ -21,6 +21,9 @@ var conversationMigration string
 //go:embed migrations/000003_versioned_configuration.sql
 var configurationMigration string
 
+//go:embed migrations/000004_cache_protection_runtime.sql
+var cacheProtectionMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -38,6 +41,9 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, configurationMigration); err != nil {
 		return fmt.Errorf("migrate configuration store: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, cacheProtectionMigration); err != nil {
+		return fmt.Errorf("migrate cache protection store: %w", err)
 	}
 	return nil
 }

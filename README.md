@@ -97,3 +97,5 @@ The core migration is embedded in the binary and runs only when `GATEWAY_MIGRATE
 Responses can continue a branch with `previous_response_id`, or use a mutable Conversation with `conversation`; these modes are intentionally mutually exclusive. Conversation create/get/delete and CAS item append are available under `/v1/conversations`. A Response transaction appends its new input while acquiring the Conversation, then appends terminal output and releases it during the same transaction that records final usage.
 
 Every successful execution records the normalized token counts, original provider usage payload, immutable price snapshot, calculated amount, observed cache-discount evidence, and transactional outbox events. Provider cache discounts are not labeled as Cache Protection savings unless separate Protected Hit evidence exists.
+
+Cache refresh intents are durable PostgreSQL work, not process-local timers. Due work is claimed with `FOR UPDATE SKIP LOCKED`; lease revision and fencing tokens are checked on every transition, successful refreshes advance both values, and ambiguous outcomes become terminal `uncertain` intents rather than automatic retries.
