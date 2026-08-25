@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/toddzheng/llm-gateway/internal/configuration"
@@ -149,6 +152,67 @@ func TestRoutesFromJSONAcceptsFirstReleaseProviders(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildProviderComponentsWiresProductionDialect(t *testing.T) {
+	t.Setenv("PROVIDER_DIALECT_TEST_KEY", "fake-key")
+	tests := []struct {
+		provider       string
+		maxTokensField string
+		googleHeader   string
+	}{
+		{provider: "openai", maxTokensField: "max_completion_tokens"},
+		{provider: "deepseek", maxTokensField: "max_tokens"},
+		{provider: "gemini", maxTokensField: "max_completion_tokens", googleHeader: "llm-gateway/0.1.0"},
+	}
+	for _, test := range tests {
+		t.Run(test.provider, func(t *testing.T) {
+			var body map[string]any
+			client := &http.Client{Transport: mainRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if got := request.Header.Get("Authorization"); got != "Bearer fake-key" {
+					t.Errorf("Authorization = %q", got)
+				}
+				if got := request.Header.Get("x-goog-api-client"); got != test.googleHeader {
+					t.Errorf("x-goog-api-client = %q", got)
+				}
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n")), Request: request,
+				}, nil
+			})}
+			executor, _, _, err := buildProviderComponentsWithHTTPClient(routeConfig{
+				Provider: test.provider, ProviderModel: "test-model", BaseURL: "https://provider.test/v1",
+				APIKeyEnv: "PROVIDER_DIALECT_TEST_KEY",
+			}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			maxTokens := 8
+			stream, err := executor.Execute(context.Background(), core.Request{
+				Input:           []core.Item{{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}}}},
+				MaxOutputTokens: &maxTokens,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = stream.Close()
+			if body[test.maxTokensField] != float64(8) {
+				t.Fatalf("%s payload = %#v", test.provider, body)
+			}
+			if test.provider == "deepseek" && !strings.Contains(fmt.Sprint(body["thinking"]), "disabled") {
+				t.Fatalf("DeepSeek thinking = %#v", body["thinking"])
+			}
+		})
+	}
+}
+
+type mainRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f mainRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 func TestRoutesFromJSONRejectsSplitAnthropicCacheTransport(t *testing.T) {

@@ -380,6 +380,10 @@ func firstReleaseProvider(name string) bool {
 }
 
 func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
+	return buildProviderComponentsWithHTTPClient(config, nil)
+}
+
+func buildProviderComponentsWithHTTPClient(config routeConfig, httpClient *http.Client) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
 	if config.Provider == "anthropic" {
 		var ttl time.Duration
 		var apiVersion string
@@ -411,6 +415,7 @@ func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, pro
 		adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
 			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), APIVersion: apiVersion,
 			TTL: ttl, Model: config.ProviderModel, RouteID: config.ID,
+			HTTPClient:      httpClient,
 			CredentialScope: config.CredentialScope, Region: config.Region,
 			CacheWritePerMillionMicros: writeCostMicros,
 			EnablePromptCaching:        config.CacheRefresh != nil,
@@ -429,7 +434,7 @@ func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, pro
 
 	executor, err := openaicompat.New(openaicompat.Config{
 		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
-		Headers: config.Headers,
+		Dialect: openaicompat.Dialect(config.Provider), HTTPClient: httpClient, Headers: config.Headers,
 	})
 	if err != nil {
 		return nil, nil, nil, err

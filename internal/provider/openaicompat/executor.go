@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,14 +25,24 @@ type Config struct {
 	BaseURL    string
 	APIKey     string
 	Model      string
+	Dialect    Dialect
 	HTTPClient *http.Client
 	Headers    map[string]string
 }
+
+type Dialect string
+
+const (
+	DialectOpenAI   Dialect = "openai"
+	DialectDeepSeek Dialect = "deepseek"
+	DialectGemini   Dialect = "gemini"
+)
 
 type Executor struct {
 	endpoint   string
 	apiKey     string
 	model      string
+	dialect    Dialect
 	httpClient *http.Client
 	headers    map[string]string
 }
@@ -44,13 +56,21 @@ func New(config Config) (*Executor, error) {
 	if config.Model == "" {
 		return nil, errors.New("provider model is required")
 	}
+	if config.Dialect == "" {
+		config.Dialect = DialectOpenAI
+	}
+	switch config.Dialect {
+	case DialectOpenAI, DialectDeepSeek, DialectGemini:
+	default:
+		return nil, fmt.Errorf("unsupported OpenAI-compatible provider dialect %q", config.Dialect)
+	}
 	client := config.HTTPClient
 	if client == nil {
 		client = &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}
 	}
 	return &Executor{
 		endpoint: baseURL.String(), apiKey: config.APIKey, model: config.Model,
-		httpClient: client, headers: cloneHeaders(config.Headers),
+		dialect: config.Dialect, httpClient: client, headers: cloneHeaders(config.Headers),
 	}, nil
 }
 
@@ -60,6 +80,11 @@ func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.
 		return nil, err
 	}
 	payload := map[string]any{"model": e.model, "messages": messages, "stream": true, "stream_options": map[string]bool{"include_usage": true}}
+	if e.dialect == DialectDeepSeek {
+		// The canonical adapter does not yet expose portable reasoning replay.
+		// Disable DeepSeek thinking so private reasoning_content is never silently discarded.
+		payload["thinking"] = map[string]string{"type": "disabled"}
+	}
 	if request.Temperature != nil {
 		payload["temperature"] = *request.Temperature
 	}
@@ -67,7 +92,7 @@ func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.
 		payload["top_p"] = *request.TopP
 	}
 	if request.MaxOutputTokens != nil {
-		payload["max_completion_tokens"] = *request.MaxOutputTokens
+		payload[e.maxTokensField()] = *request.MaxOutputTokens
 	}
 	if len(request.Stop) > 0 {
 		payload["stop"] = request.Stop
@@ -79,7 +104,7 @@ func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.
 		payload["tool_choice"] = request.ToolChoice
 	}
 	if request.EndUserID != "" {
-		payload["user"] = request.EndUserID
+		payload[e.userField()] = e.endUserValue(request.TenantID, request.EndUserID)
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -94,6 +119,9 @@ func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.
 	if e.apiKey != "" {
 		httpRequest.Header.Set("Authorization", "Bearer "+e.apiKey)
 	}
+	if e.dialect == DialectGemini {
+		httpRequest.Header.Set("x-goog-api-client", "llm-gateway/0.1.0")
+	}
 	for key, value := range e.headers {
 		httpRequest.Header.Set(key, value)
 	}
@@ -107,7 +135,33 @@ func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.
 		errorBody, _ := io.ReadAll(io.LimitReader(httpResponse.Body, 64<<10))
 		return nil, fmt.Errorf("provider status %d after %s: %s", httpResponse.StatusCode, time.Since(started).Round(time.Millisecond), strings.TrimSpace(string(errorBody)))
 	}
-	return newSSEStream(httpResponse.Body), nil
+	return newSSEStream(httpResponse.Body, e.dialect), nil
+}
+
+func (e *Executor) maxTokensField() string {
+	if e.dialect == DialectDeepSeek {
+		return "max_tokens"
+	}
+	return "max_completion_tokens"
+}
+
+func (e *Executor) userField() string {
+	if e.dialect == DialectDeepSeek {
+		return "user_id"
+	}
+	return "user"
+}
+
+func (e *Executor) endUserValue(tenantID, value string) string {
+	if e.dialect != DialectDeepSeek {
+		return value
+	}
+	if tenantID == "" {
+		tenantID = "anonymous"
+	}
+	digest := hmac.New(sha256.New, []byte(tenantID))
+	_, _ = digest.Write([]byte(value))
+	return fmt.Sprintf("gw_%x", digest.Sum(nil))
 }
 
 func messagesFromItems(items []core.Item) ([]map[string]any, error) {
@@ -159,11 +213,15 @@ func openAIContent(parts []core.Content) (any, error) {
 }
 
 type sseStream struct {
-	body      io.ReadCloser
-	scanner   *bufio.Scanner
-	done      bool
-	pending   []core.Event
-	toolCalls map[int]*toolCall
+	body              io.ReadCloser
+	scanner           *bufio.Scanner
+	dialect           Dialect
+	done              bool
+	completionEmitted bool
+	lastUsage         *core.Usage
+	lastProviderUsage json.RawMessage
+	pending           []core.Event
+	toolCalls         map[int]*toolCall
 }
 
 type toolCall struct {
@@ -172,10 +230,10 @@ type toolCall struct {
 	Arguments strings.Builder
 }
 
-func newSSEStream(body io.ReadCloser) *sseStream {
+func newSSEStream(body io.ReadCloser, dialect Dialect) *sseStream {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	return &sseStream{body: body, scanner: scanner, toolCalls: make(map[int]*toolCall)}
+	return &sseStream{body: body, scanner: scanner, dialect: dialect, toolCalls: make(map[int]*toolCall)}
 }
 
 func (s *sseStream) Recv() (core.Event, error) {
@@ -199,13 +257,21 @@ func (s *sseStream) Recv() (core.Event, error) {
 		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
 			s.done = true
+			if !s.completionEmitted {
+				s.completionEmitted = true
+				return core.Event{
+					Type: "response.completed", Usage: cloneUsage(s.lastUsage),
+					ProviderUsage: append(json.RawMessage(nil), s.lastProviderUsage...),
+				}, nil
+			}
 			return core.Event{}, io.EOF
 		}
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Function struct {
@@ -223,6 +289,7 @@ func (s *sseStream) Recv() (core.Event, error) {
 				PromptTokenDetails struct {
 					CachedTokens int64 `json:"cached_tokens"`
 				} `json:"prompt_tokens_details"`
+				PromptCacheHitTokens int64 `json:"prompt_cache_hit_tokens"`
 			} `json:"usage"`
 			Error *struct {
 				Code    string `json:"code"`
@@ -236,15 +303,12 @@ func (s *sseStream) Recv() (core.Event, error) {
 		if chunk.Error != nil {
 			return core.Event{}, fmt.Errorf("provider stream error %s: %s", chunk.Error.Code, chunk.Error.Message)
 		}
-		if chunk.Usage != nil {
-			usage := core.Usage{
-				InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens,
-				TotalTokens: chunk.Usage.TotalTokens, CachedInputTokens: chunk.Usage.PromptTokenDetails.CachedTokens,
-			}
-			return core.Event{Type: "response.completed", Usage: &usage, ProviderUsage: append(json.RawMessage(nil), []byte(data)...)}, nil
-		}
+		var events []core.Event
 		if len(chunk.Choices) > 0 {
 			choice := chunk.Choices[0]
+			if choice.Delta.ReasoningContent != "" && s.dialect == DialectDeepSeek {
+				return core.Event{}, errors.New("DeepSeek returned reasoning_content while thinking was disabled")
+			}
 			for _, delta := range choice.Delta.ToolCalls {
 				call := s.toolCalls[delta.Index]
 				if call == nil {
@@ -275,18 +339,43 @@ func (s *sseStream) Recv() (core.Event, error) {
 						return core.Event{}, errors.New("provider returned invalid function-call arguments")
 					}
 					item := core.Item{Type: "function_call", CallID: call.ID, Name: call.Name, Arguments: arguments}
-					s.pending = append(s.pending, core.Event{Type: "response.output_item.done", Item: &item})
+					events = append(events, core.Event{Type: "response.output_item.done", Item: &item})
 				}
 				s.toolCalls = make(map[int]*toolCall)
-				if len(s.pending) > 0 {
-					event := s.pending[0]
-					s.pending = s.pending[1:]
-					return event, nil
-				}
 			}
 			if choice.Delta.Content != "" {
-				return core.Event{Type: "response.output_text.delta", Delta: choice.Delta.Content}, nil
+				events = append([]core.Event{{Type: "response.output_text.delta", Delta: choice.Delta.Content}}, events...)
 			}
+		}
+		if chunk.Usage != nil {
+			cachedInputTokens := chunk.Usage.PromptTokenDetails.CachedTokens
+			if s.dialect == DialectDeepSeek {
+				cachedInputTokens = chunk.Usage.PromptCacheHitTokens
+			}
+			usage := core.Usage{
+				InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens,
+				TotalTokens: chunk.Usage.TotalTokens, CachedInputTokens: cachedInputTokens,
+			}
+			s.lastUsage = &usage
+			s.lastProviderUsage = append(s.lastProviderUsage[:0], []byte(data)...)
+			terminal := len(chunk.Choices) == 0
+			for _, choice := range chunk.Choices {
+				if choice.FinishReason != nil {
+					terminal = true
+					break
+				}
+			}
+			if terminal {
+				s.completionEmitted = true
+				events = append(events, core.Event{
+					Type: "response.completed", Usage: cloneUsage(s.lastUsage),
+					ProviderUsage: append(json.RawMessage(nil), s.lastProviderUsage...),
+				})
+			}
+		}
+		if len(events) > 0 {
+			s.pending = append(s.pending, events[1:]...)
+			return events[0], nil
 		}
 	}
 	s.done = true
@@ -294,6 +383,14 @@ func (s *sseStream) Recv() (core.Event, error) {
 		return core.Event{}, fmt.Errorf("read provider SSE: %w", err)
 	}
 	return core.Event{}, io.EOF
+}
+
+func cloneUsage(usage *core.Usage) *core.Usage {
+	if usage == nil {
+		return nil
+	}
+	cloned := *usage
+	return &cloned
 }
 
 func (s *sseStream) Close() error {

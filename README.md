@@ -128,7 +128,28 @@ Tenant policies bound concurrent Responses and input-item counts, set an explici
 make test
 make test-race
 make vet
+make build
+make test-integration-local
 ```
+
+`make test-integration` requires `TEST_DATABASE_URL` and fails when it is absent, so PostgreSQL coverage cannot silently pass by skipping every integration test. `make test-integration-local` starts the Compose PostgreSQL service and supplies its development-only connection string. CI runs the same unit, race, vet, build, and PostgreSQL gates.
+
+Provider adapters have offline conformance tests that use fake credentials and local HTTP transports; they do not call Provider APIs or incur model charges:
+
+| Provider | Execution surface | Offline contract covered | Proactive refresh |
+| --- | --- | --- | --- |
+| OpenAI | Chat Completions | bearer auth, request fields, SSE text/tools/usage | off |
+| DeepSeek | OpenAI-compatible Chat Completions | `max_tokens`, `user_id`, SSE text/tools/usage | off |
+| Anthropic | native Messages | `x-api-key`, API version, request fields, SSE text/usage, no cache breakpoint while disabled | off by default |
+| Gemini | OpenAI-compatible Chat Completions | bearer auth, client identification, request fields, SSE text/tools/usage | off |
+
+Real Provider verification is isolated behind the `live` build tag. Fill the eight empty key/model variables in the ignored local `.env`, then explicitly run:
+
+```sh
+make test-live-providers
+```
+
+This target sends one small streaming request to each Provider. Missing variables are a hard failure rather than a skip. `.env.example` documents the required names; `.env` is ignored by Git and must never be committed.
 
 The core migration is embedded in the binary and runs only when `GATEWAY_MIGRATE=true`. Production schema rollout should normally happen as a separate deployment gate.
 

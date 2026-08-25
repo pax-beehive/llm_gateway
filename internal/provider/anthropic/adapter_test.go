@@ -105,9 +105,70 @@ func TestAdapterDoesNotInventCacheLeaseWithoutProviderUsageEvidence(t *testing.T
 	}
 }
 
+func TestAdapterExecutesOfficialMessagesProtocolWithCachingDisabled(t *testing.T) {
+	t.Parallel()
+
+	client := &http.Client{Transport: anthropicRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/v1/messages" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		if got := request.Header.Get("x-api-key"); got != "fake-key" {
+			t.Fatalf("x-api-key = %q", got)
+		}
+		if got := request.Header.Get("anthropic-version"); got != "2023-06-01" {
+			t.Fatalf("anthropic-version = %q", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["model"] != "claude-test" || body["stream"] != true || body["max_tokens"] != float64(16) {
+			t.Fatalf("payload = %#v", body)
+		}
+		encoded, _ := json.Marshal(body)
+		if strings.Contains(string(encoded), "cache_control") {
+			t.Fatalf("refresh-disabled route emitted cache_control: %s", encoded)
+		}
+		stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream)), Request: request}, nil
+	})}
+	adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
+		BaseURL: "https://api.anthropic.test/v1", APIKey: "fake-key", APIVersion: "2023-06-01",
+		Model: "claude-test", RouteID: "anthropic-test", CredentialScope: "test", Region: "test",
+		EnablePromptCaching: false, HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxTokens := 16
+	stream, err := adapter.Execute(context.Background(), core.Request{
+		Input:           []core.Item{{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}}}},
+		MaxOutputTokens: &maxTokens,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if event, err := stream.Recv(); err != nil || event.Delta != "ok" {
+		t.Fatalf("delta = %#v, err = %v", event, err)
+	}
+	if event, err := stream.Recv(); err != nil || event.Usage == nil || event.Usage.TotalTokens != 4 {
+		t.Fatalf("usage = %#v, err = %v", event, err)
+	}
+}
+
 type anthropicTransport struct {
 	mu       sync.Mutex
 	requests [][]byte
+}
+
+type anthropicRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f anthropicRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 func (t *anthropicTransport) RoundTrip(request *http.Request) (*http.Response, error) {
