@@ -67,7 +67,11 @@ func New(config Config) (*Executor, error) {
 	client := config.HTTPClient
 	if client == nil {
 		client = &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}
+	} else {
+		clientCopy := *client
+		client = &clientCopy
 	}
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	return &Executor{
 		endpoint: baseURL.String(), apiKey: config.APIKey, model: config.Model,
 		dialect: config.Dialect, httpClient: client, headers: cloneHeaders(config.Headers),

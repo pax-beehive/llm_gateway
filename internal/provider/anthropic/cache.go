@@ -47,7 +47,11 @@ func NewCacheProtector(config CacheConfig) (*CacheProtector, error) {
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = &http.Client{Timeout: 60 * time.Second, Transport: otelhttp.NewTransport(http.DefaultTransport)}
+	} else {
+		clientCopy := *config.HTTPClient
+		config.HTTPClient = &clientCopy
 	}
+	config.HTTPClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	if config.TTL == 0 {
 		config.TTL = 5 * time.Minute
 	}

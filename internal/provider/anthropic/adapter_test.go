@@ -3,6 +3,7 @@ package anthropic_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -157,6 +158,115 @@ func TestAdapterExecutesOfficialMessagesProtocolWithCachingDisabled(t *testing.T
 	}
 	if event, err := stream.Recv(); err != nil || event.Usage == nil || event.Usage.TotalTokens != 4 {
 		t.Fatalf("usage = %#v, err = %v", event, err)
+	}
+}
+
+func TestAdapterSerializesTypedImageInput(t *testing.T) {
+	t.Parallel()
+
+	client := &http.Client{Transport: anthropicRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		encoded, _ := json.Marshal(body["messages"])
+		for _, expected := range []string{`"type":"image"`, `"type":"url"`, `"url":"https://example.test/image.png"`} {
+			if !strings.Contains(string(encoded), expected) {
+				t.Fatalf("messages missing %s: %s", expected, encoded)
+			}
+		}
+		stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream)), Request: request}, nil
+	})}
+	adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
+		BaseURL: "https://api.anthropic.test/v1", APIKey: "secret", Model: "claude-test",
+		RouteID: "anthropic-test", CredentialScope: "test", Region: "test", HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := adapter.Execute(context.Background(), core.Request{Input: []core.Item{{
+		Type: "message", Role: "user", Content: []core.Content{
+			{Type: "input_text", Text: "describe"},
+			{Type: "input_image", ImageURL: "https://example.test/image.png"},
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if event, err := stream.Recv(); err != nil || event.Usage == nil || event.Usage.TotalTokens != 4 {
+		t.Fatalf("completion = %#v, err = %v", event, err)
+	}
+}
+
+func TestAdapterRejectsRedirectsWithoutFollowingProviderCredentials(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	client := &http.Client{Transport: anthropicRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.URL.Host == "attacker.test" {
+			t.Fatalf("Anthropic request followed a cross-origin redirect: %#v", request.Header)
+		}
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"https://attacker.test/messages"}},
+			Body:       io.NopCloser(strings.NewReader("redirect")),
+			Request:    request,
+		}, nil
+	})}
+	adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
+		BaseURL: "https://api.anthropic.test/v1", APIKey: "secret", Model: "claude-test",
+		RouteID: "anthropic-test", CredentialScope: "test", Region: "test", HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = adapter.Execute(context.Background(), core.Request{Input: []core.Item{{
+		Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "status 302") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("HTTP calls = %d, want 1", calls)
+	}
+}
+
+func TestAdapterReturnsProviderFailuresWithoutRetrying(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusNotFound} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			client := &http.Client{Transport: anthropicRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{
+					StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"error":"conformance"}`)), Request: request,
+				}, nil
+			})}
+			adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
+				BaseURL: "https://api.anthropic.test/v1", APIKey: "secret", Model: "claude-test",
+				RouteID: "anthropic-test", CredentialScope: "test", Region: "test", HTTPClient: client,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = adapter.Execute(context.Background(), core.Request{Input: []core.Item{{
+				Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}},
+			}}})
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("status %d", status)) {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("HTTP calls = %d, want no adapter retry", calls)
+			}
+		})
 	}
 }
 

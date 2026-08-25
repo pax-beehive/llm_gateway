@@ -65,6 +65,42 @@ func TestVisibleProviderFailureIsPersistedWithoutFallback(t *testing.T) {
 	}
 }
 
+func TestProviderFailureBeforeVisibleOutputFallsBack(t *testing.T) {
+	t.Parallel()
+
+	var fallbackCalls atomic.Int64
+	first := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{{err: errors.New("provider unavailable before output")}}}, nil
+	})
+	usage := core.Usage{InputTokens: 2, OutputTokens: 1, TotalTokens: 3}
+	second := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		fallbackCalls.Add(1)
+		return &scriptedStream{steps: []streamStep{
+			{event: core.Event{Type: "response.output_text.delta", Delta: "recovered"}},
+			{event: core.Event{Type: "response.completed", Usage: &usage}},
+		}}, nil
+	})
+	responseStore := store.NewMemoryResponseStore()
+	secondRoute := testRoute("second", second)
+	secondRoute.PriceSnapshot = core.PriceSnapshot{
+		ID: "second-price", Provider: "second", Model: "provider-model", Region: "local",
+		Currency: "USD", EffectiveAt: 1, Source: "test",
+	}
+	engine := gatewayruntime.New(responseStore, provider.NewRouter(testRoute("first", first), secondRoute))
+	response, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallbackCalls.Load() != 1 || response.Status != core.ResponseStatusCompleted || response.OutputText() != "recovered" {
+		t.Fatalf("fallback calls/response = %d / %#v", fallbackCalls.Load(), response)
+	}
+	if len(response.Attempts) != 2 || response.Attempts[0].Error == nil || response.Attempts[1].Error != nil {
+		t.Fatalf("attempts = %#v", response.Attempts)
+	}
+}
+
 func TestVisibleProviderEOFWithoutTerminalUsageIsFailure(t *testing.T) {
 	t.Parallel()
 	executor := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
@@ -133,6 +169,47 @@ func TestProviderIdleTimeoutEmitsKeepaliveAndPersistsFailure(t *testing.T) {
 	}
 	if keepalives.Load() == 0 {
 		t.Fatal("keepalive count = 0, want at least one before idle timeout")
+	}
+}
+
+func TestClientCancellationClosesProviderStreamAndPersistsCancellation(t *testing.T) {
+	t.Parallel()
+
+	stream := newSignalledBlockingStream()
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(testRoute("cancel", executorFunc(
+		func(context.Context, core.Request) (provider.EventStream, error) { return stream, nil },
+	))), gatewayruntime.Options{ProviderIdleTimeout: time.Second})
+	type result struct {
+		response core.Response
+		err      error
+	}
+	finished := make(chan result, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		response, err := engine.Execute(ctx, core.Request{
+			TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		})
+		finished <- result{response: response, err: err}
+	}()
+	select {
+	case <-stream.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider stream did not start")
+	}
+	cancel()
+	var completed result
+	select {
+	case completed = <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("provider execution did not stop after cancellation")
+	}
+	if !errors.Is(completed.err, context.Canceled) || completed.response.Status != core.ResponseStatusCancelled {
+		t.Fatalf("response/error = %#v / %v, want persisted cancellation", completed.response, completed.err)
+	}
+	persisted, err := engine.Get(context.Background(), "tenant-a", completed.response.ID)
+	if err != nil || persisted.Status != core.ResponseStatusCancelled {
+		t.Fatalf("persisted response/error = %#v / %v", persisted, err)
 	}
 }
 

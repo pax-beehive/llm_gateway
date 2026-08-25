@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-live-providers integration-up integration-down vet run-dev compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-live-providers test-live-provider-tools integration-up integration-down vet run-dev compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -26,7 +26,13 @@ test-integration-local: integration-up
 
 test-live-providers:
 	@test -f .env || { echo ".env is required; copy .env.example and fill the four provider keys" >&2; exit 1; }
-	@set -a; . ./.env; set +a; GOCACHE=$(GOCACHE) go test -tags=live ./internal/provider/live -count=1
+	@set -a; . ./.env; set +a; GATEWAY_LIVE_TOOL_CONFORMANCE=false GOCACHE=$(GOCACHE) \
+		go test -tags=live ./internal/provider/live -run '^TestLiveProviderTextStreaming$$' -count=1
+
+test-live-provider-tools:
+	@test -f .env || { echo ".env is required; copy .env.example and fill the four provider keys" >&2; exit 1; }
+	@set -a; . ./.env; set +a; GATEWAY_LIVE_TOOL_CONFORMANCE=true GOCACHE=$(GOCACHE) \
+		go test -v -tags=live ./internal/provider/live -run '^TestLiveProviderToolCalling$$' -count=1
 
 integration-down:
 	docker compose stop postgres

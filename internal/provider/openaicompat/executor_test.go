@@ -5,11 +5,13 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
@@ -283,6 +285,116 @@ func TestExecutorRejectsUnknownDialect(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "dialect") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExecutorRejectsRedirectsWithoutFollowingProviderCredentials(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.URL.Host == "attacker.test" {
+			t.Fatalf("provider request followed a cross-origin redirect: %#v", request.Header)
+		}
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"https://attacker.test/chat/completions"}},
+			Body:       io.NopCloser(strings.NewReader("redirect")),
+			Request:    request,
+		}, nil
+	})}
+	executor, err := openaicompat.New(openaicompat.Config{
+		BaseURL: "https://provider.test/v1", APIKey: "secret", Model: "test-model", HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executor.Execute(context.Background(), core.Request{Input: []core.Item{{
+		Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}},
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "status 302") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("HTTP calls = %d, want 1", calls)
+	}
+}
+
+func TestExecutorReturnsProviderFailuresWithoutRetrying(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusNotFound} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{
+					StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"error":"conformance"}`)), Request: request,
+				}, nil
+			})}
+			executor, err := openaicompat.New(openaicompat.Config{
+				BaseURL: "https://provider.test/v1", APIKey: "secret", Model: "test-model", HTTPClient: client,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executor.Execute(context.Background(), core.Request{Input: []core.Item{{
+				Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}},
+			}}})
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("status %d", status)) {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("HTTP calls = %d, want no adapter retry", calls)
+			}
+		})
+	}
+}
+
+func TestExecutorPropagatesRequestCancellationWithoutRetrying(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	entered := make(chan struct{})
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		close(entered)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}
+	executor, err := openaicompat.New(openaicompat.Config{
+		BaseURL: "https://provider.test/v1", APIKey: "secret", Model: "test-model", HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		_, executeErr := executor.Execute(ctx, core.Request{Input: []core.Item{{
+			Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "hello"}},
+		}}})
+		finished <- executeErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider transport was not entered")
+	}
+	cancel()
+	select {
+	case err = <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("provider request did not observe cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Execute() error = %v, want context cancellation", err)
+	}
+	if calls != 1 {
+		t.Fatalf("HTTP calls = %d, want no adapter retry", calls)
 	}
 }
 

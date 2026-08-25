@@ -160,6 +160,14 @@ make test-live-providers
 
 This target first calls each Provider's authenticated model-list endpoint, selects a conservative low-cost text model, and sends one small streaming request. Missing keys, discovery failures, or the absence of a safe smoke model are hard failures rather than skips. `.env.example` documents the required names; `.env` is ignored by Git and must never be committed. Production requests choose a public model per request; model selection is not a process-level environment setting.
 
+Deeper live function-call conformance is separately budget-gated. It discovers the same conservative models and sends exactly one forced, side-effect-free `ping` tool request per Provider, with a 64-token output cap:
+
+```sh
+make test-live-provider-tools
+```
+
+Ordinary live smoke does not run these four additional paid requests. Provider status failures, deadlines, redirects, disconnects, and cancellation are covered offline rather than manufactured against paid APIs.
+
 The core migration is embedded in the binary and runs only when `GATEWAY_MIGRATE=true`. Production schema rollout should normally happen as a separate deployment gate.
 
 ## Stateful operations
