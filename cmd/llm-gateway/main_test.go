@@ -2,12 +2,26 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
+	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
 )
+
+func TestCacheProtectionModeDefaultsOff(t *testing.T) {
+	t.Setenv("GATEWAY_CACHE_PROTECTION_MODE", "")
+	mode, err := cacheProtectionModeFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != "off" {
+		t.Fatalf("mode = %q, want off", mode)
+	}
+}
 
 func TestRoutesFromJSONUsesOneAnthropicAdapterForExecutionAndCacheLifecycle(t *testing.T) {
 	t.Setenv("ANTHROPIC_TEST_KEY", "test-key")
@@ -38,7 +52,7 @@ func TestRoutesFromJSONUsesOneAnthropicAdapterForExecutionAndCacheLifecycle(t *t
 
 func TestRoutesFromJSONCanDrainAnUnhealthyRoute(t *testing.T) {
 	payload := []byte(`[{
-		"id":"draining","provider":"compatible","public_model":"gateway-model",
+		"id":"draining","provider":"openai","public_model":"gateway-model",
 		"provider_model":"provider-model","base_url":"https://provider.test/v1",
 		"region":"local","home_region":"local","healthy":false,
 		"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
@@ -60,6 +74,83 @@ func TestRoutesFromJSONCanDrainAnUnhealthyRoute(t *testing.T) {
 	}
 }
 
+func TestRoutesFromJSONRejectsProviderOutsideFirstReleaseScope(t *testing.T) {
+	payload := []byte(`[{
+		"id":"other-provider","provider":"other","public_model":"gateway-model",
+		"provider_model":"provider-model","base_url":"https://provider.test/v1",
+		"region":"local","home_region":"local","healthy":true,
+		"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
+		"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
+	}]`)
+	if _, err := routesFromJSON(payload); err == nil {
+		t.Fatal("expected Provider outside the first-release scope to be rejected")
+	}
+}
+
+func TestPublishRoutesRejectsUnsupportedProviderBeforeDurablePublication(t *testing.T) {
+	repository := &recordingConfigurationRepository{}
+	payload := json.RawMessage(`[{
+		"id":"other-provider","provider":"other","public_model":"gateway-model",
+		"provider_model":"provider-model","base_url":"https://provider.test/v1",
+		"region":"local","home_region":"local","healthy":true,
+		"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
+		"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
+	}]`)
+	if _, _, err := publishRoutes(context.Background(), repository, 0, 1, payload, "operator"); err == nil {
+		t.Fatal("expected invalid Provider publication to fail")
+	}
+	if repository.publishCalls != 0 {
+		t.Fatalf("publication calls = %d, want 0 before route validation", repository.publishCalls)
+	}
+}
+
+func TestCacheWorkerResolverRequiresCurrentTenantPermission(t *testing.T) {
+	protector := cacheProtectorStub{}
+	anchor := provider.CacheAnchor{
+		TenantID: "tenant-a", RouteID: "anthropic-route", Provider: "anthropic",
+		Region: "local", CredentialScope: "tenant-primary",
+	}
+	router := provider.NewRouter(provider.Route{
+		ID: anchor.RouteID, Provider: anchor.Provider, Region: anchor.Region,
+		CredentialScope: anchor.CredentialScope, CacheProtector: protector,
+	})
+	if got := resolveCacheProtectorForTenant(router, nil, anchor); got != nil {
+		t.Fatal("Cache Protector resolved without explicit Tenant permission")
+	}
+	allowCache := true
+	policies := map[string]core.TenantPolicy{"tenant-a": {AllowCacheProtection: &allowCache}}
+	if got := resolveCacheProtectorForTenant(router, policies, anchor); got == nil {
+		t.Fatal("Cache Protector was not resolved for an explicitly permitted Tenant")
+	}
+	allowCache = false
+	if got := resolveCacheProtectorForTenant(router, policies, anchor); got != nil {
+		t.Fatal("Cache Protector resolved after Tenant permission was revoked")
+	}
+}
+
+func TestRoutesFromJSONAcceptsFirstReleaseProviders(t *testing.T) {
+	t.Setenv("PROVIDER_TEST_KEY", "test-key")
+	for _, providerName := range []string{"openai", "deepseek", "anthropic", "gemini"} {
+		t.Run(providerName, func(t *testing.T) {
+			payload := []byte(fmt.Sprintf(`[{
+				"id":"%[1]s-route","provider":"%[1]s","public_model":"gateway-model",
+				"provider_model":"provider-model","base_url":"https://%[1]s.test/v1",
+				"api_key_env":"PROVIDER_TEST_KEY","region":"local","home_region":"local",
+				"credential_scope":"tenant-primary","healthy":true,
+				"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
+				"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
+			}]`, providerName))
+			routes, err := routesFromJSON(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(routes) != 1 || routes[0].Provider != providerName || routes[0].Executor == nil {
+				t.Fatalf("routes = %#v, want configured %s route", routes, providerName)
+			}
+		})
+	}
+}
+
 func TestRoutesFromJSONRejectsSplitAnthropicCacheTransport(t *testing.T) {
 	t.Setenv("ANTHROPIC_TEST_KEY", "test-key")
 	payload := []byte(`[{
@@ -73,4 +164,27 @@ func TestRoutesFromJSONRejectsSplitAnthropicCacheTransport(t *testing.T) {
 	if _, err := routesFromJSON(payload); err == nil {
 		t.Fatal("expected split Anthropic cache transport to be rejected")
 	}
+}
+
+type recordingConfigurationRepository struct {
+	publishCalls int
+}
+
+type cacheProtectorStub struct{}
+
+func (cacheProtectorStub) Inspect(context.Context, provider.CacheAnchor) provider.CacheCapability {
+	return provider.CacheCapability{Supported: true}
+}
+
+func (cacheProtectorStub) Refresh(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
+	return provider.RefreshResult{Status: "succeeded"}, nil
+}
+
+func (r *recordingConfigurationRepository) Current(context.Context, string) (configuration.Snapshot, error) {
+	return configuration.Snapshot{}, configuration.ErrNotFound
+}
+
+func (r *recordingConfigurationRepository) Publish(_ context.Context, kind string, _ int64, revision int64, payload json.RawMessage, actor string) (configuration.Snapshot, error) {
+	r.publishCalls++
+	return configuration.Snapshot{Kind: kind, Revision: revision, Payload: payload, CreatedBy: actor}, nil
 }

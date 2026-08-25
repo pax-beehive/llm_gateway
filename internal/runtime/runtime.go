@@ -64,6 +64,7 @@ type Options struct {
 }
 
 const (
+	CacheProtectionOffMode             = "off"
 	CacheProtectionShadowMode          = "shadow"
 	CacheProtectionAnthropicCanaryMode = "anthropic-one-refresh-canary"
 )
@@ -71,6 +72,8 @@ const (
 var ErrProviderIdleTimeout = errors.New("provider stream idle timeout")
 
 var ErrQuotaExceeded = store.ErrQuotaExceeded
+
+var ErrCacheProtectionNotAllowed = errors.New("Cache Protection not allowed")
 
 func New(responseStore store.ResponseStore, router provider.Router) *Runtime {
 	return NewWithOptions(responseStore, router, Options{})
@@ -84,7 +87,7 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 		options.KeepaliveInterval = 15 * time.Second
 	}
 	if options.CacheProtectionMode == "" {
-		options.CacheProtectionMode = CacheProtectionShadowMode
+		options.CacheProtectionMode = CacheProtectionOffMode
 	}
 	if options.CacheHoldoutPercent < 0 || options.CacheHoldoutPercent > 100 {
 		options.CacheHoldoutPercent = 100
@@ -125,6 +128,11 @@ func (r *Runtime) ExecuteStreaming(ctx context.Context, request core.Request, em
 		return core.Response{}, errors.New("stream event emitter is required")
 	}
 	return r.execute(ctx, request, emit)
+}
+
+// ValidateRequestPolicy checks request-level policy gates that must be known before a transport commits headers.
+func (r *Runtime) ValidateRequestPolicy(request core.Request) error {
+	return r.validateCacheProtectionAccess(request)
 }
 
 func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(core.Event) error) (core.Response, error) {
@@ -439,21 +447,15 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 
 func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Context, func(), error) {
 	policy, configured := r.tenantPolicies[request.TenantID]
+	if err := r.validateCacheProtectionAccess(request); err != nil {
+		return nil, nil, err
+	}
 	if configured {
 		if policy.MaxInputItems > 0 && len(request.Input) > policy.MaxInputItems {
 			return nil, nil, fmt.Errorf("tenant input-item quota exceeded: maximum is %d", policy.MaxInputItems)
 		}
 		if request.Store && policy.AllowStoredResponses != nil && !*policy.AllowStoredResponses {
 			return nil, nil, errors.New("tenant policy forbids stored Responses")
-		}
-		if request.CacheProtection != nil && request.CacheProtection.Enabled {
-			if policy.AllowCacheProtection != nil && !*policy.AllowCacheProtection {
-				return nil, nil, errors.New("tenant policy forbids Cache Protection")
-			}
-			if request.CacheProtection.AllowContentInspection &&
-				(policy.AllowContentInspection == nil || !*policy.AllowContentInspection) {
-				return nil, nil, errors.New("tenant policy forbids Cache Protection content inspection")
-			}
 		}
 	}
 	if !configured || policy.MaxConcurrentResponses <= 0 {
@@ -510,6 +512,23 @@ func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Cont
 	}, nil
 }
 
+func (r *Runtime) validateCacheProtectionAccess(request core.Request) error {
+	policy, configured := r.tenantPolicies[request.TenantID]
+	if request.CacheProtection != nil && request.CacheProtection.Enabled {
+		if r.cacheProtectionMode == CacheProtectionOffMode {
+			return fmt.Errorf("%w: disabled by gateway policy", ErrCacheProtectionNotAllowed)
+		}
+		if !configured || policy.AllowCacheProtection == nil || !*policy.AllowCacheProtection {
+			return fmt.Errorf("%w: tenant policy does not allow Cache Protection", ErrCacheProtectionNotAllowed)
+		}
+		if request.CacheProtection.AllowContentInspection &&
+			(policy.AllowContentInspection == nil || !*policy.AllowContentInspection) {
+			return fmt.Errorf("%w: tenant policy forbids Cache Protection content inspection", ErrCacheProtectionNotAllowed)
+		}
+	}
+	return nil
+}
+
 func cloneTenantPolicies(policies map[string]core.TenantPolicy) map[string]core.TenantPolicy {
 	cloned := make(map[string]core.TenantPolicy, len(policies))
 	for tenantID, policy := range policies {
@@ -542,7 +561,7 @@ func perMillionCost(tokens, rate int64) int64 {
 }
 
 func (r *Runtime) observeCustomerRequest(ctx context.Context, request core.Request, route provider.Route) *core.ProtectedHitEvidence {
-	if r.cacheCoordinator == nil || route.CacheAnchorBuilder == nil {
+	if r.cacheProtectionMode == CacheProtectionOffMode || r.cacheCoordinator == nil || route.CacheAnchorBuilder == nil {
 		return nil
 	}
 	anchor, exists, err := route.CacheAnchorBuilder.CurrentCacheAnchor(ctx, request)

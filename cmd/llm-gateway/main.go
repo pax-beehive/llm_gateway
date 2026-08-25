@@ -144,9 +144,9 @@ func run() error {
 		intentRepository = cacheprotection.NewMemoryIntentRepository()
 	}
 	cacheCoordinator := cacheprotection.NewCoordinator(intentRepository, time.Now)
-	cacheProtectionMode := envOr("GATEWAY_CACHE_PROTECTION_MODE", runtime.CacheProtectionShadowMode)
-	if cacheProtectionMode != runtime.CacheProtectionShadowMode && cacheProtectionMode != runtime.CacheProtectionAnthropicCanaryMode {
-		return errors.New("GATEWAY_CACHE_PROTECTION_MODE must be shadow or anthropic-one-refresh-canary")
+	cacheProtectionMode, err := cacheProtectionModeFromEnv()
+	if err != nil {
+		return err
 	}
 	holdoutPercent, err := strconv.Atoi(envOr("GATEWAY_CACHE_PROTECTION_HOLDOUT_PERCENT", "10"))
 	if err != nil || holdoutPercent < 0 || holdoutPercent > 100 {
@@ -159,7 +159,9 @@ func run() error {
 		CacheProtectionMode: cacheProtectionMode, CacheHoldoutPercent: holdoutPercent,
 		TenantPolicies: tenantPolicies,
 	})
-	go runCacheWorker(ctx, cacheCoordinator, router)
+	if cacheProtectionMode != runtime.CacheProtectionOffMode {
+		go runCacheWorker(ctx, cacheCoordinator, router, tenantPolicies)
+	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
 	handler := httpapi.New(httpapi.Config{
 		Runtime: engine, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
@@ -186,6 +188,16 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
+	}
+}
+
+func cacheProtectionModeFromEnv() (string, error) {
+	mode := envOr("GATEWAY_CACHE_PROTECTION_MODE", runtime.CacheProtectionOffMode)
+	switch mode {
+	case runtime.CacheProtectionOffMode, runtime.CacheProtectionShadowMode, runtime.CacheProtectionAnthropicCanaryMode:
+		return mode, nil
+	default:
+		return "", errors.New("GATEWAY_CACHE_PROTECTION_MODE must be off, shadow, or anthropic-one-refresh-canary")
 	}
 }
 
@@ -238,6 +250,7 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 	}
 	repository := configuration.NewPostgresRepository(database)
 	snapshot, err := repository.Current(ctx, "model_routes")
+	var routes []provider.Route
 	if errors.Is(err, configuration.ErrNotFound) {
 		if os.Getenv("GATEWAY_BOOTSTRAP_ROUTES") != "true" {
 			return nil, errors.New("model_routes configuration is absent; publish it or explicitly set GATEWAY_BOOTSTRAP_ROUTES=true")
@@ -246,8 +259,8 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 		if parseErr != nil {
 			return nil, fmt.Errorf("GATEWAY_CONFIG_REVISION: %w", parseErr)
 		}
-		snapshot, err = repository.Publish(
-			ctx, "model_routes", 0, revision, json.RawMessage(os.Getenv("GATEWAY_ROUTES_JSON")), envOr("GATEWAY_CONFIG_ACTOR", "bootstrap"),
+		snapshot, routes, err = publishRoutes(
+			ctx, repository, 0, revision, json.RawMessage(os.Getenv("GATEWAY_ROUTES_JSON")), envOr("GATEWAY_CONFIG_ACTOR", "bootstrap"),
 		)
 	}
 	if err != nil {
@@ -259,16 +272,18 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 		if expectedErr != nil || revisionErr != nil {
 			return nil, errors.New("publishing routes requires numeric GATEWAY_CONFIG_EXPECTED_REVISION and GATEWAY_CONFIG_REVISION")
 		}
-		snapshot, err = repository.Publish(
-			ctx, "model_routes", expected, revision, json.RawMessage(os.Getenv("GATEWAY_ROUTES_JSON")), envOr("GATEWAY_CONFIG_ACTOR", "operator"),
+		snapshot, routes, err = publishRoutes(
+			ctx, repository, expected, revision, json.RawMessage(os.Getenv("GATEWAY_ROUTES_JSON")), envOr("GATEWAY_CONFIG_ACTOR", "operator"),
 		)
 		if err != nil {
 			return nil, err
 		}
 	}
-	routes, err := routesFromJSON(snapshot.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("model_routes revision %d: %w", snapshot.Revision, err)
+	if routes == nil {
+		routes, err = routesFromJSON(snapshot.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("model_routes revision %d: %w", snapshot.Revision, err)
+		}
 	}
 	router := provider.NewVersionedRouter(snapshot.Revision, routes)
 	go func() {
@@ -289,6 +304,24 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 	return router, nil
 }
 
+func publishRoutes(
+	ctx context.Context,
+	repository configuration.Repository,
+	expectedRevision, revision int64,
+	payload json.RawMessage,
+	actor string,
+) (configuration.Snapshot, []provider.Route, error) {
+	routes, err := routesFromJSON(payload)
+	if err != nil {
+		return configuration.Snapshot{}, nil, fmt.Errorf("validate model_routes revision %d: %w", revision, err)
+	}
+	snapshot, err := repository.Publish(ctx, "model_routes", expectedRevision, revision, payload, actor)
+	if err != nil {
+		return configuration.Snapshot{}, nil, err
+	}
+	return snapshot, routes, nil
+}
+
 func routesFromJSON(payload []byte) ([]provider.Route, error) {
 	var configs []routeConfig
 	if err := json.Unmarshal(payload, &configs); err != nil || len(configs) == 0 {
@@ -298,6 +331,9 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 	for index, config := range configs {
 		if config.ID == "" || config.PublicModel == "" || config.Provider == "" || config.Region == "" || config.HomeRegion == "" {
 			return nil, fmt.Errorf("route %d requires id, provider, public_model, region, and home_region", index)
+		}
+		if !firstReleaseProvider(config.Provider) {
+			return nil, fmt.Errorf("route %d provider %q is outside the first-release scope; supported providers are openai, deepseek, anthropic, and gemini", index, config.Provider)
 		}
 		if !validNonNegativeCost(config.InputCost) || !validNonNegativeCost(config.OutputCost) || !validNonNegativeCost(config.CachedInputCost) {
 			return nil, fmt.Errorf("route %q prices must be finite and non-negative", config.ID)
@@ -332,6 +368,15 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		})
 	}
 	return routes, nil
+}
+
+func firstReleaseProvider(name string) bool {
+	switch name {
+	case "openai", "deepseek", "anthropic", "gemini":
+		return true
+	default:
+		return false
+	}
 }
 
 func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
@@ -406,7 +451,12 @@ func cacheWriteCostPerMillion(config routeConfig) (float64, error) {
 	return value, nil
 }
 
-func runCacheWorker(ctx context.Context, coordinator *cacheprotection.Coordinator, router *provider.StaticRouter) {
+func runCacheWorker(
+	ctx context.Context,
+	coordinator *cacheprotection.Coordinator,
+	router *provider.StaticRouter,
+	tenantPolicies map[string]core.TenantPolicy,
+) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -414,12 +464,26 @@ func runCacheWorker(ctx context.Context, coordinator *cacheprotection.Coordinato
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, err := coordinator.RunDue(ctx, 32, router.ResolveCacheProtector)
+			_, err := coordinator.RunDue(ctx, 32, func(anchor provider.CacheAnchor) provider.CacheProtector {
+				return resolveCacheProtectorForTenant(router, tenantPolicies, anchor)
+			})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("cache protection worker iteration failed", "error", err)
 			}
 		}
 	}
+}
+
+func resolveCacheProtectorForTenant(
+	router *provider.StaticRouter,
+	tenantPolicies map[string]core.TenantPolicy,
+	anchor provider.CacheAnchor,
+) provider.CacheProtector {
+	policy, configured := tenantPolicies[anchor.TenantID]
+	if !configured || policy.AllowCacheProtection == nil || !*policy.AllowCacheProtection {
+		return nil
+	}
+	return router.ResolveCacheProtector(anchor)
 }
 
 func runRetentionWorker(ctx context.Context, responseStore store.ResponseStore, localRegion string) {

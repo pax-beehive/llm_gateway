@@ -199,6 +199,7 @@ func TestTenantPolicyRejectsDisallowedCacheContentInspection(t *testing.T) {
 	t.Parallel()
 	allowCache := true
 	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(testRoute("policy", provider.NewEchoExecutor())), gatewayruntime.Options{
+		CacheProtectionMode: gatewayruntime.CacheProtectionShadowMode,
 		TenantPolicies: map[string]core.TenantPolicy{
 			"tenant-a": {AllowCacheProtection: &allowCache},
 		},
@@ -209,6 +210,65 @@ func TestTenantPolicyRejectsDisallowedCacheContentInspection(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "content inspection") {
 		t.Fatalf("execute error = %v, want tenant content-inspection policy rejection", err)
+	}
+}
+
+func TestCacheProtectionDefaultsOffAndRejectsRequestOptIn(t *testing.T) {
+	t.Parallel()
+	allowCache := true
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(testRoute("policy", provider.NewEchoExecutor())), gatewayruntime.Options{
+		TenantPolicies: map[string]core.TenantPolicy{
+			"tenant-a": {AllowCacheProtection: &allowCache},
+		},
+	})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		CacheProtection: &core.CacheProtectionPolicy{
+			Enabled: true, MaxSpendMicros: 1_000_000, MaxRefreshes: 1, MaxProtectionWindowSec: 3600,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "disabled by gateway policy") {
+		t.Fatalf("execute error = %v, want gateway-level Cache Protection rejection", err)
+	}
+}
+
+func TestCacheProtectionRequiresExplicitTenantOptIn(t *testing.T) {
+	t.Parallel()
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(testRoute("policy", provider.NewEchoExecutor())), gatewayruntime.Options{
+		CacheProtectionMode: gatewayruntime.CacheProtectionShadowMode,
+	})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		CacheProtection: &core.CacheProtectionPolicy{
+			Enabled: true, MaxSpendMicros: 1_000_000, MaxRefreshes: 1, MaxProtectionWindowSec: 3600,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "tenant policy does not allow") {
+		t.Fatalf("execute error = %v, want Tenant-level Cache Protection rejection", err)
+	}
+}
+
+func TestCacheProtectionOffSkipsCacheLifecycleForOrdinaryRequests(t *testing.T) {
+	t.Parallel()
+	adapter := &cacheAdapterStub{}
+	route := testRoute("cache-route", provider.NewEchoExecutor())
+	route.CacheProtector = adapter
+	route.CacheAnchorBuilder = adapter
+	route.PriceSnapshot = core.PriceSnapshot{
+		ID: "price-v1", Provider: route.Provider, Model: "gateway-model", Region: "local", Currency: "USD",
+		EffectiveAt: 1, Source: "test",
+	}
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(route), gatewayruntime.Options{
+		CacheCoordinator: cacheprotection.NewCoordinator(cacheprotection.NewMemoryIntentRepository(), time.Now),
+	})
+	if _, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.currentAnchorCalls.Load() != 0 || adapter.buildAnchorCalls.Load() != 0 {
+		t.Fatalf("current/build Cache Anchor calls = %d/%d, want 0/0 while Cache Protection is off",
+			adapter.currentAnchorCalls.Load(), adapter.buildAnchorCalls.Load())
 	}
 }
 
@@ -309,8 +369,10 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	repository := cacheprotection.NewMemoryIntentRepository()
 	coordinator := cacheprotection.NewCoordinator(repository, time.Now)
 	responseStore := store.NewMemoryResponseStore()
+	allowCache := true
 	engine := gatewayruntime.NewWithOptions(responseStore, provider.NewRouter(route), gatewayruntime.Options{
 		CacheCoordinator: coordinator, CacheProtectionMode: gatewayruntime.CacheProtectionAnthropicCanaryMode,
+		TenantPolicies: map[string]core.TenantPolicy{"tenant-a": {AllowCacheProtection: &allowCache}},
 	})
 	response, err := engine.Execute(context.Background(), core.Request{
 		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
@@ -337,7 +399,7 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	}
 }
 
-func TestCacheProtectionDefaultsToShadowAndNeverRefreshes(t *testing.T) {
+func TestCacheProtectionShadowModeNeverRefreshes(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().UTC()
@@ -366,8 +428,10 @@ func TestCacheProtectionDefaultsToShadowAndNeverRefreshes(t *testing.T) {
 	}
 	repository := cacheprotection.NewMemoryIntentRepository()
 	coordinator := cacheprotection.NewCoordinator(repository, time.Now)
+	allowCache := true
 	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(route), gatewayruntime.Options{
-		CacheCoordinator: coordinator,
+		CacheCoordinator: coordinator, CacheProtectionMode: gatewayruntime.CacheProtectionShadowMode,
+		TenantPolicies: map[string]core.TenantPolicy{"tenant-shadow": {AllowCacheProtection: &allowCache}},
 	})
 	_, err := engine.Execute(context.Background(), core.Request{
 		TenantID: "tenant-shadow", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
@@ -427,9 +491,11 @@ type signalledBlockingStream struct {
 }
 
 type cacheAdapterStub struct {
-	observation   provider.CacheObservation
-	refreshResult provider.RefreshResult
-	refreshCalls  atomic.Int64
+	observation        provider.CacheObservation
+	refreshResult      provider.RefreshResult
+	refreshCalls       atomic.Int64
+	currentAnchorCalls atomic.Int64
+	buildAnchorCalls   atomic.Int64
 }
 
 type failingRenewalStore struct {
@@ -461,10 +527,12 @@ func (s *cacheAdapterStub) Refresh(context.Context, provider.CacheAnchor) (provi
 }
 
 func (s *cacheAdapterStub) CurrentCacheAnchor(context.Context, core.Request) (provider.CacheAnchor, bool, error) {
+	s.currentAnchorCalls.Add(1)
 	return s.observation.Anchor, false, nil
 }
 
 func (s *cacheAdapterStub) BuildCacheAnchor(context.Context, core.Request, core.Response) (provider.CacheObservation, error) {
+	s.buildAnchorCalls.Add(1)
 	return s.observation, nil
 }
 

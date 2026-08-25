@@ -71,6 +71,8 @@ type CacheProtector interface {
 
 Provider adapters own serialization quirks, event translation, usage normalization, cache breakpoints, timeout behavior, and provider errors. The Response Runtime owns lifecycle invariants, attempt history, idempotency, persistence, and the rule that a request cannot transparently fall back after its first visible output event.
 
+The first release accepts exactly four Provider identities: `openai`, `deepseek`, `anthropic`, and `gemini`. OpenAI, DeepSeek, and Gemini initially share the OpenAI-compatible execution seam; Anthropic uses its native Messages API for Claude. This bounds the initial conformance and operations matrix while keeping the Provider seam replaceable. Additional Provider identities are rejected at route publication until they receive an explicit compatibility profile and conformance suite.
+
 ### 3. Use home-region single-writer state
 
 A Tenant and each stateful Conversation or Response execution has a Home Region. Stateful writes are routed there and committed to a multi-AZ authoritative database before success is acknowledged.
@@ -125,7 +127,8 @@ The Continuation Forecast targets the probability and timing of the next cache-c
 
 Cache Protection has these invariants:
 
-- Default off; explicit Tenant or request opt-in.
+- Default hard-off at the gateway; the refresh worker and Cache Anchor inspection do not run in this mode.
+- Enabling requires all three gates: a non-`off` gateway mode, explicit Tenant permission, and explicit request opt-in. Missing Tenant permission is deny-by-default.
 - Finite `max_spend`, `max_refreshes`, and `max_protection_window`.
 - Refresh in the Home Region and on the exact provider, model, credential scope, cache key, and compatible prompt serialization.
 - Refresh never appends dummy items to the customer's Conversation or Response Chain.
@@ -133,7 +136,7 @@ Cache Protection has these invariants:
 - One active refresh intent per Cache Lease revision, protected by a lease and fencing token.
 - A real customer request cancels a pending refresh.
 - Ambiguous provider outcomes are recorded as `uncertain` and are not blindly retried.
-- Provider or policy changes can disable a refresh adapter immediately without changing callers.
+- Provider or Tenant policy changes are re-evaluated when durable work is claimed and can disable a refresh adapter immediately without changing callers.
 
 Initial provider rollout:
 
@@ -152,7 +155,7 @@ The gateway will not present all cache discounts as savings caused by Cache Prot
 
 Every calculation references immutable provider/model/region price snapshots and the original usage payload. If a provider does not report reliable cache reads and writes, attribution is labeled estimated or unavailable.
 
-The first production experiment will run in shadow mode before issuing refreshes. A later treatment uses a small, stable holdout cohort, limits each session to one refresh, and enables only prefixes large enough to clear a conservative ROI threshold.
+The first production experiment requires an operator to move the gateway from `off` to `shadow` before issuing refreshes. A later treatment uses a small, stable holdout cohort, limits each Continuation to one refresh, and enables only prefixes large enough to clear a conservative ROI threshold.
 
 ## Technical selection
 
@@ -250,7 +253,7 @@ Rejected. It can spend more than a future cold request, prolong data residency, 
 5. Prompt Cache observability and cache-aware provider affinity without proactive refresh.
 6. Cache Protection shadow mode and offline ROI evaluation.
 7. Anthropic one-refresh canary with randomized holdout and Savings Ledger.
-8. Additional provider refresh adapters only after provider-specific conformance and economic tests pass.
+8. Additional refresh adapters or Provider identities only after provider-specific conformance and economic tests pass.
 
 ## Initial non-goals
 

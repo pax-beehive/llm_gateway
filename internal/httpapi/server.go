@@ -232,6 +232,10 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
 		return
 	}
+	if err := s.runtime.ValidateRequestPolicy(canonical); err != nil {
+		writeRuntimeError(responseWriter, core.Response{}, err)
+		return
+	}
 	if len(canonical.IdempotencyKey) > 256 {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "Idempotency-Key exceeds 256 bytes", "Idempotency-Key")
 		return
@@ -545,6 +549,10 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
 		return
 	}
+	if err := s.runtime.ValidateRequestPolicy(canonical); err != nil {
+		writeRuntimeError(responseWriter, core.Response{}, err)
+		return
+	}
 	if payload.Stream {
 		s.streamChatCompletion(responseWriter, request, canonical, payload.StreamOptions)
 		return
@@ -775,6 +783,10 @@ func writeNamedSSE(responseWriter http.ResponseWriter, eventName string, value a
 func writeRuntimeError(responseWriter http.ResponseWriter, result core.Response, err error) {
 	if errors.Is(err, runtime.ErrQuotaExceeded) {
 		writeError(responseWriter, http.StatusTooManyRequests, "rate_limit_exceeded", err.Error(), "")
+		return
+	}
+	if errors.Is(err, runtime.ErrCacheProtectionNotAllowed) {
+		writeError(responseWriter, http.StatusForbidden, "cache_protection_not_allowed", err.Error(), "cache_protection")
 		return
 	}
 	if errors.Is(err, store.ErrIdempotencyMismatch) {

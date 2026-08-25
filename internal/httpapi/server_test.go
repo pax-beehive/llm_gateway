@@ -191,6 +191,41 @@ func TestUnknownCompatibilityModeIsRejected(t *testing.T) {
 	}
 }
 
+func TestCacheProtectionOptInIsForbiddenWhileGatewayModeIsOff(t *testing.T) {
+	t.Parallel()
+	cacheProtection := map[string]any{
+		"enabled": true, "max_spend_micros": 1_000_000, "max_refreshes": 1,
+		"max_protection_window_seconds": 3600,
+	}
+	tests := []struct {
+		name   string
+		target string
+		body   map[string]any
+	}{
+		{name: "Responses", target: "/v1/responses", body: map[string]any{
+			"model": "echo-v1", "input": "hello", "cache_protection": cacheProtection,
+		}},
+		{name: "Responses stream", target: "/v1/responses", body: map[string]any{
+			"model": "echo-v1", "input": "hello", "stream": true, "cache_protection": cacheProtection,
+		}},
+		{name: "Responses background", target: "/v1/responses", body: map[string]any{
+			"model": "echo-v1", "input": "hello", "background": true, "cache_protection": cacheProtection,
+		}},
+		{name: "Chat stream", target: "/v1/chat/completions", body: map[string]any{
+			"model": "echo-v1", "messages": []map[string]any{{"role": "user", "content": "hello"}},
+			"stream": true, "cache_protection": cacheProtection,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := performJSON(t, newTestHandler(), "tenant-a-key", http.MethodPost, test.target, test.body)
+			if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "cache_protection_not_allowed") {
+				t.Fatalf("status/body = %d / %s, want explicit Cache Protection forbidden response", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestChatMultimodalContentBecomesTypedCanonicalInput(t *testing.T) {
 	t.Parallel()
 	captured := make(chan core.Request, 1)
