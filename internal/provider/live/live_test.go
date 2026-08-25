@@ -13,20 +13,24 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
+	"github.com/toddzheng/llm-gateway/internal/provider/modeldiscovery"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
 )
 
 type liveProvider struct {
-	name     string
-	executor provider.ResponseExecutor
+	name             string
+	provider         modeldiscovery.Provider
+	apiKey           string
+	discoveryBaseURL string
+	newExecutor      func(*testing.T, string) provider.ResponseExecutor
 }
 
 func TestLiveProviderTextStreaming(t *testing.T) {
 	required := []string{
-		"OPENAI_API_KEY", "OPENAI_MODEL",
-		"DEEPSEEK_API_KEY", "DEEPSEEK_MODEL",
-		"ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
-		"GEMINI_API_KEY", "GEMINI_MODEL",
+		"OPENAI_API_KEY",
+		"DEEPSEEK_API_KEY",
+		"ANTHROPIC_API_KEY",
+		"GEMINI_API_KEY",
 	}
 	var missing []string
 	for _, name := range required {
@@ -39,19 +43,36 @@ func TestLiveProviderTextStreaming(t *testing.T) {
 	}
 
 	providers := []liveProvider{
-		{name: "OpenAI", executor: mustOpenAICompatible(t, openaicompat.Config{
-			BaseURL: "https://api.openai.com/v1",
-			APIKey:  os.Getenv("OPENAI_API_KEY"), Model: os.Getenv("OPENAI_MODEL"), Dialect: openaicompat.DialectOpenAI,
-		})},
-		{name: "DeepSeek", executor: mustOpenAICompatible(t, openaicompat.Config{
-			BaseURL: "https://api.deepseek.com",
-			APIKey:  os.Getenv("DEEPSEEK_API_KEY"), Model: os.Getenv("DEEPSEEK_MODEL"), Dialect: openaicompat.DialectDeepSeek,
-		})},
-		{name: "Anthropic", executor: mustAnthropic(t)},
-		{name: "Gemini", executor: mustOpenAICompatible(t, openaicompat.Config{
-			BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
-			APIKey:  os.Getenv("GEMINI_API_KEY"), Model: os.Getenv("GEMINI_MODEL"), Dialect: openaicompat.DialectGemini,
-		})},
+		{
+			name: "OpenAI", provider: modeldiscovery.OpenAI, apiKey: os.Getenv("OPENAI_API_KEY"), discoveryBaseURL: "https://api.openai.com/v1",
+			newExecutor: func(t *testing.T, model string) provider.ResponseExecutor {
+				return mustOpenAICompatible(t, openaicompat.Config{
+					BaseURL: "https://api.openai.com/v1", APIKey: os.Getenv("OPENAI_API_KEY"), Model: model, Dialect: openaicompat.DialectOpenAI,
+				})
+			},
+		},
+		{
+			name: "DeepSeek", provider: modeldiscovery.DeepSeek, apiKey: os.Getenv("DEEPSEEK_API_KEY"), discoveryBaseURL: "https://api.deepseek.com",
+			newExecutor: func(t *testing.T, model string) provider.ResponseExecutor {
+				return mustOpenAICompatible(t, openaicompat.Config{
+					BaseURL: "https://api.deepseek.com", APIKey: os.Getenv("DEEPSEEK_API_KEY"), Model: model, Dialect: openaicompat.DialectDeepSeek,
+				})
+			},
+		},
+		{
+			name: "Anthropic", provider: modeldiscovery.Anthropic, apiKey: os.Getenv("ANTHROPIC_API_KEY"), discoveryBaseURL: "https://api.anthropic.com/v1",
+			newExecutor: func(t *testing.T, model string) provider.ResponseExecutor {
+				return mustAnthropic(t, model)
+			},
+		},
+		{
+			name: "Gemini", provider: modeldiscovery.Gemini, apiKey: os.Getenv("GEMINI_API_KEY"), discoveryBaseURL: "https://generativelanguage.googleapis.com/v1beta",
+			newExecutor: func(t *testing.T, model string) provider.ResponseExecutor {
+				return mustOpenAICompatible(t, openaicompat.Config{
+					BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKey: os.Getenv("GEMINI_API_KEY"), Model: model, Dialect: openaicompat.DialectGemini,
+				})
+			},
+		},
 	}
 
 	for _, live := range providers {
@@ -59,8 +80,23 @@ func TestLiveProviderTextStreaming(t *testing.T) {
 		t.Run(live.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
+			discovery, err := modeldiscovery.New(modeldiscovery.Config{
+				Provider: live.provider, BaseURL: live.discoveryBaseURL, APIKey: live.apiKey,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			models, err := discovery.List(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model, err := modeldiscovery.SelectSmokeModel(live.provider, models)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor := live.newExecutor(t, model)
 			maxTokens := 64
-			stream, err := live.executor.Execute(ctx, core.Request{
+			stream, err := executor.Execute(ctx, core.Request{
 				Input:           []core.Item{{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "Reply with exactly: pong"}}}},
 				MaxOutputTokens: &maxTokens,
 			})
@@ -102,11 +138,11 @@ func mustOpenAICompatible(t *testing.T, config openaicompat.Config) provider.Res
 	return executor
 }
 
-func mustAnthropic(t *testing.T) provider.ResponseExecutor {
+func mustAnthropic(t *testing.T, model string) provider.ResponseExecutor {
 	t.Helper()
 	adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
 		BaseURL: "https://api.anthropic.com/v1",
-		APIKey:  os.Getenv("ANTHROPIC_API_KEY"), APIVersion: "2023-06-01", Model: os.Getenv("ANTHROPIC_MODEL"),
+		APIKey:  os.Getenv("ANTHROPIC_API_KEY"), APIVersion: "2023-06-01", Model: model,
 		RouteID: "live-anthropic", CredentialScope: "live-smoke", Region: "global", EnablePromptCaching: false,
 	})
 	if err != nil {

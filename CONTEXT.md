@@ -16,6 +16,10 @@ _Avoid_: Backend, vendor API
 A policy-governed path from a requested model capability to one concrete provider, model, credential scope, and region.
 _Avoid_: Endpoint, deployment
 
+**Model Catalog**:
+The Tenant-visible list of public model identifiers currently backed by healthy, Home Region-compatible Model Routes with native text capability.
+_Avoid_: Raw Provider inventory, environment model list
+
 **Capability Profile**:
 The declared set of model behaviors a Model Route supports natively, through translation, or not at all.
 _Avoid_: Feature flags, compatibility boolean

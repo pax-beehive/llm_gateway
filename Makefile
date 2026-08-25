@@ -25,7 +25,7 @@ test-integration-local: integration-up
 	TEST_DATABASE_URL='postgres://gateway:gateway-dev-only@127.0.0.1:5432/llm_gateway?sslmode=disable' $(MAKE) test-integration
 
 test-live-providers:
-	@test -f .env || { echo ".env is required; copy .env.example and fill the provider keys and models" >&2; exit 1; }
+	@test -f .env || { echo ".env is required; copy .env.example and fill the four provider keys" >&2; exit 1; }
 	@set -a; . ./.env; set +a; GOCACHE=$(GOCACHE) go test -tags=live ./internal/provider/live -count=1
 
 integration-down:

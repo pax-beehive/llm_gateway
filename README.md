@@ -28,6 +28,15 @@ curl -N http://localhost:8080/v1/chat/completions \
   -d '{"model":"echo-v1","stream":true,"messages":[{"role":"user","content":"hello stream"}]}'
 ```
 
+List the authenticated Tenant's currently routable public models:
+
+```sh
+curl -sS http://localhost:8080/v1/models \
+  -H 'Authorization: Bearer dev-token'
+```
+
+The returned model IDs are the same public IDs accepted by each request's `model` field. The catalog exposes healthy, Home Region-compatible Model Routes with native text capability; it does not expose internal Route IDs or raw Provider model IDs. Each OpenAI-compatible model object's `created` timestamp is the durable publication time of the active Model Route catalog revision.
+
 Use `docker compose up --build` for the PostgreSQL-backed development stack. The Compose credentials and bearer token are development-only.
 
 ## Production configuration
@@ -143,13 +152,13 @@ Provider adapters have offline conformance tests that use fake credentials and l
 | Anthropic | native Messages | `x-api-key`, API version, request fields, SSE text/usage, no cache breakpoint while disabled | off by default |
 | Gemini | OpenAI-compatible Chat Completions | bearer auth, client identification, request fields, SSE text/tools/usage | off |
 
-Real Provider verification is isolated behind the `live` build tag. Fill the eight empty key/model variables in the ignored local `.env`, then explicitly run:
+Real Provider verification is isolated behind the `live` build tag. Fill the four key variables in the ignored local `.env`, then explicitly run:
 
 ```sh
 make test-live-providers
 ```
 
-This target sends one small streaming request to each Provider. Missing variables are a hard failure rather than a skip. `.env.example` documents the required names; `.env` is ignored by Git and must never be committed.
+This target first calls each Provider's authenticated model-list endpoint, selects a conservative low-cost text model, and sends one small streaming request. Missing keys, discovery failures, or the absence of a safe smoke model are hard failures rather than skips. `.env.example` documents the required names; `.env` is ignored by Git and must never be committed. Production requests choose a public model per request; model selection is not a process-level environment setting.
 
 The core migration is embedded in the binary and runs only when `GATEWAY_MIGRATE=true`. Production schema rollout should normally happen as a separate deployment gate.
 

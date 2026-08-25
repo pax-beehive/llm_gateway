@@ -164,7 +164,7 @@ func run() error {
 	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
 	handler := httpapi.New(httpapi.Config{
-		Runtime: engine, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
+		Runtime: engine, ModelCatalog: router, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
 		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
 	})
 
@@ -285,7 +285,7 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 			return nil, fmt.Errorf("model_routes revision %d: %w", snapshot.Revision, err)
 		}
 	}
-	router := provider.NewVersionedRouter(snapshot.Revision, routes)
+	router := provider.NewVersionedRouterAt(snapshot.Revision, snapshot.CreatedAt, routes)
 	go func() {
 		err := configuration.Watch(ctx, repository, "model_routes", 5*time.Second, func(next configuration.Snapshot) error {
 			if next.Revision <= router.Revision() {
@@ -295,7 +295,7 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 			if err != nil {
 				return err
 			}
-			return router.Update(next.Revision, nextRoutes)
+			return router.UpdateAt(next.Revision, next.CreatedAt, nextRoutes)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			slog.Error("route configuration watch stopped", "error", err)

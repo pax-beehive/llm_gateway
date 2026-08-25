@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
@@ -39,6 +40,7 @@ func (a StaticAuthenticator) Authenticate(request *http.Request) (string, error)
 
 type Config struct {
 	Runtime               *runtime.Runtime
+	ModelCatalog          provider.ModelCatalog
 	Authenticator         Authenticator
 	TenantHomeRegions     map[string]string
 	TenantExecutionEpochs map[string]int64
@@ -49,6 +51,7 @@ type Config struct {
 
 type Server struct {
 	runtime         *runtime.Runtime
+	modelCatalog    provider.ModelCatalog
 	authenticator   Authenticator
 	homeRegions     map[string]string
 	executionEpochs map[string]int64
@@ -66,7 +69,7 @@ func New(config Config) http.Handler {
 		config.ForwardClient = http.DefaultClient
 	}
 	server := &Server{
-		runtime: config.Runtime, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
+		runtime: config.Runtime, modelCatalog: config.ModelCatalog, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
 		executionEpochs: config.TenantExecutionEpochs, localRegion: config.LocalRegion,
 		homeRegionURLs: config.HomeRegionURLs, forwardClient: config.ForwardClient, mux: http.NewServeMux(),
 	}
@@ -76,12 +79,38 @@ func New(config Config) http.Handler {
 	server.mux.HandleFunc("POST /v1/responses/{response_id}/cancel", server.cancelResponse)
 	server.mux.HandleFunc("GET /v1/responses/{response_id}/input_items", server.inputItems)
 	server.mux.HandleFunc("POST /v1/chat/completions", server.chatCompletions)
+	server.mux.HandleFunc("GET /v1/models", server.listModels)
 	server.mux.HandleFunc("POST /v1/conversations", server.createConversation)
 	server.mux.HandleFunc("GET /v1/conversations/{conversation_id}", server.getConversation)
 	server.mux.HandleFunc("DELETE /v1/conversations/{conversation_id}", server.deleteConversation)
 	server.mux.HandleFunc("GET /v1/conversations/{conversation_id}/items", server.conversationItems)
 	server.mux.HandleFunc("POST /v1/conversations/{conversation_id}/items", server.appendConversationItems)
 	return server
+}
+
+func (s *Server) listModels(responseWriter http.ResponseWriter, request *http.Request) {
+	if s.modelCatalog == nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "model_catalog_unavailable", "model catalog is unavailable", "")
+		return
+	}
+	models, err := s.modelCatalog.ListModels(request.Context(), provider.ModelCatalogQuery{
+		TenantID: tenantID(request), HomeRegion: s.homeRegion(request),
+	})
+	if err != nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "model_catalog_unavailable", err.Error(), "")
+		return
+	}
+	type modelObject struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+	}
+	data := make([]modelObject, 0, len(models))
+	for _, model := range models {
+		data = append(data, modelObject{ID: model.ID, Object: "model", Created: model.Created, OwnedBy: "gateway"})
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {

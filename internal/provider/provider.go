@@ -100,12 +100,27 @@ type Router interface {
 	Candidates(context.Context, core.Request) ([]Route, error)
 }
 
+type ModelCatalogQuery struct {
+	TenantID   string
+	HomeRegion string
+}
+
+type ModelCatalogEntry struct {
+	ID      string
+	Created int64
+}
+
+type ModelCatalog interface {
+	ListModels(context.Context, ModelCatalogQuery) ([]ModelCatalogEntry, error)
+}
+
 type StaticRouter struct {
 	snapshot atomic.Pointer[routeSnapshot]
 }
 
 type routeSnapshot struct {
 	revision int64
+	created  int64
 	routes   []Route
 }
 
@@ -129,21 +144,35 @@ func NewRouter(routes ...Route) *StaticRouter {
 }
 
 func NewVersionedRouter(revision int64, routes []Route) *StaticRouter {
+	return NewVersionedRouterAt(revision, time.Now(), routes)
+}
+
+func NewVersionedRouterAt(revision int64, createdAt time.Time, routes []Route) *StaticRouter {
 	if revision <= 0 {
 		panic("route snapshot revision must be positive")
 	}
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
 	router := &StaticRouter{}
-	router.snapshot.Store(&routeSnapshot{revision: revision, routes: append([]Route(nil), routes...)})
+	router.snapshot.Store(&routeSnapshot{revision: revision, created: createdAt.Unix(), routes: append([]Route(nil), routes...)})
 	return router
 }
 
 func (r *StaticRouter) Update(revision int64, routes []Route) error {
+	return r.UpdateAt(revision, time.Now(), routes)
+}
+
+func (r *StaticRouter) UpdateAt(revision int64, createdAt time.Time, routes []Route) error {
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
 	for {
 		current := r.snapshot.Load()
 		if current != nil && revision <= current.revision {
 			return errors.New("route snapshot revision must increase")
 		}
-		next := &routeSnapshot{revision: revision, routes: append([]Route(nil), routes...)}
+		next := &routeSnapshot{revision: revision, created: createdAt.Unix(), routes: append([]Route(nil), routes...)}
 		if r.snapshot.CompareAndSwap(current, next) {
 			return nil
 		}
@@ -155,6 +184,29 @@ func (r *StaticRouter) Revision() int64 {
 		return snapshot.revision
 	}
 	return 0
+}
+
+func (r *StaticRouter) ListModels(_ context.Context, query ModelCatalogQuery) ([]ModelCatalogEntry, error) {
+	snapshot := r.snapshot.Load()
+	if snapshot == nil {
+		return nil, errors.New("model route configuration is unavailable")
+	}
+	models := make(map[string]struct{})
+	for _, route := range snapshot.routes {
+		if !route.Healthy || route.Model == "" || route.Profile.Features["text"] != CapabilityNative {
+			continue
+		}
+		if query.HomeRegion != "" && route.HomeRegion != "" && route.HomeRegion != query.HomeRegion {
+			continue
+		}
+		models[route.Model] = struct{}{}
+	}
+	entries := make([]ModelCatalogEntry, 0, len(models))
+	for model := range models {
+		entries = append(entries, ModelCatalogEntry{ID: model, Created: snapshot.created})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	return entries, nil
 }
 
 func (r *StaticRouter) ResolveCacheProtector(anchor CacheAnchor) CacheProtector {

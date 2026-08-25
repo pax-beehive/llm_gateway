@@ -69,6 +69,53 @@ func TestTenantCanCreateAndRetrieveResponse(t *testing.T) {
 	}
 }
 
+func TestTenantListsRoutablePublicModels(t *testing.T) {
+	t.Parallel()
+	textProfile := provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{"text": provider.CapabilityNative}}
+	routes := []provider.Route{
+		{ID: "openai-fast", Provider: "openai", Model: "fast-chat", HomeRegion: "us-west", Healthy: true, Profile: textProfile},
+		{ID: "gemini-fast", Provider: "gemini", Model: "fast-chat", HomeRegion: "us-west", Healthy: true, Profile: textProfile},
+		{ID: "anthropic-smart", Provider: "anthropic", Model: "smart-chat", HomeRegion: "us-west", Healthy: true, Profile: textProfile},
+		{ID: "deepseek-draining", Provider: "deepseek", Model: "draining-chat", HomeRegion: "us-west", Healthy: false, Profile: textProfile},
+		{ID: "gemini-eu", Provider: "gemini", Model: "eu-chat", HomeRegion: "eu-west", Healthy: true, Profile: textProfile},
+		{ID: "opaque-route", Provider: "openai", Model: "opaque-chat", HomeRegion: "us-west", Healthy: true},
+	}
+	createdAt := time.Unix(1_724_566_400, 0)
+	router := provider.NewVersionedRouterAt(1, createdAt, routes)
+	handler := httpapi.New(httpapi.Config{
+		Runtime:           runtime.New(store.NewMemoryResponseStore(), router),
+		ModelCatalog:      router,
+		Authenticator:     httpapi.StaticAuthenticator{"tenant-a-key": "tenant-a"},
+		TenantHomeRegions: map[string]string{"tenant-a": "us-west"},
+	})
+
+	response := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/models", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var catalog struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
+			Created *int64 `json:"created"`
+		} `json:"data"`
+	}
+	decodeJSON(t, response, &catalog)
+	if catalog.Object != "list" || len(catalog.Data) != 2 {
+		t.Fatalf("catalog = %#v", catalog)
+	}
+	if catalog.Data[0].ID != "fast-chat" || catalog.Data[1].ID != "smart-chat" {
+		t.Fatalf("models = %#v", catalog.Data)
+	}
+	for _, model := range catalog.Data {
+		if model.Object != "model" || model.OwnedBy != "gateway" || model.Created == nil || *model.Created != createdAt.Unix() {
+			t.Fatalf("model = %#v", model)
+		}
+	}
+}
+
 func TestStatefulWriteIsForwardedToTenantHomeRegion(t *testing.T) {
 	t.Parallel()
 	forwarded := make(chan *http.Request, 1)
