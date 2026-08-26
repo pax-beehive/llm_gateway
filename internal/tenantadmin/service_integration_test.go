@@ -5,6 +5,7 @@ package tenantadmin_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -56,10 +57,24 @@ func TestCreateTenantIsIdempotentAndCommitsAuditAndOutboxAtomically(t *testing.T
 	if !replayed.Replay || replayed.Tenant.ID != created.Tenant.ID || replayed.Tenant.Revision != created.Tenant.Revision {
 		t.Fatalf("replayed Tenant = %#v", replayed)
 	}
+	changedReason := actor
+	changedReason.Reason = "different audit reason"
+	if _, err := service.CreateTenant(ctx, changedReason, idempotencyKey, command); !errors.Is(err, tenantadmin.ErrIdempotencyConflict) {
+		t.Fatalf("changed reason idempotency error = %v", err)
+	}
 	changed := command
 	changed.DisplayName = "Different request"
 	if _, err := service.CreateTenant(ctx, actor, idempotencyKey, changed); !errors.Is(err, tenantadmin.ErrIdempotencyConflict) {
 		t.Fatalf("idempotency mismatch error = %v", err)
+	}
+	if _, err := service.CreateTenant(ctx, actor, "duplicate-"+tenantID, command); !errors.Is(err, tenantadmin.ErrAlreadyExists) {
+		t.Fatalf("duplicate Tenant error = %v", err)
+	}
+	invalid := command
+	invalid.ID = "invalid/path"
+	invalid.Slug = "invalid/path"
+	if _, err := service.CreateTenant(ctx, actor, "invalid-"+tenantID, invalid); !errors.Is(err, tenantadmin.ErrInvalidArgument) {
+		t.Fatalf("invalid resource ID error = %v", err)
 	}
 	var auditCount, outboxCount int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM control_audit_events WHERE tenant_id = $1`, tenantID).Scan(&auditCount); err != nil {
@@ -197,9 +212,18 @@ func TestTenantProfileAndLifecycleMutationsRequireCurrentRevision(t *testing.T) 
 	if closed.Tenant.Status != access.TenantClosed || closed.Tenant.Revision != 5 {
 		t.Fatalf("closed Tenant = %#v", closed.Tenant)
 	}
+	closedPage, err := service.ListTenants(ctx, actor, tenantadmin.TenantFilter{
+		ID: tenantID, Status: access.TenantClosed, Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closedPage.Data) != 1 || closedPage.Data[0].ID != tenantID {
+		t.Fatalf("explicit closed status page = %#v", closedPage)
+	}
 	if _, err := service.TransitionTenant(ctx, actor, "reopen-"+tenantID, tenantadmin.TransitionTenantCommand{
 		TenantID: tenantID, ExpectedRevision: 5, Target: access.TenantActive,
-	}); !errors.Is(err, tenantadmin.ErrRevisionConflict) {
+	}); !errors.Is(err, tenantadmin.ErrInvalidTransition) {
 		t.Fatalf("closed Tenant reopen error = %v", err)
 	}
 	var auditCount, outboxCount int
@@ -211,6 +235,20 @@ func TestTenantProfileAndLifecycleMutationsRequireCurrentRevision(t *testing.T) 
 	}
 	if auditCount != 5 || outboxCount != 5 {
 		t.Fatalf("audit/outbox count = %d/%d, want 5/5", auditCount, outboxCount)
+	}
+	var auditPayload []byte
+	if err := db.QueryRowContext(ctx, `
+		SELECT payload FROM control_audit_events
+		WHERE tenant_id = $1 AND action = 'tenant.update'`, tenantID).Scan(&auditPayload); err != nil {
+		t.Fatal(err)
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(auditPayload, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence["display_name_before"] != "Before" || evidence["display_name_after"] != "After" ||
+		evidence["metadata_digest_before"] == evidence["metadata_digest_after"] {
+		t.Fatalf("profile audit evidence = %#v", evidence)
 	}
 }
 
@@ -273,12 +311,146 @@ func TestTenantPolicyPublicationAndRestoreAppendImmutableRevisions(t *testing.T)
 	if revisions.Data[2].Policy.MaxConcurrentResponses != revisions.Data[0].Policy.MaxConcurrentResponses {
 		t.Fatalf("restored revision content = %#v, original = %#v", revisions.Data[2], revisions.Data[0])
 	}
+	if _, err := service.ListTenantPolicyRevisions(ctx, actor, "missing-"+tenantID, "", 10); !errors.Is(err, tenantadmin.ErrNotFound) {
+		t.Fatalf("missing Tenant policy history error = %v", err)
+	}
 	if _, err := db.ExecContext(ctx, `UPDATE tenant_policy_revisions SET change_reason = 'tampered' WHERE tenant_id = $1 AND revision = 1`, tenantID); err == nil {
 		t.Fatal("policy revision update unexpectedly succeeded")
 	}
 	if _, err := db.ExecContext(ctx, `DELETE FROM tenant_policy_revisions WHERE tenant_id = $1 AND revision = 1`, tenantID); err == nil {
 		t.Fatal("policy revision deletion unexpectedly succeeded")
 	}
+}
+
+func TestTenantLifecycleTransitionMatrix(t *testing.T) {
+	db, ctx := adminIntegrationDatabase(t)
+	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tenantadmin.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	service, err := tenantadmin.NewService(db, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := tenantadmin.ActorEnvelope{
+		Type: "human", ID: "operator-matrix", Scopes: []string{tenantadmin.ScopePlatformWrite},
+		RequestID: "request-matrix", Reason: "transition matrix",
+	}
+	statuses := []access.TenantStatus{access.TenantActive, access.TenantSuspended, access.TenantClosed}
+	for _, current := range statuses {
+		for _, target := range statuses {
+			t.Run(string(current)+"_to_"+string(target), func(t *testing.T) {
+				tenantID := fmt.Sprintf("admin-matrix-%s-%s-%d", current, target, time.Now().UnixNano())
+				created, err := service.CreateTenant(ctx, actor, "create-"+tenantID, tenantadmin.CreateTenantCommand{
+					ID: tenantID, Slug: tenantID, DisplayName: "Matrix Tenant", HomeRegion: "us-test",
+					InitialPolicy: core.TenantPolicy{Revision: 1},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				state := created.Tenant
+				if current != access.TenantActive {
+					state, err = transitionForMatrix(ctx, service, actor, tenantID, state.Revision, current)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				result, err := service.TransitionTenant(ctx, actor, "attempt-"+tenantID, tenantadmin.TransitionTenantCommand{
+					TenantID: tenantID, ExpectedRevision: state.Revision, Target: target,
+				})
+				legal := current == access.TenantActive && (target == access.TenantSuspended || target == access.TenantClosed) ||
+					current == access.TenantSuspended && (target == access.TenantActive || target == access.TenantClosed)
+				if legal {
+					if err != nil || result.Tenant.Status != target || result.Tenant.Revision != state.Revision+1 {
+						t.Fatalf("transition result/error = %#v / %v", result, err)
+					}
+					return
+				}
+				if !errors.Is(err, tenantadmin.ErrInvalidTransition) {
+					t.Fatalf("illegal transition error = %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestTenantWriteScopesCannotCrossActingTenant(t *testing.T) {
+	db, ctx := adminIntegrationDatabase(t)
+	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tenantadmin.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	service, err := tenantadmin.NewService(db, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("admin-authz-%d", time.Now().UnixNano())
+	platform := tenantadmin.ActorEnvelope{
+		Type: "human", ID: "platform-writer", Scopes: []string{tenantadmin.ScopePlatformWrite},
+		RequestID: "request-authz-setup", Reason: "authorization test setup",
+	}
+	for _, suffix := range []string{"a", "b"} {
+		tenantID := prefix + "-" + suffix
+		if _, err := service.CreateTenant(ctx, platform, "create-"+tenantID, tenantadmin.CreateTenantCommand{
+			ID: tenantID, Slug: tenantID, DisplayName: "Authz " + suffix, HomeRegion: "us-test",
+			InitialPolicy: core.TenantPolicy{Revision: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tenantWriter := tenantadmin.ActorEnvelope{
+		Type: "human", ID: "tenant-writer", ActingTenantID: prefix + "-a", Scopes: []string{tenantadmin.ScopeTenantWrite},
+		RequestID: "request-authz", Reason: "authorization test",
+	}
+	changed := "Allowed"
+	if _, err := service.UpdateTenant(ctx, tenantWriter, "own-update-"+prefix, tenantadmin.UpdateTenantCommand{
+		TenantID: prefix + "-a", ExpectedRevision: 1, DisplayName: &changed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UpdateTenant(ctx, tenantWriter, "cross-update-"+prefix, tenantadmin.UpdateTenantCommand{
+		TenantID: prefix + "-b", ExpectedRevision: 1, DisplayName: &changed,
+	}); !errors.Is(err, tenantadmin.ErrPolicyDenied) {
+		t.Fatalf("cross-Tenant update error = %v", err)
+	}
+	if _, err := service.TransitionTenant(ctx, tenantWriter, "cross-transition-"+prefix, tenantadmin.TransitionTenantCommand{
+		TenantID: prefix + "-b", ExpectedRevision: 1, Target: access.TenantSuspended,
+	}); !errors.Is(err, tenantadmin.ErrPolicyDenied) {
+		t.Fatalf("cross-Tenant transition error = %v", err)
+	}
+	nextPolicy := core.TenantPolicy{Revision: 2}
+	if _, err := service.PublishTenantPolicy(ctx, tenantWriter, "cross-policy-"+prefix, tenantadmin.PublishPolicyCommand{
+		TenantID: prefix + "-b", ExpectedRevision: 1, Policy: &nextPolicy,
+	}); !errors.Is(err, tenantadmin.ErrPolicyDenied) {
+		t.Fatalf("cross-Tenant policy error = %v", err)
+	}
+	platformReader := tenantadmin.ActorEnvelope{
+		Type: "human", ID: "platform-reader", Scopes: []string{tenantadmin.ScopePlatformRead},
+		RequestID: "request-platform-read", Reason: "authorization test",
+	}
+	if _, err := service.TransitionTenant(ctx, platformReader, "read-scope-transition-"+prefix, tenantadmin.TransitionTenantCommand{
+		TenantID: prefix + "-b", ExpectedRevision: 1, Target: access.TenantSuspended,
+	}); !errors.Is(err, tenantadmin.ErrPolicyDenied) {
+		t.Fatalf("read-only platform mutation error = %v", err)
+	}
+}
+
+func transitionForMatrix(
+	ctx context.Context,
+	service *tenantadmin.Service,
+	actor tenantadmin.ActorEnvelope,
+	tenantID string,
+	revision int64,
+	target access.TenantStatus,
+) (access.Tenant, error) {
+	result, err := service.TransitionTenant(ctx, actor, "setup-"+tenantID, tenantadmin.TransitionTenantCommand{
+		TenantID: tenantID, ExpectedRevision: revision, Target: target,
+	})
+	return result.Tenant, err
 }
 
 func adminIntegrationDatabase(t *testing.T) (*sql.DB, context.Context) {

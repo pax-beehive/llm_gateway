@@ -64,7 +64,8 @@ func (s *Service) ListTenants(ctx context.Context, actor ActorEnvelope, filter T
 		  AND ($5::text = '' OR home_region = $5)
 		  AND ($6::boolean OR status <> 'closed')
 		ORDER BY id
-		LIMIT $7`, cursor, filter.ID, filter.Slug, filter.Status, filter.HomeRegion, filter.IncludeClosed, filter.Limit+1)
+		LIMIT $7`, cursor, filter.ID, filter.Slug, filter.Status, filter.HomeRegion,
+		filter.IncludeClosed || filter.Status == access.TenantClosed, filter.Limit+1)
 	if err != nil {
 		return TenantPage{}, err
 	}
@@ -98,6 +99,9 @@ func (s *Service) ListTenantPolicyRevisions(
 	limit int,
 ) (PolicyRevisionPage, error) {
 	if err := authorizeTenantRead(actor, tenantID); err != nil {
+		return PolicyRevisionPage{}, err
+	}
+	if _, err := s.GetTenant(ctx, actor, tenantID); err != nil {
 		return PolicyRevisionPage{}, err
 	}
 	if limit == 0 {

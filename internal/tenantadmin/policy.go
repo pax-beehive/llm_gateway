@@ -40,7 +40,7 @@ func (s *Service) PublishTenantPolicy(
 			return MutationResult{}, err
 		}
 	}
-	requestHash, err := commandHash(command)
+	requestHash, err := commandHash(command, actor.Reason)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -76,7 +76,7 @@ func (s *Service) PublishTenantPolicy(
 			tenant_id, revision, policy, actor_type, actor_id, change_reason
 		) VALUES ($1,$2,$3,$4,$5,$6)`,
 		command.TenantID, nextRevision, payload, actor.Type, actor.ID, actor.Reason); err != nil {
-		return MutationResult{}, mapDatabaseError("publish Tenant Policy", err)
+		return MutationResult{}, mapDatabaseError("publish Tenant Policy", err, ErrRevisionConflict)
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE tenants
@@ -89,7 +89,14 @@ func (s *Service) PublishTenantPolicy(
 	if err := requireOneMutation(result); err != nil {
 		return MutationResult{}, err
 	}
-	return s.completeMutation(ctx, tx, actor, publishPolicyOperation, idempotencyKey, requestHash, command.TenantID, "TenantPolicyPublished")
+	extra := map[string]any{
+		"policy_revision_before": command.ExpectedRevision,
+		"policy_revision_after":  nextRevision,
+	}
+	if command.RestoreRevision != nil {
+		extra["restored_from_revision"] = *command.RestoreRevision
+	}
+	return s.completeMutation(ctx, tx, actor, publishPolicyOperation, idempotencyKey, requestHash, command.TenantID, "TenantPolicyPublished", extra)
 }
 
 func policyForPublication(

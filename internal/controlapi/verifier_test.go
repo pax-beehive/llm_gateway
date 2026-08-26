@@ -53,8 +53,16 @@ func TestRS256VerifierValidatesHumanIAMAssertion(t *testing.T) {
 }
 
 func signedToken(t *testing.T, key *rsa.PrivateKey, claims map[string]any) string {
+	return signedTokenWithKid(t, key, "", claims)
+}
+
+func signedTokenWithKid(t *testing.T, key *rsa.PrivateKey, kid string, claims map[string]any) string {
 	t.Helper()
-	header, err := json.Marshal(map[string]any{"alg": "RS256", "typ": "JWT"})
+	headerValue := map[string]any{"alg": "RS256", "typ": "JWT"}
+	if kid != "" {
+		headerValue["kid"] = kid
+	}
+	header, err := json.Marshal(headerValue)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -37,7 +37,7 @@ func (s *Service) UpdateTenant(
 			return MutationResult{}, err
 		}
 	}
-	requestHash, err := commandHash(command)
+	requestHash, err := commandHash(command, actor.Reason)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -79,7 +79,20 @@ func (s *Service) UpdateTenant(
 	if err := requireOneMutation(result); err != nil {
 		return MutationResult{}, err
 	}
-	return s.completeMutation(ctx, tx, actor, updateTenantOperation, idempotencyKey, requestHash, command.TenantID, "TenantProfileChanged")
+	changedFields := make([]string, 0, 2)
+	extra := map[string]any{}
+	if command.DisplayName != nil {
+		changedFields = append(changedFields, "display_name")
+		extra["display_name_before"] = current.DisplayName
+		extra["display_name_after"] = displayName
+	}
+	if command.Metadata != nil {
+		changedFields = append(changedFields, "metadata")
+		extra["metadata_digest_before"] = metadataDigest(current.Metadata)
+		extra["metadata_digest_after"] = metadataDigest(metadata)
+	}
+	extra["changed_fields"] = changedFields
+	return s.completeMutation(ctx, tx, actor, updateTenantOperation, idempotencyKey, requestHash, command.TenantID, "TenantProfileChanged", extra)
 }
 
 func (s *Service) TransitionTenant(
@@ -97,7 +110,7 @@ func (s *Service) TransitionTenant(
 	if command.ExpectedRevision <= 0 || !validTenantStatus(command.Target) {
 		return MutationResult{}, fmt.Errorf("%w: expected revision and valid target status are required", ErrInvalidArgument)
 	}
-	requestHash, err := commandHash(command)
+	requestHash, err := commandHash(command, actor.Reason)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -113,8 +126,11 @@ func (s *Service) TransitionTenant(
 	if err != nil {
 		return MutationResult{}, err
 	}
-	if current.Revision != command.ExpectedRevision || !allowedTransition(current.Status, command.Target) {
+	if current.Revision != command.ExpectedRevision {
 		return MutationResult{}, ErrRevisionConflict
+	}
+	if !allowedTransition(current.Status, command.Target) {
+		return MutationResult{}, ErrInvalidTransition
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE tenants
@@ -134,7 +150,10 @@ func (s *Service) TransitionTenant(
 	if err := requireOneMutation(result); err != nil {
 		return MutationResult{}, err
 	}
-	return s.completeMutation(ctx, tx, actor, transitionTenantOperation, idempotencyKey, requestHash, command.TenantID, "TenantStatusChanged")
+	return s.completeMutation(ctx, tx, actor, transitionTenantOperation, idempotencyKey, requestHash, command.TenantID, "TenantStatusChanged", map[string]any{
+		"status_before": current.Status,
+		"status_after":  command.Target,
+	})
 }
 
 func (s *Service) completeMutation(
@@ -144,12 +163,17 @@ func (s *Service) completeMutation(
 	operation, idempotencyKey string,
 	requestHash []byte,
 	tenantID, eventType string,
+	extra map[string]any,
 ) (MutationResult, error) {
 	tenant, err := getTenantTx(ctx, tx, tenantID)
 	if err != nil {
 		return MutationResult{}, err
 	}
-	if err := s.recordMutation(ctx, tx, actor, tenant, eventType, operation, tenantEventPayload(tenant)); err != nil {
+	payload := tenantEventPayload(tenant)
+	for key, value := range extra {
+		payload[key] = value
+	}
+	if err := s.recordMutation(ctx, tx, actor, tenant, eventType, operation, payload); err != nil {
 		return MutationResult{}, err
 	}
 	if err := recordCommandResult(ctx, tx, actor, operation, idempotencyKey, requestHash, tenant); err != nil {

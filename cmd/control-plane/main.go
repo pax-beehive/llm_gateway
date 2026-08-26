@@ -44,9 +44,10 @@ func run() error {
 			slog.Warn("OpenTelemetry shutdown failed", "error", err)
 		}
 	}()
-	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	devMode := os.Getenv("CONTROL_PLANE_DEV_MODE") == "true"
+	databaseURL := strings.TrimSpace(os.Getenv("CONTROL_PLANE_DATABASE_URL"))
 	if databaseURL == "" {
-		return errors.New("DATABASE_URL is required")
+		return errors.New("CONTROL_PLANE_DATABASE_URL is required")
 	}
 	database, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -61,7 +62,13 @@ func run() error {
 	if err := database.PingContext(connectCtx); err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
+	if err := assertDatabaseRole(connectCtx, database, devMode); err != nil {
+		return err
+	}
 	if os.Getenv("CONTROL_PLANE_MIGRATE") == "true" {
+		if !devMode {
+			return errors.New("CONTROL_PLANE_MIGRATE is development-only; production migrations require a separate deployment gate")
+		}
 		if err := store.NewPostgresResponseStore(database).Migrate(ctx); err != nil {
 			return fmt.Errorf("migrate shared schema: %w", err)
 		}
@@ -80,16 +87,6 @@ func run() error {
 	api := controlapi.New(controlapi.Config{Administration: administration, Verifier: verifier})
 	mux := http.NewServeMux()
 	mux.Handle("/", api)
-	mux.HandleFunc("GET /readyz", func(writer http.ResponseWriter, request *http.Request) {
-		readyCtx, cancel := context.WithTimeout(request.Context(), time.Second)
-		defer cancel()
-		if err := database.PingContext(readyCtx); err != nil {
-			http.Error(writer, `{"status":"not_ready"}`, http.StatusServiceUnavailable)
-			return
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte("{\"status\":\"ready\"}\n"))
-	})
 	address := envOr("CONTROL_PLANE_ADDR", ":8081")
 	server := &http.Server{
 		Addr: address, Handler: otelhttp.NewHandler(mux, "control-plane.http"),
@@ -131,23 +128,33 @@ func configureIdentityVerifier() (controlapi.IdentityVerifier, error) {
 			}, nil
 		}), nil
 	}
-	keyFile := strings.TrimSpace(os.Getenv("CONTROL_IAM_PUBLIC_KEY_FILE"))
+	jwksURL := strings.TrimSpace(os.Getenv("CONTROL_IAM_JWKS_URL"))
 	issuer := strings.TrimSpace(os.Getenv("CONTROL_IAM_ISSUER"))
 	audience := strings.TrimSpace(os.Getenv("CONTROL_IAM_AUDIENCE"))
-	if keyFile == "" || issuer == "" || audience == "" {
-		return nil, errors.New("CONTROL_IAM_PUBLIC_KEY_FILE, CONTROL_IAM_ISSUER, and CONTROL_IAM_AUDIENCE are required")
+	if jwksURL == "" || issuer == "" || audience == "" {
+		return nil, errors.New("CONTROL_IAM_JWKS_URL, CONTROL_IAM_ISSUER, and CONTROL_IAM_AUDIENCE are required")
 	}
-	payload, err := os.ReadFile(keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("read Human IAM public key: %w", err)
-	}
-	publicKey, err := controlapi.ParseRSAPublicKeyPEM(payload)
-	if err != nil {
-		return nil, err
-	}
-	return controlapi.NewRS256Verifier(controlapi.RS256VerifierConfig{
-		PublicKey: publicKey, Issuer: issuer, Audience: audience, ClockSkew: 30 * time.Second,
+	return controlapi.NewJWKSVerifier(controlapi.JWKSVerifierConfig{
+		URL: jwksURL, Issuer: issuer, Audience: audience, ClockSkew: 30 * time.Second,
 	})
+}
+
+func assertDatabaseRole(ctx context.Context, database *sql.DB, devMode bool) error {
+	if devMode {
+		return nil
+	}
+	expected := strings.TrimSpace(os.Getenv("CONTROL_PLANE_DB_ROLE"))
+	if expected == "" {
+		return errors.New("CONTROL_PLANE_DB_ROLE is required outside development mode")
+	}
+	var current string
+	if err := database.QueryRowContext(ctx, `SELECT current_user`).Scan(&current); err != nil {
+		return fmt.Errorf("inspect control-plane database role: %w", err)
+	}
+	if current != expected {
+		return fmt.Errorf("control-plane database role mismatch: connected as %q", current)
+	}
+	return nil
 }
 
 func envOr(name, fallback string) string {

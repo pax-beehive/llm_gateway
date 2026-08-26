@@ -76,6 +76,28 @@ GATEWAY_CACHE_PROTECTION_MODE=off
 GATEWAY_ROUTES_JSON=[...]
 ```
 
+The Tenant Administration control plane is a separate process and requires a
+separate runtime database role plus Human IAM JWKS verification:
+
+```text
+CONTROL_PLANE_DATABASE_URL=postgres://tenant_admin_runtime@...
+CONTROL_PLANE_DB_ROLE=tenant_admin_runtime
+CONTROL_IAM_JWKS_URL=https://iam.example/.well-known/jwks.json
+CONTROL_IAM_ISSUER=https://iam.example
+CONTROL_IAM_AUDIENCE=llm-gateway-control-plane
+```
+
+Run schema migration as a separate owner job, then apply least-privilege grants
+with `make configure-tenant-admin-roles ADMIN_DATABASE_URL=... TENANT_ADMIN_DB_ROLE=... GATEWAY_DB_ROLE=...`.
+The control-plane runtime refuses in-process production migration and verifies
+its connected role. The Gateway role receives only temporary read access to
+Tenant state; ADR 0004 replaces that adapter with a local Access Projection.
+`/healthz` is liveness only. Full dependency and backlog readiness is introduced
+by ADR 0008; this process does not claim readiness before those checks exist.
+Tenant mutations atomically append `control_outbox`; that is durable enqueue,
+not delivery proof. Relay, consumer receipts, lag, and repair surfaces are also
+implemented by ADR 0008 before physical database separation.
+
 In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. Keep `GATEWAY_API_KEY_PEPPER` stable and secret. Rotating it currently requires reissuing or explicitly reimporting keys.
 
 Environment key maps are only for an explicit, idempotent first bootstrap. A raw bootstrap key must contain at least 24 characters. After a successful bootstrap, remove the raw-key variables and disable the flag; subsequent replicas load access state only from PostgreSQL:

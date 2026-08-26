@@ -28,7 +28,7 @@ func TestDevelopmentIdentityVerifierRequiresExplicitModeAndToken(t *testing.T) {
 
 func TestProductionIdentityVerifierFailsClosedWithoutIAMConfiguration(t *testing.T) {
 	t.Setenv("CONTROL_PLANE_DEV_MODE", "false")
-	t.Setenv("CONTROL_IAM_PUBLIC_KEY_FILE", "")
+	t.Setenv("CONTROL_IAM_JWKS_URL", "")
 	t.Setenv("CONTROL_IAM_ISSUER", "")
 	t.Setenv("CONTROL_IAM_AUDIENCE", "")
 	if _, err := configureIdentityVerifier(); err == nil {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 )
 
 const createTenantOperation = "tenant.create"
+
+var resourceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
 
 type Service struct {
 	db  *sql.DB
@@ -56,7 +59,7 @@ func (s *Service) CreateTenant(
 	if command.InitialPolicy.Revision == 0 {
 		command.InitialPolicy.Revision = 1
 	}
-	requestHash, err := commandHash(command)
+	requestHash, err := commandHash(command, actor.Reason)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -89,7 +92,7 @@ func (s *Service) CreateTenant(
 		) VALUES ($1,$2,$3,'active',$4,1,1,$5,$6,1)`,
 		command.ID, command.Slug, command.DisplayName, command.HomeRegion, policyPayload, metadataPayload,
 	); err != nil {
-		return MutationResult{}, mapDatabaseError("create Tenant", err)
+		return MutationResult{}, mapDatabaseError("create Tenant", err, ErrAlreadyExists)
 	}
 	tenant, err := getTenantTx(ctx, tx, command.ID)
 	if err != nil {
@@ -226,7 +229,10 @@ func getTenantTx(ctx context.Context, tx *sql.Tx, tenantID string) (access.Tenan
 }
 
 func validateCreateCommand(command CreateTenantCommand) error {
-	if command.ID == "" || command.Slug == "" || strings.TrimSpace(command.DisplayName) == "" || command.HomeRegion == "" {
+	if !resourceIDPattern.MatchString(command.ID) || !resourceIDPattern.MatchString(command.Slug) {
+		return fmt.Errorf("%w: Tenant ID and slug must be URL-safe resource identifiers", ErrInvalidArgument)
+	}
+	if strings.TrimSpace(command.DisplayName) == "" || command.HomeRegion == "" {
 		return fmt.Errorf("%w: Tenant ID, slug, display name, and Home Region are required", ErrInvalidArgument)
 	}
 	if command.InitialPolicy.Revision != 0 && command.InitialPolicy.Revision != 1 {
@@ -298,8 +304,17 @@ func tenantEventPayload(tenant access.Tenant) map[string]any {
 	}
 }
 
-func commandHash(command any) ([]byte, error) {
-	payload, err := json.Marshal(command)
+func metadataDigest(metadata map[string]any) string {
+	payload, _ := metadataPayload(metadata)
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func commandHash(command any, reason string) ([]byte, error) {
+	payload, err := json.Marshal(struct {
+		Command any    `json:"command"`
+		Reason  string `json:"reason"`
+	}{Command: command, Reason: reason})
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode command: %v", ErrInvalidArgument, err)
 	}
@@ -316,10 +331,10 @@ func hasScope(actor ActorEnvelope, wanted string) bool {
 	return false
 }
 
-func mapDatabaseError(operation string, err error) error {
+func mapDatabaseError(operation string, err error, conflict error) error {
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
-		return fmt.Errorf("%w: %s", ErrRevisionConflict, operation)
+		return fmt.Errorf("%w: %s", conflict, operation)
 	}
 	return fmt.Errorf("%s: %w", operation, err)
 }

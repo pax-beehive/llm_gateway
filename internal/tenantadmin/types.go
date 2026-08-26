@@ -10,7 +10,9 @@ import (
 
 var (
 	ErrNotFound            = errors.New("tenant administration record not found")
+	ErrAlreadyExists       = errors.New("tenant administration record already exists")
 	ErrRevisionConflict    = errors.New("tenant administration revision conflict")
+	ErrInvalidTransition   = errors.New("tenant administration invalid lifecycle transition")
 	ErrIdempotencyConflict = errors.New("tenant administration idempotency conflict")
 	ErrPolicyDenied        = errors.New("tenant administration policy denied")
 	ErrInvalidArgument     = errors.New("tenant administration invalid argument")

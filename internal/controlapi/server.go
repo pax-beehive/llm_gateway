@@ -415,8 +415,12 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, tenantadmin.ErrNotFound):
 		writeAPIError(writer, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, tenantadmin.ErrAlreadyExists):
+		writeAPIError(writer, http.StatusConflict, "already_exists", err.Error())
 	case errors.Is(err, tenantadmin.ErrRevisionConflict):
 		writeAPIError(writer, http.StatusConflict, "revision_conflict", err.Error())
+	case errors.Is(err, tenantadmin.ErrInvalidTransition):
+		writeAPIError(writer, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, tenantadmin.ErrIdempotencyConflict):
 		writeAPIError(writer, http.StatusConflict, "idempotency_conflict", err.Error())
 	case errors.Is(err, tenantadmin.ErrPolicyDenied):

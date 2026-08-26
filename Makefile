@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev configure-tenant-admin-roles compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -11,7 +11,7 @@ test:
 test-race:
 	GOCACHE=$(GOCACHE) go test -race ./...
 
-test-integration:
+test-integration: test-tenant-admin-roles
 	@if [ -z "$(TEST_DATABASE_URL)" ]; then \
 		echo "TEST_DATABASE_URL is required; integration tests must not be skipped" >&2; \
 		exit 1; \
@@ -25,6 +25,10 @@ integration-up:
 
 test-integration-local: integration-up
 	TEST_DATABASE_URL='postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable' $(MAKE) test-integration
+
+test-tenant-admin-roles:
+	@test -n "$(TEST_DATABASE_URL)" || { echo "TEST_DATABASE_URL is required" >&2; exit 1; }
+	psql "$(TEST_DATABASE_URL)" -f tests/sql/tenant_admin_roles_test.sql
 
 test-openai-sdk-blackbox:
 	python3 tests/blackbox/openai_sdk.py
@@ -64,8 +68,17 @@ run-dev:
 run-control-plane-dev:
 	GOCACHE=$(GOCACHE) CONTROL_PLANE_DEV_MODE=true CONTROL_PLANE_MIGRATE=true \
 	CONTROL_PLANE_DEV_TOKEN="$${CONTROL_PLANE_TOKEN:-local-control-admin-token}" \
-	DATABASE_URL="$${DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
+	CONTROL_PLANE_DATABASE_URL="$${CONTROL_PLANE_DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
 	go run ./cmd/control-plane
+
+configure-tenant-admin-roles:
+	@test -n "$(ADMIN_DATABASE_URL)" || { echo "ADMIN_DATABASE_URL is required" >&2; exit 1; }
+	@test -n "$(TENANT_ADMIN_DB_ROLE)" || { echo "TENANT_ADMIN_DB_ROLE is required" >&2; exit 1; }
+	@test -n "$(GATEWAY_DB_ROLE)" || { echo "GATEWAY_DB_ROLE is required" >&2; exit 1; }
+	psql "$(ADMIN_DATABASE_URL)" \
+		-v tenant_admin_role="$(TENANT_ADMIN_DB_ROLE)" \
+		-v gateway_role="$(GATEWAY_DB_ROLE)" \
+		-f scripts/postgres/configure-tenant-admin-roles.sql
 
 compose-up:
 	docker compose up --build
