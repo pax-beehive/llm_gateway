@@ -135,6 +135,11 @@ func (s *PostgresService) CreateTenant(ctx context.Context, tenant Tenant, actor
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT
+		set_config('app.control_actor_type', $1, true),
+		set_config('app.control_actor_id', $2, true)`, actor.Type, actor.ID); err != nil {
+		return fmt.Errorf("set initial Tenant policy attribution: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tenants (
 			id, slug, display_name, status, home_region, execution_epoch,
@@ -145,17 +150,6 @@ func (s *PostgresService) CreateTenant(ctx context.Context, tenant Tenant, actor
 		tenant.Policy.Revision, policyPayload, metadata,
 	); err != nil {
 		return fmt.Errorf("create Tenant: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO tenant_policy_revisions (
-			tenant_id, revision, policy, actor_type, actor_id
-		) VALUES ($1,$2,$3,$4,$5)
-		ON CONFLICT (tenant_id, revision) DO UPDATE SET
-			actor_type = EXCLUDED.actor_type, actor_id = EXCLUDED.actor_id
-		WHERE tenant_policy_revisions.actor_type = 'compatibility'`,
-		tenant.ID, tenant.Policy.Revision, policyPayload, actor.Type, actor.ID,
-	); err != nil {
-		return fmt.Errorf("record Tenant policy: %w", err)
 	}
 	var matches bool
 	if err := tx.QueryRowContext(ctx, `

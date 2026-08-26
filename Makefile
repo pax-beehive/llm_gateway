@@ -1,9 +1,9 @@
-.PHONY: build test test-race test-integration test-integration-local test-openai-sdk-blackbox test-stage-a-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
 build:
-	GOCACHE=$(GOCACHE) go build ./cmd/llm-gateway
+	GOCACHE=$(GOCACHE) go build ./cmd/...
 
 test:
 	GOCACHE=$(GOCACHE) go test ./...
@@ -18,7 +18,7 @@ test-integration:
 	fi
 	GOCACHE=$(GOCACHE) go test -count=1 -p=1 -tags=integration \
 		./internal/access ./internal/store ./internal/configuration ./internal/cacheprotection \
-		./internal/quota ./internal/httpapi ./cmd/llm-gateway
+		./internal/quota ./internal/httpapi ./internal/tenantadmin ./cmd/llm-gateway
 
 integration-up:
 	docker compose up -d --wait postgres
@@ -31,6 +31,9 @@ test-openai-sdk-blackbox:
 
 test-stage-a-blackbox:
 	python3 tests/blackbox/stage_a.py
+
+test-tenant-admin-blackbox:
+	python3 tests/blackbox/tenant_admin.py
 
 test-codex-sandbox-blackbox:
 	bash tests/blackbox/codex_sandbox_multiturn.sh
@@ -57,6 +60,12 @@ run-dev:
 	GATEWAY_TENANT_HOME_REGIONS_JSON='{"tenant-dev":"local","tenant-other":"local"}' \
 	GATEWAY_DEV_ROUTE_TENANT_IDS_JSON='["tenant-dev"]' \
 	go run ./cmd/llm-gateway
+
+run-control-plane-dev:
+	GOCACHE=$(GOCACHE) CONTROL_PLANE_DEV_MODE=true CONTROL_PLANE_MIGRATE=true \
+	CONTROL_PLANE_DEV_TOKEN="$${CONTROL_PLANE_TOKEN:-local-control-admin-token}" \
+	DATABASE_URL="$${DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
+	go run ./cmd/control-plane
 
 compose-up:
 	docker compose up --build

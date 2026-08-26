@@ -66,8 +66,12 @@ BEGIN
     INSERT INTO tenant_policy_revisions (
         tenant_id, revision, policy, actor_type, actor_id, change_reason
     ) VALUES (
-        NEW.id, NEW.policy_revision, NEW.policy, 'compatibility', 'tenant-insert-trigger',
-        'initial policy for legacy Tenant insert'
+        NEW.id,
+        NEW.policy_revision,
+        NEW.policy,
+        COALESCE(NULLIF(current_setting('app.control_actor_type', true), ''), 'compatibility'),
+        COALESCE(NULLIF(current_setting('app.control_actor_id', true), ''), 'tenant-insert-trigger'),
+        COALESCE(NULLIF(current_setting('app.control_change_reason', true), ''), 'initial policy for legacy Tenant insert')
     ) ON CONFLICT (tenant_id, revision) DO NOTHING;
     RETURN NEW;
 END $$;
