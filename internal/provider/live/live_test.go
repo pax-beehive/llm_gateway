@@ -16,6 +16,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
 	"github.com/toddzheng/llm-gateway/internal/provider/modeldiscovery"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
+	"github.com/toddzheng/llm-gateway/internal/provider/openairesponses"
 )
 
 type liveProvider struct {
@@ -149,8 +150,8 @@ func configuredLiveProviders(t *testing.T) []liveProvider {
 		{
 			name: "OpenAI", provider: modeldiscovery.OpenAI, apiKey: os.Getenv("OPENAI_API_KEY"), discoveryBaseURL: "https://api.openai.com/v1",
 			newExecutor: func(t *testing.T, model string) provider.ResponseExecutor {
-				return mustOpenAICompatible(t, openaicompat.Config{
-					BaseURL: "https://api.openai.com/v1", APIKey: os.Getenv("OPENAI_API_KEY"), Model: model, Dialect: openaicompat.DialectOpenAI,
+				return mustOpenAIResponses(t, openairesponses.Config{
+					BaseURL: "https://api.openai.com/v1", APIKey: os.Getenv("OPENAI_API_KEY"), Model: model,
 				})
 			},
 		},
@@ -201,6 +202,15 @@ func (live liveProvider) discoverExecutor(t *testing.T, ctx context.Context) pro
 func mustOpenAICompatible(t *testing.T, config openaicompat.Config) provider.ResponseExecutor {
 	t.Helper()
 	executor, err := openaicompat.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return executor
+}
+
+func mustOpenAIResponses(t *testing.T, config openairesponses.Config) provider.ResponseExecutor {
+	t.Helper()
+	executor, err := openairesponses.New(config)
 	if err != nil {
 		t.Fatal(err)
 	}

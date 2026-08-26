@@ -14,7 +14,7 @@ var (
 	ErrConflict            = errors.New("response revision conflict")
 	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 	ErrConversationBusy    = errors.New("conversation already has an active response")
-	ErrQuotaExceeded       = errors.New("tenant concurrent Response quota exceeded")
+	ErrQuotaExceeded       = errors.New("quota exceeded")
 )
 
 type ResponseStore interface {

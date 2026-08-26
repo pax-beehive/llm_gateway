@@ -12,12 +12,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
+
+func TestAPIKeyPolicyCannotExpandTenantCacheProtectionAccess(t *testing.T) {
+	allowCache := true
+	principal := access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a", HomeRegion: "local", ExecutionEpoch: 1,
+		TenantPolicy: core.TenantPolicy{Revision: 1, AllowCacheProtection: &allowCache},
+		APIKeyPolicy: core.APIKeyPolicy{Revision: 1, AllowCacheProtection: false},
+	}
+	engine := runtime.NewWithOptions(
+		store.NewMemoryResponseStore(),
+		provider.NewStaticRouter(provider.NewEchoExecutor()),
+		runtime.Options{CacheProtectionMode: runtime.CacheProtectionShadowMode},
+	)
+	handler := httpapi.New(httpapi.Config{
+		Runtime: engine, Authenticator: principalAuthenticatorStub{Principal: principal}, LocalRegion: "local",
+	})
+
+	response := performJSON(t, handler, "persisted-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "echo-v1", "input": "hello",
+		"cache_protection": map[string]any{
+			"enabled": true, "max_spend_micros": 1000, "max_refreshes": 1,
+			"max_protection_window_seconds": 60,
+		},
+	})
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "API key policy") {
+		t.Fatalf("status/body = %d / %s, want API key policy rejection", response.Code, response.Body.String())
+	}
+}
+
+type principalAuthenticatorStub struct {
+	Principal access.Principal
+	Err       error
+}
+
+func (s principalAuthenticatorStub) Authenticate(context.Context, string) (access.Principal, error) {
+	return s.Principal, s.Err
+}
 
 func TestTenantCanCreateAndRetrieveResponse(t *testing.T) {
 	t.Parallel()
@@ -114,6 +152,65 @@ func TestTenantListsRoutablePublicModels(t *testing.T) {
 			t.Fatalf("model = %#v", model)
 		}
 	}
+}
+
+func TestCodexListsRoutableModels(t *testing.T) {
+	textProfile := codexCapabilityProfile()
+	router := provider.NewVersionedRouterAt(1, time.Unix(1_724_566_400, 0), []provider.Route{
+		{ID: "openai-fast", Provider: "openai", Model: "codex-model", HomeRegion: "us-west", Healthy: true, Profile: textProfile},
+	})
+	handler := httpapi.New(httpapi.Config{
+		Runtime:           runtime.New(store.NewMemoryResponseStore(), router),
+		ModelCatalog:      router,
+		Authenticator:     httpapi.StaticAuthenticator{"tenant-a-key": "tenant-a"},
+		TenantHomeRegions: map[string]string{"tenant-a": "us-west"},
+		LocalRegion:       "us-west",
+	})
+
+	response := performJSON(t, handler, "tenant-a-key", http.MethodGet, "/v1/models?client_version=1.2.3", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var catalog struct {
+		Models []struct {
+			Slug           string `json:"slug"`
+			ContextWindow  int    `json:"context_window"`
+			SupportedInAPI bool   `json:"supported_in_api"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1 || catalog.Models[0].Slug != "codex-model" || catalog.Models[0].ContextWindow == 0 || !catalog.Models[0].SupportedInAPI {
+		t.Fatalf("models = %#v", catalog.Models)
+	}
+}
+
+func TestCodexListsRoutableModelsByClientHeader(t *testing.T) {
+	textProfile := codexCapabilityProfile()
+	router := provider.NewVersionedRouterAt(1, time.Unix(1_724_566_400, 0), []provider.Route{
+		{ID: "openai-fast", Provider: "openai", Model: "codex-model", HomeRegion: "us-west", Healthy: true, Profile: textProfile},
+	})
+	handler := httpapi.New(httpapi.Config{
+		Runtime: runtime.New(store.NewMemoryResponseStore(), router), ModelCatalog: router,
+		Authenticator: httpapi.StaticAuthenticator{"tenant-a-key": "tenant-a"}, TenantHomeRegions: map[string]string{"tenant-a": "us-west"},
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer tenant-a-key")
+	request.Header.Set("Originator", "codex_cli_rs")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"models"`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func codexCapabilityProfile() provider.CapabilityProfile {
+	return provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{
+		"text": provider.CapabilityNative, "responses_native": provider.CapabilityNative,
+		"tools": provider.CapabilityNative, "reasoning": provider.CapabilityNative,
+	}}
 }
 
 func TestStatefulWriteIsForwardedToTenantHomeRegion(t *testing.T) {
@@ -388,6 +485,46 @@ func TestResponsesExposesCanonicalToolsAndSamplingFields(t *testing.T) {
 	}
 }
 
+func TestResponsesAcceptsCodexNativeFieldsAndToolShapes(t *testing.T) {
+	t.Parallel()
+	captured := make(chan core.Request, 1)
+	executor := captureExecutor{capture: captured, delegate: provider.NewEchoExecutor()}
+	handler := handlerForExecutor(executor)
+	response := performJSON(t, handler, "tenant-a-key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "gateway-model", "store": false,
+		"input": []any{
+			map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "work locally"}}},
+			map[string]any{"type": "function_call", "call_id": "old-call", "name": "exec_command", "arguments": `{"cmd":"pwd"}`},
+			map[string]any{"type": "function_call_output", "call_id": "old-call", "output": "/workspace"},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command", "parameters": map[string]any{"type": "object"}},
+			map[string]any{"type": "namespace", "name": "mcp", "tools": []any{}},
+			map[string]any{"type": "web_search", "external_web_access": false},
+		},
+		"tool_choice": "auto", "parallel_tool_calls": true,
+		"reasoning": map[string]any{"summary": "auto"}, "include": []string{"reasoning.encrypted_content"},
+		"prompt_cache_key": "thread-1", "client_metadata": map[string]any{"thread_id": "thread-1"},
+		"text": map[string]any{"verbosity": "low"}, "service_tier": "default", "truncation": "auto",
+		"max_tool_calls": 20, "safety_identifier": "tenant-user",
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	request := <-captured
+	if request.ParallelToolCalls == nil || !*request.ParallelToolCalls || request.PromptCacheKey != "thread-1" || request.MaxToolCalls == nil || *request.MaxToolCalls != 20 {
+		t.Fatalf("Codex request fields = %#v", request)
+	}
+	if len(request.Input) != 3 || request.Input[0].Role != "developer" || string(request.Input[1].Arguments) != `{"cmd":"pwd"}` {
+		t.Fatalf("Codex input = %#v", request.Input)
+	}
+	for _, feature := range []string{"text", "tools", "reasoning", "responses_native"} {
+		if !slices.Contains(request.RequestedFeatures, feature) {
+			t.Fatalf("requested features = %#v, missing %q", request.RequestedFeatures, feature)
+		}
+	}
+}
+
 func TestChatCompletionPreservesToolCallRoundTrip(t *testing.T) {
 	t.Parallel()
 	captured := make(chan core.Request, 1)
@@ -500,7 +637,8 @@ func handlerForExecutor(executor provider.ResponseExecutor) http.Handler {
 		Profile: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{
 			"text": provider.CapabilityNative, "streaming": provider.CapabilityNative,
 			"tools": provider.CapabilityNative, "sampling": provider.CapabilityNative, "multimodal": provider.CapabilityNative,
-			"end_user_id": provider.CapabilityNative,
+			"end_user_id": provider.CapabilityNative, "reasoning": provider.CapabilityNative,
+			"responses_native": provider.CapabilityNative,
 		}},
 		PriceSnapshot: core.PriceSnapshot{
 			ID: "test-price", Provider: "test-provider", Model: "provider-model", Region: "local",

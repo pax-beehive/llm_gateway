@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
@@ -25,6 +27,8 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
+	"github.com/toddzheng/llm-gateway/internal/provider/openairesponses"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
@@ -107,8 +111,8 @@ func run() error {
 		}
 	}()
 	apiKeys, err := parseStringMapEnv("GATEWAY_API_KEYS_JSON")
-	if err != nil || len(apiKeys) == 0 {
-		return fmt.Errorf("GATEWAY_API_KEYS_JSON: configure at least one token-to-tenant mapping: %w", err)
+	if err != nil {
+		return fmt.Errorf("GATEWAY_API_KEYS_JSON: %w", err)
 	}
 	homeRegions, err := parseStringMapEnv("GATEWAY_TENANT_HOME_REGIONS_JSON")
 	if err != nil {
@@ -133,17 +137,28 @@ func run() error {
 		return err
 	}
 	defer cleanup()
+	authenticator, err := configureAuthenticator(ctx, database, apiKeys, homeRegions, executionEpochs, tenantPolicies)
+	if err != nil {
+		return err
+	}
 	router, err := configureRouter(ctx, database)
 	if err != nil {
 		return err
 	}
 	var intentRepository cacheprotection.IntentRepository
+	var quotaController quota.Controller
 	if database != nil {
 		intentRepository = cacheprotection.NewPostgresIntentRepository(database)
+		quotaController = quota.NewPostgresController(database, time.Now)
 	} else {
 		intentRepository = cacheprotection.NewMemoryIntentRepository()
 	}
-	cacheCoordinator := cacheprotection.NewCoordinator(intentRepository, time.Now)
+	principalSource, _ := authenticator.(cachePrincipalSource)
+	var refreshBudget cacheprotection.RefreshBudget
+	if quotaController != nil && principalSource != nil {
+		refreshBudget = &refreshBudgetGate{principals: principalSource, quota: quotaController, now: time.Now}
+	}
+	cacheCoordinator := cacheprotection.NewCoordinatorWithBudget(intentRepository, time.Now, refreshBudget)
 	cacheProtectionMode, err := cacheProtectionModeFromEnv()
 	if err != nil {
 		return err
@@ -157,14 +172,18 @@ func run() error {
 		OnCacheError:        func(err error) { slog.Warn("cache protection degraded", "error", err) },
 		OnCoordinationError: func(err error) { slog.Warn("gateway coordination degraded", "error", err) },
 		CacheProtectionMode: cacheProtectionMode, CacheHoldoutPercent: holdoutPercent,
-		TenantPolicies: tenantPolicies,
+		TenantPolicies:  tenantPolicies,
+		QuotaController: quotaController,
 	})
 	if cacheProtectionMode != runtime.CacheProtectionOffMode {
-		go runCacheWorker(ctx, cacheCoordinator, router, tenantPolicies)
+		go runCacheWorker(ctx, cacheCoordinator, router, principalSource, tenantPolicies)
+	}
+	if quotaController != nil {
+		go runQuotaReconciliationWorker(ctx, quotaController)
 	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
 	handler := httpapi.New(httpapi.Config{
-		Runtime: engine, ModelCatalog: router, Authenticator: httpapi.StaticAuthenticator(apiKeys), TenantHomeRegions: homeRegions,
+		Runtime: engine, ModelCatalog: router, Authenticator: authenticator, TenantHomeRegions: homeRegions,
 		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
 	})
 
@@ -230,11 +249,104 @@ func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[
 			return nil, nil, func() {}, err
 		}
 	}
-	if err := ensureTenants(ctx, db, apiKeys, homeRegions, executionEpochs, tenantPolicies); err != nil {
-		cleanup()
-		return nil, nil, func() {}, err
-	}
 	return postgresStore, db, cleanup, nil
+}
+
+func configureAuthenticator(
+	ctx context.Context,
+	db *sql.DB,
+	apiKeys, homeRegions map[string]string,
+	executionEpochs map[string]int64,
+	tenantPolicies map[string]core.TenantPolicy,
+) (httpapi.Authenticator, error) {
+	if db == nil {
+		if len(apiKeys) == 0 {
+			return nil, errors.New("GATEWAY_API_KEYS_JSON must configure at least one development token")
+		}
+		return httpapi.StaticAuthenticator(apiKeys), nil
+	}
+	service, err := access.NewPostgresService(db, []byte(os.Getenv("GATEWAY_API_KEY_PEPPER")))
+	if err != nil {
+		return nil, fmt.Errorf("configure persistent API key authentication: %w", err)
+	}
+	if os.Getenv("GATEWAY_BOOTSTRAP_ACCESS") != "true" {
+		if len(apiKeys) > 0 {
+			return nil, errors.New("GATEWAY_API_KEYS_JSON is bootstrap input; set GATEWAY_BOOTSTRAP_ACCESS=true or remove it")
+		}
+		return service, nil
+	}
+	if len(apiKeys) == 0 {
+		return nil, errors.New("GATEWAY_BOOTSTRAP_ACCESS=true requires GATEWAY_API_KEYS_JSON")
+	}
+	apiKeyPolicies, err := parseAPIKeyPoliciesEnv("GATEWAY_API_KEY_POLICIES_JSON")
+	if err != nil {
+		return nil, fmt.Errorf("GATEWAY_API_KEY_POLICIES_JSON: %w", err)
+	}
+	apiKeyMetadata, err := parseAPIKeyMetadataEnv("GATEWAY_API_KEY_METADATA_JSON")
+	if err != nil {
+		return nil, fmt.Errorf("GATEWAY_API_KEY_METADATA_JSON: %w", err)
+	}
+	for rawKey := range apiKeyPolicies {
+		if _, exists := apiKeys[rawKey]; !exists {
+			return nil, errors.New("GATEWAY_API_KEY_POLICIES_JSON contains a key absent from GATEWAY_API_KEYS_JSON")
+		}
+	}
+	for rawKey := range apiKeyMetadata {
+		if _, exists := apiKeys[rawKey]; !exists {
+			return nil, errors.New("GATEWAY_API_KEY_METADATA_JSON contains a key absent from GATEWAY_API_KEYS_JSON")
+		}
+	}
+	tenantIDs := make([]string, 0, len(apiKeys))
+	seen := make(map[string]struct{})
+	for _, tenantID := range apiKeys {
+		if tenantID == "" {
+			return nil, errors.New("bootstrap API key has an empty Tenant ID")
+		}
+		if _, exists := seen[tenantID]; exists {
+			continue
+		}
+		seen[tenantID] = struct{}{}
+		tenantIDs = append(tenantIDs, tenantID)
+	}
+	slices.Sort(tenantIDs)
+	for _, tenantID := range tenantIDs {
+		homeRegion := homeRegions[tenantID]
+		if homeRegion == "" {
+			return nil, fmt.Errorf("Tenant %q has no configured Home Region", tenantID)
+		}
+		executionEpoch := executionEpochs[tenantID]
+		if executionEpoch == 0 {
+			executionEpoch = 1
+		}
+		policy := tenantPolicies[tenantID]
+		if policy.Revision == 0 {
+			policy.Revision = 1
+		}
+		if err := service.CreateTenant(ctx, access.Tenant{
+			ID: tenantID, Slug: tenantID, DisplayName: tenantID, Status: access.TenantActive,
+			HomeRegion: homeRegion, ExecutionEpoch: executionEpoch, Policy: policy,
+		}, access.ChangeActor{Type: "bootstrap", ID: "gateway-startup"}); err != nil {
+			return nil, fmt.Errorf("bootstrap Tenant %q: %w", tenantID, err)
+		}
+	}
+	rawKeys := make([]string, 0, len(apiKeys))
+	for rawKey := range apiKeys {
+		rawKeys = append(rawKeys, rawKey)
+	}
+	slices.Sort(rawKeys)
+	for _, rawKey := range rawKeys {
+		keyPolicy := apiKeyPolicies[rawKey]
+		if keyPolicy.Revision == 0 {
+			keyPolicy.Revision = 1
+		}
+		if _, err := service.ImportAPIKey(ctx, access.APIKeySpec{
+			TenantID: apiKeys[rawKey], Name: "gateway bootstrap key", RawKey: rawKey,
+			Policy: keyPolicy, Metadata: apiKeyMetadata[rawKey],
+		}); err != nil {
+			return nil, fmt.Errorf("bootstrap API key for Tenant %q: %w", apiKeys[rawKey], err)
+		}
+	}
+	return service, nil
 }
 
 func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRouter, error) {
@@ -431,6 +543,16 @@ func buildProviderComponentsWithHTTPClient(config routeConfig, httpClient *http.
 	if config.CacheRefresh != nil {
 		return nil, nil, nil, errors.New("proactive cache refresh is enabled only for conformance-tested direct Anthropic routes")
 	}
+	if config.Provider == "openai" {
+		executor, err := openairesponses.New(openairesponses.Config{
+			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
+			HTTPClient: httpClient, Headers: config.Headers,
+		})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return executor, nil, nil, nil
+	}
 
 	executor, err := openaicompat.New(openaicompat.Config{
 		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
@@ -460,6 +582,7 @@ func runCacheWorker(
 	ctx context.Context,
 	coordinator *cacheprotection.Coordinator,
 	router *provider.StaticRouter,
+	principalSource cachePrincipalSource,
 	tenantPolicies map[string]core.TenantPolicy,
 ) {
 	ticker := time.NewTicker(2 * time.Second)
@@ -470,7 +593,7 @@ func runCacheWorker(
 			return
 		case <-ticker.C:
 			_, err := coordinator.RunDue(ctx, 32, func(anchor provider.CacheAnchor) provider.CacheProtector {
-				return resolveCacheProtectorForTenant(router, tenantPolicies, anchor)
+				return resolveCacheProtectorForTenant(ctx, router, principalSource, tenantPolicies, anchor)
 			})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("cache protection worker iteration failed", "error", err)
@@ -479,11 +602,103 @@ func runCacheWorker(
 	}
 }
 
+type cachePrincipalSource interface {
+	LookupPrincipal(context.Context, string, string) (access.Principal, error)
+}
+
+type refreshBudgetGate struct {
+	principals cachePrincipalSource
+	quota      quota.Controller
+	now        func() time.Time
+}
+
+func (g *refreshBudgetGate) Reserve(ctx context.Context, intent cacheprotection.Intent) (cacheprotection.RefreshBudgetReservation, error) {
+	principal, err := g.principals.LookupPrincipal(ctx, intent.TenantID, intent.Anchor.APIKeyID)
+	if err != nil {
+		return cacheprotection.RefreshBudgetReservation{}, err
+	}
+	if principal.TenantPolicy.AllowCacheProtection == nil || !*principal.TenantPolicy.AllowCacheProtection ||
+		!principal.APIKeyPolicy.AllowCacheProtection {
+		return cacheprotection.RefreshBudgetReservation{}, errors.New("active refresh is disabled by current principal policy")
+	}
+	effective, err := quota.EffectiveLimits(principal.TenantPolicy.Limits, principal.APIKeyPolicy.Limits)
+	if err != nil {
+		return cacheprotection.RefreshBudgetReservation{}, err
+	}
+	if !quota.HasRefreshLimits(effective) {
+		return cacheprotection.RefreshBudgetReservation{}, nil
+	}
+	reservation, err := g.quota.ReserveRefresh(ctx, quota.RefreshReservationRequest{
+		TenantID: intent.TenantID, APIKeyID: intent.Anchor.APIKeyID, CacheRefreshIntentID: intent.ID,
+		TenantPolicyRevision: principal.TenantPolicy.Revision, APIKeyPolicyRevision: principal.APIKeyPolicy.Revision,
+		TenantLimits: principal.TenantPolicy.Limits, APIKeyLimits: principal.APIKeyPolicy.Limits,
+		ReservedSpendMicros: intent.Candidate.Economics.RefreshCostMicros,
+		Currency:            intent.Candidate.RefreshPriceSnapshot.Currency, ExpiresAt: g.now().UTC().Add(5 * time.Minute),
+	})
+	if err != nil {
+		return cacheprotection.RefreshBudgetReservation{}, err
+	}
+	return cacheprotection.RefreshBudgetReservation{ID: reservation.ID}, nil
+}
+
+func (g *refreshBudgetGate) Complete(ctx context.Context, reservation cacheprotection.RefreshBudgetReservation, intent cacheprotection.Intent, outcome error) error {
+	if reservation.ID == "" {
+		return nil
+	}
+	if outcome == nil {
+		return g.quota.Commit(ctx, reservation.ID, quota.ActualUsage{SpendMicros: cacheprotection.ActualRefreshCost(intent)})
+	}
+	if intent.ProviderResult.Status == "rejected" {
+		return g.quota.Release(ctx, reservation.ID)
+	}
+	// The provider may have performed the side effect. Preserve the reserved
+	// estimate as committed spend until financial evidence can correct it.
+	return g.quota.Uncertain(ctx, reservation.ID)
+}
+
+func runQuotaReconciliationWorker(ctx context.Context, controller quota.Controller) {
+	run := func() {
+		for {
+			settled, err := controller.Reconcile(ctx, 256)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Error("quota reconciliation failed", "error", err)
+				}
+				return
+			}
+			if settled < 256 {
+				return
+			}
+		}
+	}
+	run()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
 func resolveCacheProtectorForTenant(
+	ctx context.Context,
 	router *provider.StaticRouter,
+	principalSource cachePrincipalSource,
 	tenantPolicies map[string]core.TenantPolicy,
 	anchor provider.CacheAnchor,
 ) provider.CacheProtector {
+	if principalSource != nil {
+		principal, err := principalSource.LookupPrincipal(ctx, anchor.TenantID, anchor.APIKeyID)
+		if err != nil || principal.TenantPolicy.AllowCacheProtection == nil ||
+			!*principal.TenantPolicy.AllowCacheProtection || !principal.APIKeyPolicy.AllowCacheProtection {
+			return nil
+		}
+		return router.ResolveCacheProtector(anchor)
+	}
 	policy, configured := tenantPolicies[anchor.TenantID]
 	if !configured || policy.AllowCacheProtection == nil || !*policy.AllowCacheProtection {
 		return nil
@@ -531,56 +746,6 @@ func validNonNegativeCost(amount float64) bool {
 	return !math.IsNaN(amount) && !math.IsInf(amount, 0) && amount >= 0
 }
 
-func ensureTenants(ctx context.Context, db *sql.DB, apiKeys, homeRegions map[string]string, executionEpochs map[string]int64, tenantPolicies map[string]core.TenantPolicy) error {
-	seen := make(map[string]struct{})
-	for _, tenantID := range apiKeys {
-		if _, exists := seen[tenantID]; exists {
-			continue
-		}
-		seen[tenantID] = struct{}{}
-		homeRegion := homeRegions[tenantID]
-		if homeRegion == "" {
-			return fmt.Errorf("tenant %q has no configured home region", tenantID)
-		}
-		executionEpoch := executionEpochs[tenantID]
-		if executionEpoch == 0 {
-			executionEpoch = 1
-		}
-		if executionEpoch < 0 {
-			return fmt.Errorf("tenant %q has an invalid execution epoch", tenantID)
-		}
-		policy := tenantPolicies[tenantID]
-		if policy.Revision == 0 {
-			policy.Revision = 1
-		}
-		policyDocument := policy
-		policyDocument.Revision = 0
-		policyPayload, err := json.Marshal(policyDocument)
-		if err != nil {
-			return fmt.Errorf("encode tenant %q policy: %w", tenantID, err)
-		}
-		if _, err := db.ExecContext(ctx, `
-			INSERT INTO tenants (id, home_region, execution_epoch, policy_revision, policy) VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT (id) DO NOTHING`, tenantID, homeRegion, executionEpoch, policy.Revision, policyPayload); err != nil {
-			return fmt.Errorf("ensure tenant %q: %w", tenantID, err)
-		}
-		var storedRegion string
-		var storedEpoch, storedPolicyRevision int64
-		var policyMatches bool
-		if err := db.QueryRowContext(ctx, `
-			SELECT home_region, execution_epoch, policy_revision, policy = $2::jsonb
-			FROM tenants WHERE id = $1`, tenantID, policyPayload).Scan(
-			&storedRegion, &storedEpoch, &storedPolicyRevision, &policyMatches,
-		); err != nil {
-			return err
-		}
-		if storedRegion != homeRegion || storedEpoch != executionEpoch || storedPolicyRevision != policy.Revision || !policyMatches {
-			return fmt.Errorf("tenant %q configuration does not match durable home region, execution epoch, or policy revision", tenantID)
-		}
-	}
-	return nil
-}
-
 func parseInt64MapEnv(name string) (map[string]int64, error) {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -622,6 +787,45 @@ func parseTenantPoliciesEnv(name string) (map[string]core.TenantPolicy, error) {
 		if tenantID == "" || policy.Revision < 1 || policy.MaxConcurrentResponses < 0 || policy.MaxInputItems < 0 || policy.RetentionSeconds < 0 {
 			return nil, errors.New("tenant IDs must be non-empty, policy revisions positive, and quotas and retention non-negative")
 		}
+		if _, err := quota.EffectiveLimits(policy.Limits, core.QuotaLimits{}); err != nil {
+			return nil, fmt.Errorf("Tenant %q policy: %w", tenantID, err)
+		}
+	}
+	return result, nil
+}
+
+func parseAPIKeyPoliciesEnv(name string) (map[string]core.APIKeyPolicy, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return map[string]core.APIKeyPolicy{}, nil
+	}
+	var result map[string]core.APIKeyPolicy
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		return nil, err
+	}
+	for rawKey, policy := range result {
+		if rawKey == "" || policy.Revision < 0 {
+			return nil, errors.New("API key policy identities must be non-empty and revisions non-negative")
+		}
+		if policy.Revision == 0 {
+			policy.Revision = 1
+			result[rawKey] = policy
+		}
+		if _, err := quota.EffectiveLimits(core.QuotaLimits{}, policy.Limits); err != nil {
+			return nil, fmt.Errorf("API key policy: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func parseAPIKeyMetadataEnv(name string) (map[string]map[string]any, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return map[string]map[string]any{}, nil
+	}
+	var result map[string]map[string]any
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

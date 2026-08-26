@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-live-providers test-live-provider-tools integration-up integration-down vet run-dev compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-openai-sdk-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -16,13 +16,21 @@ test-integration:
 		echo "TEST_DATABASE_URL is required; integration tests must not be skipped" >&2; \
 		exit 1; \
 	fi
-	GOCACHE=$(GOCACHE) go test -count=1 -p=1 -tags=integration ./internal/store ./internal/configuration ./internal/cacheprotection
+	GOCACHE=$(GOCACHE) go test -count=1 -p=1 -tags=integration \
+		./internal/access ./internal/store ./internal/configuration ./internal/cacheprotection \
+		./internal/quota ./internal/httpapi ./cmd/llm-gateway
 
 integration-up:
 	docker compose up -d --wait postgres
 
 test-integration-local: integration-up
-	TEST_DATABASE_URL='postgres://gateway:gateway-dev-only@127.0.0.1:5432/llm_gateway?sslmode=disable' $(MAKE) test-integration
+	TEST_DATABASE_URL='postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable' $(MAKE) test-integration
+
+test-openai-sdk-blackbox:
+	python3 tests/blackbox/openai_sdk.py
+
+test-codex-sandbox-blackbox:
+	bash tests/blackbox/codex_sandbox_multiturn.sh
 
 test-live-providers:
 	@test -f .env || { echo ".env is required; copy .env.example and fill the four provider keys" >&2; exit 1; }

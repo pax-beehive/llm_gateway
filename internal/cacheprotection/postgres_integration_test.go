@@ -13,6 +13,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
@@ -38,9 +39,21 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, home_region) VALUES ($1, 'local')`, tenantID); err != nil {
 		t.Fatal(err)
 	}
+	accessService, err := access.NewPostgresService(db, []byte("integration-test-pepper"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := accessService.ImportAPIKey(ctx, access.APIKeySpec{
+		TenantID: tenantID, Name: "refresh sponsor", RawKey: "gw_test_refresh_" + tenantID,
+		Policy: core.APIKeyPolicy{Revision: 1, AllowCacheProtection: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	candidate := eligibleCandidate(now)
 	candidate.Lease.Anchor.TenantID = tenantID
+	candidate.Lease.Anchor.APIKeyID = key.ID
 	candidate.Lease.EstimatedExpiresAt = now.Add(5 * time.Minute)
 	candidate.Forecast.ExpectedAt = now.Add(30 * time.Minute)
 	candidate.HoldoutCohort = "treatment"
@@ -117,17 +130,27 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 		t.Fatalf("lease revision/fence/status = %d/%d/%s", revision, fencingToken, status)
 	}
 	var refreshAmount int64
+	var sponsorAPIKeyID string
 	var refreshProviderUsage []byte
 	var refreshUsageReliable bool
 	if err := db.QueryRowContext(ctx, `
-		SELECT amount::bigint, provider_usage, usage_reliable
+		SELECT amount::bigint, provider_usage, usage_reliable, api_key_id
 		FROM cache_refresh_usage_ledger
 		WHERE tenant_id = $1 AND cache_refresh_intent_id = $2`, tenantID, completed[0].ID,
-	).Scan(&refreshAmount, &refreshProviderUsage, &refreshUsageReliable); err != nil {
+	).Scan(&refreshAmount, &refreshProviderUsage, &refreshUsageReliable, &sponsorAPIKeyID); err != nil {
 		t.Fatal(err)
 	}
-	if refreshAmount != 1_250_000 || !refreshUsageReliable || string(refreshProviderUsage) != `{"cache_creation_input_tokens": 100000}` {
+	if refreshAmount != 1_250_000 || sponsorAPIKeyID != key.ID || !refreshUsageReliable || string(refreshProviderUsage) != `{"cache_creation_input_tokens": 100000}` {
 		t.Fatalf("refresh financial evidence = %d / %s", refreshAmount, refreshProviderUsage)
+	}
+	var refreshCount, refreshRollupAmount int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT refresh_count, amount_micros FROM api_key_refresh_usage_daily
+		WHERE tenant_id = $1 AND api_key_id = $2`, tenantID, key.ID).Scan(&refreshCount, &refreshRollupAmount); err != nil {
+		t.Fatal(err)
+	}
+	if refreshCount != 1 || refreshRollupAmount != refreshAmount {
+		t.Fatalf("refresh usage rollup = %d/%d", refreshCount, refreshRollupAmount)
 	}
 	requestObserver := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(6 * time.Minute) })
 	requestResult, err := requestObserver.CustomerRequest(ctx, candidate.Lease.Anchor)

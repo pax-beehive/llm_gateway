@@ -43,6 +43,25 @@ func TestVersionedRouterAtomicallyReplacesSnapshotsAndRejectsStaleUpdates(t *tes
 	}
 }
 
+func TestModelCatalogFiltersRequiredNativeFeatures(t *testing.T) {
+	t.Parallel()
+	native := route("native")
+	native.Model = "native-model"
+	native.Profile.Features["responses_native"] = provider.CapabilityNative
+	translated := route("translated")
+	translated.Model = "translated-model"
+	translated.Profile.Features["responses_native"] = provider.CapabilityTranslated
+	router := provider.NewVersionedRouter(1, []provider.Route{native, translated})
+
+	models, err := router.ListModels(context.Background(), provider.ModelCatalogQuery{RequiredFeatures: []string{"responses_native"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "native-model" {
+		t.Fatalf("models = %#v, want native-model", models)
+	}
+}
+
 func route(id string) provider.Route {
 	return provider.Route{
 		ID: id, Provider: "provider", Model: "model", Region: "local", HomeRegion: "local", Healthy: true,

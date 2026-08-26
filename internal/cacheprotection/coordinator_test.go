@@ -48,6 +48,29 @@ func TestAmbiguousRefreshIsRecordedUncertainAndNeverRetried(t *testing.T) {
 	}
 }
 
+func TestRefreshBudgetIsReservedBeforeProviderSideEffect(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	repository := cacheprotection.NewMemoryIntentRepository()
+	budget := &refreshBudgetStub{reserveErr: errors.New("hard refresh quota exceeded")}
+	coordinator := cacheprotection.NewCoordinatorWithBudget(repository, func() time.Time { return now }, budget)
+	var refreshCalls atomic.Int64
+	protector := cacheProtectorStub{
+		inspect: provider.CacheCapability{Supported: true},
+		refresh: func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error) {
+			refreshCalls.Add(1)
+			return provider.RefreshResult{Status: "succeeded"}, nil
+		},
+	}
+	intent, err := coordinator.Run(context.Background(), eligibleCandidate(now), protector)
+	if err == nil || intent.Status != cacheprotection.IntentRejected {
+		t.Fatalf("budget-denied intent/error = %#v / %v", intent, err)
+	}
+	if refreshCalls.Load() != 0 || budget.reserveCalls.Load() != 1 || budget.completeCalls.Load() != 0 {
+		t.Fatalf("refresh/reserve/complete calls = %d/%d/%d", refreshCalls.Load(), budget.reserveCalls.Load(), budget.completeCalls.Load())
+	}
+}
+
 func TestSuccessfulRefreshHydratesNextLeaseRevisionAndPolicyTotals(t *testing.T) {
 	t.Parallel()
 	clock := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
@@ -170,6 +193,22 @@ func eligibleCandidate(now time.Time) cacheprotection.Candidate {
 type cacheProtectorStub struct {
 	inspect provider.CacheCapability
 	refresh func(context.Context, provider.CacheAnchor) (provider.RefreshResult, error)
+}
+
+type refreshBudgetStub struct {
+	reserveErr    error
+	reserveCalls  atomic.Int64
+	completeCalls atomic.Int64
+}
+
+func (s *refreshBudgetStub) Reserve(context.Context, cacheprotection.Intent) (cacheprotection.RefreshBudgetReservation, error) {
+	s.reserveCalls.Add(1)
+	return cacheprotection.RefreshBudgetReservation{ID: "reservation-1"}, s.reserveErr
+}
+
+func (s *refreshBudgetStub) Complete(context.Context, cacheprotection.RefreshBudgetReservation, cacheprotection.Intent, error) error {
+	s.completeCalls.Add(1)
+	return nil
 }
 
 func (s cacheProtectorStub) Inspect(context.Context, provider.CacheAnchor) provider.CacheCapability {

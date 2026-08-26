@@ -9,12 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"sync"
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -44,6 +47,7 @@ type Runtime struct {
 	tenantPolicies      map[string]core.TenantPolicy
 	quotaLeaseTTL       time.Duration
 	quotaRenewInterval  time.Duration
+	quotaController     quota.Controller
 
 	mu       sync.Mutex
 	cancels  map[string]context.CancelFunc
@@ -61,6 +65,7 @@ type Options struct {
 	TenantPolicies      map[string]core.TenantPolicy
 	QuotaLeaseTTL       time.Duration
 	QuotaRenewInterval  time.Duration
+	QuotaController     quota.Controller
 }
 
 const (
@@ -116,6 +121,7 @@ func NewWithOptions(responseStore store.ResponseStore, router provider.Router, o
 		cacheProtectionMode: options.CacheProtectionMode, cacheHoldoutPercent: options.CacheHoldoutPercent,
 		tenantPolicies: cloneTenantPolicies(options.TenantPolicies),
 		quotaLeaseTTL:  options.QuotaLeaseTTL, quotaRenewInterval: options.QuotaRenewInterval,
+		quotaController: options.QuotaController,
 	}
 }
 
@@ -202,6 +208,16 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			request.PreferredRouteID = previous.Attempts[len(previous.Attempts)-1].RouteID
 		}
 	}
+	effectiveLimits, err := r.effectiveQuotaLimits(request)
+	if err != nil {
+		return core.Response{}, err
+	}
+	if err := quota.ApplyRequestLimits(&request, effectiveLimits); err != nil {
+		if errors.Is(err, quota.ErrExceeded) {
+			return core.Response{}, fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
+		}
+		return core.Response{}, err
+	}
 	now := r.now().UTC()
 	response := core.Response{
 		ID: newID("resp"), Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
@@ -214,7 +230,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		// A standalone Response is the root of any future Response Chain.
 		request.ExperimentIdentity = "chain:" + response.ID
 	}
-	if policy, exists := r.tenantPolicies[request.TenantID]; request.Store && exists && policy.RetentionSeconds > 0 {
+	if policy, exists := r.tenantPolicy(request); request.Store && exists && policy.RetentionSeconds > 0 {
 		expiresAt := now.Add(time.Duration(policy.RetentionSeconds) * time.Second).Unix()
 		response.ContentExpiresAt = &expiresAt
 	}
@@ -235,6 +251,55 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		}
 	} else if err := r.store.Create(ctx, request.TenantID, responseForPersistence(response)); err != nil {
 		return core.Response{}, fmt.Errorf("create response: %w", err)
+	}
+	routes, err := r.router.Candidates(ctx, request)
+	if err != nil {
+		return r.fail(context.WithoutCancel(ctx), request.TenantID, response, "route_not_found", err)
+	}
+	var reservation *quota.Reservation
+	reservationSettled := false
+	reservationUsagePersisted := false
+	providerSideEffectStarted := false
+	if r.quotaController != nil && request.APIKeyID != "" && quota.HasLimits(effectiveLimits) {
+		estimate, estimateErr := quota.EstimateRequest(request, routes, effectiveLimits)
+		if estimateErr != nil {
+			return r.fail(context.WithoutCancel(ctx), request.TenantID, response, "quota_configuration_error", estimateErr)
+		}
+		tenantPolicy, _ := r.tenantPolicy(request)
+		apiKeyPolicy := core.APIKeyPolicy{}
+		if request.APIKeyPolicy != nil {
+			apiKeyPolicy = *request.APIKeyPolicy
+		}
+		reserved, reserveErr := r.quotaController.Reserve(ctx, quota.ReservationRequest{
+			TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: response.ID,
+			TenantPolicyRevision: tenantPolicy.Revision, APIKeyPolicyRevision: apiKeyPolicy.Revision,
+			TenantLimits: tenantPolicy.Limits, APIKeyLimits: apiKeyPolicy.Limits,
+			Requests: 1, ReservedInputTokens: estimate.InputTokens, ReservedOutputTokens: estimate.OutputTokens,
+			ReservedSpendMicros: estimate.SpendMicros, Currency: estimate.Currency, ExpiresAt: now.Add(r.quotaLeaseTTL),
+		})
+		if reserveErr != nil {
+			if errors.Is(reserveErr, quota.ErrExceeded) {
+				reserveErr = fmt.Errorf("%w: %v", ErrQuotaExceeded, reserveErr)
+			}
+			return r.fail(context.WithoutCancel(ctx), request.TenantID, response, "quota_exceeded", reserveErr)
+		}
+		reservation = &reserved
+		defer func() {
+			if reservationSettled || reservationUsagePersisted {
+				return
+			}
+			settleCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var settleErr error
+			if providerSideEffectStarted {
+				settleErr = r.quotaController.Uncertain(settleCtx, reserved.ID)
+			} else {
+				settleErr = r.quotaController.Commit(settleCtx, reserved.ID, quota.ActualUsage{Requests: 1})
+			}
+			if settleErr != nil && r.coordinationError != nil {
+				r.coordinationError(fmt.Errorf("settle incomplete quota reservation: %w", settleErr))
+			}
+		}()
 	}
 	sequence := int64(0)
 	emitEvent := func(event core.Event) error {
@@ -259,11 +324,6 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		cancel()
 		r.clearCancel(response.ID)
 	}()
-
-	routes, err := r.router.Candidates(executionCtx, request)
-	if err != nil {
-		return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "route_not_found", err)
-	}
 
 	var lastErr error
 	for _, route := range routes {
@@ -291,6 +351,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		}
 		response.Attempts = append(response.Attempts, attempt)
 		protectedHit := r.observeCustomerRequest(executionCtx, request, route)
+		providerSideEffectStarted = true
 		stream, executeErr := route.Executor.Execute(executionCtx, request)
 		if executeErr != nil {
 			recordAttempt("request_error")
@@ -301,6 +362,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 
 		visible := false
 		providerCompleted := false
+		providerMessageDone := false
 		var outputText string
 		var providerUsage []byte
 		for {
@@ -346,12 +408,17 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 					return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "client_disconnected", err)
 				}
 			}
-			outputText += event.Delta
+			if event.Type == "response.output_text.delta" {
+				outputText += event.Delta
+			}
 			if event.Item != nil {
 				if event.Item.ID == "" {
 					event.Item.ID = newID("item")
 				}
-				response.Output = append(response.Output, *event.Item)
+				if event.Type == "response.output_item.done" {
+					response.Output = append(response.Output, *event.Item)
+					providerMessageDone = providerMessageDone || event.Item.Type == "message"
+				}
 			}
 			if event.Usage != nil {
 				response.Usage = *event.Usage
@@ -376,7 +443,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "stream_interrupted", lastErr)
 		}
 		recordAttempt("completed")
-		if outputText != "" {
+		if outputText != "" && !providerMessageDone {
 			response.Output = append(response.Output, outputMessage(outputText))
 		}
 		completed := r.now().UTC()
@@ -388,12 +455,15 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			providerUsage = []byte("{}")
 		}
 		usageRecord := core.UsageRecord{
-			ID: newID("usage"), TenantID: request.TenantID, ResponseID: response.ID,
+			ID: newID("usage"), TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: response.ID,
 			AttemptID: response.Attempts[len(response.Attempts)-1].ID, PriceSnapshot: route.PriceSnapshot,
 			ProviderUsage: providerUsage, Usage: response.Usage,
 			AmountMicros: calculateUsageAmount(response.Usage, route.PriceSnapshot), Currency: route.PriceSnapshot.Currency,
 			CacheUsageReliable: route.CacheUsageReliable, CreatedAt: completed,
 			HoldoutCohort: r.experimentCohort(request, route), ExperimentRevision: r.experimentRevision(route),
+		}
+		if reservation != nil {
+			usageRecord.QuotaReservationID = reservation.ID
 		}
 		if protectedHit != nil && route.CacheUsageReliable && response.Usage.CachedInputTokens > 0 {
 			usageRecord.ProtectedHit = protectedHit
@@ -412,6 +482,16 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		}
 		if persistErr != nil {
 			return core.Response{}, fmt.Errorf("persist completed response and usage: %w", persistErr)
+		}
+		reservationUsagePersisted = true
+		if reservation != nil {
+			if err := r.quotaController.Commit(context.WithoutCancel(executionCtx), reservation.ID, quota.ActualUsage{
+				Requests: 1, InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens,
+				SpendMicros: usageRecord.AmountMicros,
+			}); err != nil {
+				return core.Response{}, fmt.Errorf("commit quota usage: %w", err)
+			}
+			reservationSettled = true
 		}
 		response.Revision++
 		r.responses.Add(executionCtx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "completed")))
@@ -446,7 +526,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 }
 
 func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Context, func(), error) {
-	policy, configured := r.tenantPolicies[request.TenantID]
+	policy, configured := r.tenantPolicy(request)
 	if err := r.validateCacheProtectionAccess(request); err != nil {
 		return nil, nil, err
 	}
@@ -513,7 +593,7 @@ func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Cont
 }
 
 func (r *Runtime) validateCacheProtectionAccess(request core.Request) error {
-	policy, configured := r.tenantPolicies[request.TenantID]
+	policy, configured := r.tenantPolicy(request)
 	if request.CacheProtection != nil && request.CacheProtection.Enabled {
 		if r.cacheProtectionMode == CacheProtectionOffMode {
 			return fmt.Errorf("%w: disabled by gateway policy", ErrCacheProtectionNotAllowed)
@@ -521,12 +601,39 @@ func (r *Runtime) validateCacheProtectionAccess(request core.Request) error {
 		if !configured || policy.AllowCacheProtection == nil || !*policy.AllowCacheProtection {
 			return fmt.Errorf("%w: tenant policy does not allow Cache Protection", ErrCacheProtectionNotAllowed)
 		}
+		if request.APIKeyPolicy != nil && !request.APIKeyPolicy.AllowCacheProtection {
+			return fmt.Errorf("%w: API key policy does not allow Cache Protection", ErrCacheProtectionNotAllowed)
+		}
 		if request.CacheProtection.AllowContentInspection &&
 			(policy.AllowContentInspection == nil || !*policy.AllowContentInspection) {
 			return fmt.Errorf("%w: tenant policy forbids Cache Protection content inspection", ErrCacheProtectionNotAllowed)
 		}
+		if request.CacheProtection.AllowContentInspection && request.APIKeyPolicy != nil &&
+			!request.APIKeyPolicy.AllowContentInspection {
+			return fmt.Errorf("%w: API key policy forbids Cache Protection content inspection", ErrCacheProtectionNotAllowed)
+		}
 	}
 	return nil
+}
+
+func (r *Runtime) tenantPolicy(request core.Request) (core.TenantPolicy, bool) {
+	if request.TenantPolicy != nil {
+		return *request.TenantPolicy, true
+	}
+	policy, configured := r.tenantPolicies[request.TenantID]
+	return policy, configured
+}
+
+func (r *Runtime) effectiveQuotaLimits(request core.Request) (core.QuotaLimits, error) {
+	tenantPolicy, configured := r.tenantPolicy(request)
+	if !configured {
+		return core.QuotaLimits{}, nil
+	}
+	apiKeyLimits := core.QuotaLimits{}
+	if request.APIKeyPolicy != nil {
+		apiKeyLimits = request.APIKeyPolicy.Limits
+	}
+	return quota.EffectiveLimits(tenantPolicy.Limits, apiKeyLimits)
 }
 
 func cloneTenantPolicies(policies map[string]core.TenantPolicy) map[string]core.TenantPolicy {
@@ -550,14 +657,34 @@ func calculateUsageAmount(usage core.Usage, snapshot core.PriceSnapshot) int64 {
 	cached := min(max(usage.CachedInputTokens, 0), max(usage.InputTokens, 0))
 	cacheWrite := min(max(usage.CacheWriteInputTokens, 0), max(usage.InputTokens-cached, 0))
 	uncached := max(usage.InputTokens-cached-cacheWrite, 0)
-	return perMillionCost(uncached, snapshot.InputPerMillionMicros) +
-		perMillionCost(cached, snapshot.CachedInputPerMillionMicros) +
-		perMillionCost(cacheWrite, snapshot.CacheWritePerMillionMicros) +
-		perMillionCost(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros)
+	amount := int64(0)
+	for _, component := range []int64{
+		perMillionCost(uncached, snapshot.InputPerMillionMicros),
+		perMillionCost(cached, snapshot.CachedInputPerMillionMicros),
+		perMillionCost(cacheWrite, snapshot.CacheWritePerMillionMicros),
+		perMillionCost(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros),
+	} {
+		if amount > math.MaxInt64-component {
+			return math.MaxInt64
+		}
+		amount += component
+	}
+	return amount
 }
 
 func perMillionCost(tokens, rate int64) int64 {
-	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
+	if tokens <= 0 || rate <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(uint64(tokens), uint64(rate))
+	if hi >= 1_000_000 {
+		return math.MaxInt64
+	}
+	quotient, _ := bits.Div64(hi, lo, 1_000_000)
+	if quotient > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(quotient)
 }
 
 func (r *Runtime) observeCustomerRequest(ctx context.Context, request core.Request, route provider.Route) *core.ProtectedHitEvidence {
@@ -566,6 +693,7 @@ func (r *Runtime) observeCustomerRequest(ctx context.Context, request core.Reque
 	}
 	anchor, exists, err := route.CacheAnchorBuilder.CurrentCacheAnchor(ctx, request)
 	if err == nil && exists {
+		anchor.APIKeyID = request.APIKeyID
 		var result cacheprotection.CustomerRequestResult
 		result, err = r.cacheCoordinator.CustomerRequest(ctx, anchor)
 		if err == nil && result.ProtectedHitCandidate != nil {
@@ -600,6 +728,7 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 		}
 		return
 	}
+	observation.Anchor.APIKeyID = request.APIKeyID
 	now := r.now().UTC()
 	ttl := observation.EstimatedExpiresAt.Sub(now)
 	if ttl <= 0 {
@@ -848,7 +977,7 @@ func (r *Runtime) recv(ctx context.Context, stream provider.EventStream, emit fu
 
 func outputMessage(text string) core.Item {
 	return core.Item{
-		ID: newID("msg"), Type: "message", Role: "assistant",
+		ID: newID("msg"), Type: "message", Status: "completed", Role: "assistant",
 		Content: []core.Content{{Type: "output_text", Text: text}},
 	}
 }

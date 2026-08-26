@@ -3,16 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/access"
+	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
 func TestCacheProtectionModeDefaultsOff(t *testing.T) {
@@ -110,25 +115,115 @@ func TestPublishRoutesRejectsUnsupportedProviderBeforeDurablePublication(t *test
 func TestCacheWorkerResolverRequiresCurrentTenantPermission(t *testing.T) {
 	protector := cacheProtectorStub{}
 	anchor := provider.CacheAnchor{
-		TenantID: "tenant-a", RouteID: "anthropic-route", Provider: "anthropic",
+		TenantID: "tenant-a", APIKeyID: "key-a", RouteID: "anthropic-route", Provider: "anthropic",
 		Region: "local", CredentialScope: "tenant-primary",
 	}
 	router := provider.NewRouter(provider.Route{
 		ID: anchor.RouteID, Provider: anchor.Provider, Region: anchor.Region,
 		CredentialScope: anchor.CredentialScope, CacheProtector: protector,
 	})
-	if got := resolveCacheProtectorForTenant(router, nil, anchor); got != nil {
+	if got := resolveCacheProtectorForTenant(context.Background(), router, nil, nil, anchor); got != nil {
 		t.Fatal("Cache Protector resolved without explicit Tenant permission")
 	}
 	allowCache := true
 	policies := map[string]core.TenantPolicy{"tenant-a": {AllowCacheProtection: &allowCache}}
-	if got := resolveCacheProtectorForTenant(router, policies, anchor); got == nil {
+	if got := resolveCacheProtectorForTenant(context.Background(), router, nil, policies, anchor); got == nil {
 		t.Fatal("Cache Protector was not resolved for an explicitly permitted Tenant")
 	}
 	allowCache = false
-	if got := resolveCacheProtectorForTenant(router, policies, anchor); got != nil {
+	if got := resolveCacheProtectorForTenant(context.Background(), router, nil, policies, anchor); got != nil {
 		t.Fatal("Cache Protector resolved after Tenant permission was revoked")
 	}
+	allowCache = true
+	source := cachePrincipalSourceStub{principal: access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a",
+		TenantPolicy: core.TenantPolicy{AllowCacheProtection: &allowCache},
+		APIKeyPolicy: core.APIKeyPolicy{AllowCacheProtection: true},
+	}}
+	if got := resolveCacheProtectorForTenant(context.Background(), router, source, nil, anchor); got == nil {
+		t.Fatal("Cache Protector was not resolved for a currently permitted persisted principal")
+	}
+	source.principal.APIKeyPolicy.AllowCacheProtection = false
+	if got := resolveCacheProtectorForTenant(context.Background(), router, source, nil, anchor); got != nil {
+		t.Fatal("Cache Protector resolved after API key permission was revoked")
+	}
+	source.err = errors.New("database unavailable")
+	if got := resolveCacheProtectorForTenant(context.Background(), router, source, nil, anchor); got != nil {
+		t.Fatal("Cache Protector resolved when current principal could not be revalidated")
+	}
+}
+
+func TestRefreshBudgetGateReservesAgainstCurrentSponsorPolicyAndCommitsActualUsage(t *testing.T) {
+	allowCache := true
+	limit := int64(2_000_000)
+	principals := cachePrincipalSourceStub{principal: access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a",
+		TenantPolicy: core.TenantPolicy{Revision: 4, AllowCacheProtection: &allowCache,
+			Limits: core.QuotaLimits{RefreshMonthlySpendMicros: &limit, Currency: "USD"}},
+		APIKeyPolicy: core.APIKeyPolicy{Revision: 7, AllowCacheProtection: true,
+			Limits: core.QuotaLimits{RefreshMonthlySpendMicros: &limit, Currency: "USD"}},
+	}}
+	controller := &quotaControllerStub{}
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	gate := &refreshBudgetGate{principals: principals, quota: controller, now: func() time.Time { return now }}
+	intent := cacheprotection.Intent{
+		ID: "refresh-1", TenantID: "tenant-a", Anchor: provider.CacheAnchor{TenantID: "tenant-a", APIKeyID: "key-a"},
+		Candidate: cacheprotection.Candidate{
+			Economics:            cacheprotection.Economics{RefreshCostMicros: 1_500_000},
+			RefreshPriceSnapshot: core.PriceSnapshot{Currency: "USD", CacheWritePerMillionMicros: 10_000_000},
+		},
+		ProviderResult: provider.RefreshResult{Status: "succeeded", Usage: core.Usage{InputTokens: 100_000, CacheWriteInputTokens: 100_000}},
+	}
+	reservation, err := gate.Reserve(context.Background(), intent)
+	if err != nil || reservation.ID != "quota-refresh-1" {
+		t.Fatalf("refresh reservation = %#v / %v", reservation, err)
+	}
+	if controller.refreshRequest.CacheRefreshIntentID != intent.ID || controller.refreshRequest.APIKeyID != "key-a" ||
+		controller.refreshRequest.TenantPolicyRevision != 4 || controller.refreshRequest.APIKeyPolicyRevision != 7 {
+		t.Fatalf("refresh reservation request = %#v", controller.refreshRequest)
+	}
+	if err := gate.Complete(context.Background(), reservation, intent, nil); err != nil {
+		t.Fatal(err)
+	}
+	if controller.committedID != reservation.ID || controller.actual.SpendMicros != 1_000_000 {
+		t.Fatalf("refresh settlement = %q / %#v", controller.committedID, controller.actual)
+	}
+}
+
+type cachePrincipalSourceStub struct {
+	principal access.Principal
+	err       error
+}
+
+type quotaControllerStub struct {
+	refreshRequest quota.RefreshReservationRequest
+	committedID    string
+	actual         quota.ActualUsage
+}
+
+func (s *quotaControllerStub) Reserve(context.Context, quota.ReservationRequest) (quota.Reservation, error) {
+	return quota.Reservation{}, nil
+}
+
+func (s *quotaControllerStub) ReserveRefresh(_ context.Context, request quota.RefreshReservationRequest) (quota.Reservation, error) {
+	s.refreshRequest = request
+	return quota.Reservation{ID: "quota-refresh-1"}, nil
+}
+
+func (s *quotaControllerStub) Commit(_ context.Context, id string, actual quota.ActualUsage) error {
+	s.committedID = id
+	s.actual = actual
+	return nil
+}
+
+func (s *quotaControllerStub) Release(context.Context, string) error { return nil }
+
+func (s *quotaControllerStub) Uncertain(context.Context, string) error { return nil }
+
+func (s *quotaControllerStub) Reconcile(context.Context, int) (int, error) { return 0, nil }
+
+func (s cachePrincipalSourceStub) LookupPrincipal(context.Context, string, string) (access.Principal, error) {
+	return s.principal, s.err
 }
 
 func TestRoutesFromJSONAcceptsFirstReleaseProviders(t *testing.T) {
@@ -161,7 +256,7 @@ func TestBuildProviderComponentsWiresProductionDialect(t *testing.T) {
 		maxTokensField string
 		googleHeader   string
 	}{
-		{provider: "openai", maxTokensField: "max_completion_tokens"},
+		{provider: "openai", maxTokensField: "max_output_tokens"},
 		{provider: "deepseek", maxTokensField: "max_tokens"},
 		{provider: "gemini", maxTokensField: "max_completion_tokens", googleHeader: "llm-gateway/0.1.0"},
 	}

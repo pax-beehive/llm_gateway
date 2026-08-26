@@ -8,6 +8,30 @@ This context describes a multi-tenant MaaS gateway that gives China-originating 
 A customer organization whose credentials, policies, traffic, stored state, caches, and billing records are isolated from every other customer.
 _Avoid_: Account, client
 
+**Gateway API Key**:
+A revocable credential owned by one Tenant, with its own metadata, policy revision, expiry, and usage attribution identity.
+_Avoid_: Provider key, bearer token row
+
+**Authenticated Principal**:
+The current Tenant and Gateway API Key identity plus their current policy revisions, Home Region, and execution epoch established from a presented credential.
+_Avoid_: Tenant header, API key string
+
+**Limit Policy**:
+A revisioned set of request, rate, token, spend, and Cache Protection bounds; the effective bound is always the most restrictive Tenant and Gateway API Key value.
+_Avoid_: Billing config, soft warning
+
+**Quota Reservation**:
+A durable, expiring claim against an effective Limit Policy made before a Provider side effect and later settled using actual Usage Ledger evidence.
+_Avoid_: Usage estimate, rate-limit check
+
+**Usage Ledger**:
+The immutable financial fact for one Provider attempt or cache refresh, attributed to its Tenant and sponsoring Gateway API Key using the price snapshot in force at execution.
+_Avoid_: Usage counter, dashboard row
+
+**Usage Projection**:
+A rebuildable Tenant or Gateway API Key aggregation derived transactionally from Usage Ledger facts for reporting and quota operations.
+_Avoid_: Billing source of truth
+
 **Provider**:
 An upstream model vendor or inference platform that accepts model requests and reports usage.
 _Avoid_: Backend, vendor API
@@ -63,6 +87,10 @@ _Avoid_: Guaranteed cache entry
 **Cache Protection**:
 An opt-in policy that may spend a bounded amount to refresh an economically valuable Cache Lease before it expires.
 _Avoid_: Keepalive mode, infinite heartbeat
+
+**Refresh Sponsor**:
+The Gateway API Key whose authenticated request created a Cache Protection intent and whose current permission, refresh quota, and usage attribution govern that delayed refresh.
+_Avoid_: Cache owner, background Tenant
 
 **Continuation Forecast**:
 An estimate of whether and when a cache-compatible request will arrive, used to decide whether Cache Protection has positive expected value.

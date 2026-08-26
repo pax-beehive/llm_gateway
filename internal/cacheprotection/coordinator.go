@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
+	"math/bits"
 	"sync"
 	"time"
 
@@ -71,13 +73,30 @@ type CustomerRequestResult struct {
 type Coordinator struct {
 	repository IntentRepository
 	now        func() time.Time
+	budget     RefreshBudget
+}
+
+type RefreshBudgetReservation struct {
+	ID string
+}
+
+// RefreshBudget surrounds the external refresh side effect with a durable
+// budget reservation. Complete receives the durable intent update error too,
+// so implementations can fail closed when the provider outcome is uncertain.
+type RefreshBudget interface {
+	Reserve(context.Context, Intent) (RefreshBudgetReservation, error)
+	Complete(context.Context, RefreshBudgetReservation, Intent, error) error
 }
 
 func NewCoordinator(repository IntentRepository, now func() time.Time) *Coordinator {
+	return NewCoordinatorWithBudget(repository, now, nil)
+}
+
+func NewCoordinatorWithBudget(repository IntentRepository, now func() time.Time, budget RefreshBudget) *Coordinator {
 	if now == nil {
 		now = time.Now
 	}
-	return &Coordinator{repository: repository, now: now}
+	return &Coordinator{repository: repository, now: now, budget: budget}
 }
 
 func (c *Coordinator) Run(ctx context.Context, candidate Candidate, protector provider.CacheProtector) (Intent, error) {
@@ -207,19 +226,36 @@ func (c *Coordinator) execute(ctx context.Context, intent Intent, protector prov
 }
 
 func (c *Coordinator) executeClaimed(ctx context.Context, running Intent, protector provider.CacheProtector) (Intent, error) {
+	var budgetReservation RefreshBudgetReservation
+	if c.budget != nil {
+		var err error
+		budgetReservation, err = c.budget.Reserve(ctx, running)
+		if err != nil {
+			running.Error = "refresh budget denied: " + err.Error()
+			updated, updateErr := c.repository.Update(context.WithoutCancel(ctx), running, IntentRejected)
+			return updated, errors.Join(err, updateErr)
+		}
+	}
 	result, refreshErr := protector.Refresh(ctx, running.Anchor)
 	running.ProviderResult = result
 	running.UpdatedAt = c.now().UTC()
+	var updated Intent
+	var updateErr error
 	if refreshErr != nil {
 		running.Error = refreshErr.Error()
 		status := IntentUncertain
 		if result.Status == "rejected" {
 			status = IntentRejected
 		}
-		updated, updateErr := c.repository.Update(context.WithoutCancel(ctx), running, status)
-		return updated, errors.Join(refreshErr, updateErr)
+		updated, updateErr = c.repository.Update(context.WithoutCancel(ctx), running, status)
+	} else {
+		updated, updateErr = c.repository.Update(ctx, running, IntentSucceeded)
 	}
-	return c.repository.Update(ctx, running, IntentSucceeded)
+	if c.budget != nil {
+		budgetErr := c.budget.Complete(context.WithoutCancel(ctx), budgetReservation, running, errors.Join(refreshErr, updateErr))
+		return updated, errors.Join(refreshErr, updateErr, budgetErr)
+	}
+	return updated, errors.Join(refreshErr, updateErr)
 }
 
 func (c *Coordinator) CustomerRequest(ctx context.Context, anchor provider.CacheAnchor) (CustomerRequestResult, error) {
@@ -247,7 +283,7 @@ func (r *MemoryIntentRepository) CurrentLease(_ context.Context, tenantID, lease
 			lease.Revision++
 			lease.FencingToken++
 			lease.RefreshCount++
-			lease.SpentMicros += actualRefreshCost(intent)
+			lease.SpentMicros += ActualRefreshCost(intent)
 			lease.EstimatedExpiresAt = intent.ProviderResult.ExpiresAt
 		}
 		if !found || lease.Revision > current.Revision ||
@@ -342,7 +378,7 @@ func (r *MemoryIntentRepository) CustomerRequest(_ context.Context, anchor provi
 			result.ProtectedHitCandidate = &ProtectedHitCandidate{
 				CacheLeaseID: intent.CacheLeaseID, OriginalLeaseExpiresAt: intent.Candidate.Lease.EstimatedExpiresAt,
 				RefreshSucceededAt: intent.UpdatedAt, RefreshExpiresAt: intent.ProviderResult.ExpiresAt,
-				RefreshCostMicros:    actualRefreshCost(intent),
+				RefreshCostMicros:    ActualRefreshCost(intent),
 				RefreshUsageID:       intent.ID + "_usage",
 				RefreshProviderUsage: append(json.RawMessage(nil), intent.ProviderResult.ProviderUsage...),
 				HoldoutCohort:        intent.Candidate.HoldoutCohort,
@@ -354,7 +390,7 @@ func (r *MemoryIntentRepository) CustomerRequest(_ context.Context, anchor provi
 	return result, nil
 }
 
-func actualRefreshCost(intent Intent) int64 {
+func ActualRefreshCost(intent Intent) int64 {
 	usage := intent.ProviderResult.Usage
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.CachedInputTokens == 0 && usage.CacheWriteInputTokens == 0 {
 		return intent.Candidate.Economics.RefreshCostMicros
@@ -363,14 +399,34 @@ func actualRefreshCost(intent Intent) int64 {
 	cached := min(max(usage.CachedInputTokens, 0), max(usage.InputTokens, 0))
 	cacheWrite := min(max(usage.CacheWriteInputTokens, 0), max(usage.InputTokens-cached, 0))
 	uncached := max(usage.InputTokens-cached-cacheWrite, 0)
-	return refreshPerMillion(uncached, snapshot.InputPerMillionMicros) +
-		refreshPerMillion(cached, snapshot.CachedInputPerMillionMicros) +
-		refreshPerMillion(cacheWrite, snapshot.CacheWritePerMillionMicros) +
-		refreshPerMillion(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros)
+	amount := int64(0)
+	for _, component := range []int64{
+		refreshPerMillion(uncached, snapshot.InputPerMillionMicros),
+		refreshPerMillion(cached, snapshot.CachedInputPerMillionMicros),
+		refreshPerMillion(cacheWrite, snapshot.CacheWritePerMillionMicros),
+		refreshPerMillion(max(usage.OutputTokens, 0), snapshot.OutputPerMillionMicros),
+	} {
+		if amount > math.MaxInt64-component {
+			return math.MaxInt64
+		}
+		amount += component
+	}
+	return amount
 }
 
 func refreshPerMillion(tokens, rate int64) int64 {
-	return (tokens/1_000_000)*rate + (tokens%1_000_000)*rate/1_000_000
+	if tokens <= 0 || rate <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(uint64(tokens), uint64(rate))
+	if hi >= 1_000_000 {
+		return math.MaxInt64
+	}
+	quotient, _ := bits.Div64(hi, lo, 1_000_000)
+	if quotient > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(quotient)
 }
 
 func (r *MemoryIntentRepository) ClaimDue(_ context.Context, now time.Time, limit int) ([]Intent, error) {

@@ -11,9 +11,9 @@ services:
       timeout: 2s
       retries: 20
     ports:
-      - "5432:5432"
+      - "55433:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
 
   gateway:
     build: .
@@ -24,7 +24,9 @@ services:
       DATABASE_URL: postgres://gateway:gateway-dev-only@postgres:5432/llm_gateway?sslmode=disable
       GATEWAY_MIGRATE: "true"
       GATEWAY_DEV_ECHO: "true"
-      GATEWAY_API_KEYS_JSON: '{"dev-token":"tenant-dev"}'
+      GATEWAY_API_KEY_PEPPER: "gateway-local-pepper-change-me"
+      GATEWAY_BOOTSTRAP_ACCESS: "true"
+      GATEWAY_API_KEYS_JSON: '{"dev-token-llm-gateway-local":"tenant-dev"}'
       GATEWAY_TENANT_HOME_REGIONS_JSON: '{"tenant-dev":"local"}'
     ports:
       - "8080:8080"

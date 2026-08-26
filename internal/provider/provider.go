@@ -24,6 +24,7 @@ type ResponseExecutor interface {
 
 type CacheAnchor struct {
 	TenantID         string
+	APIKeyID         string
 	RouteID          string
 	Provider         string
 	Model            string
@@ -101,8 +102,9 @@ type Router interface {
 }
 
 type ModelCatalogQuery struct {
-	TenantID   string
-	HomeRegion string
+	TenantID         string
+	HomeRegion       string
+	RequiredFeatures []string
 }
 
 type ModelCatalogEntry struct {
@@ -194,6 +196,16 @@ func (r *StaticRouter) ListModels(_ context.Context, query ModelCatalogQuery) ([
 	models := make(map[string]struct{})
 	for _, route := range snapshot.routes {
 		if !route.Healthy || route.Model == "" || route.Profile.Features["text"] != CapabilityNative {
+			continue
+		}
+		compatible := true
+		for _, feature := range query.RequiredFeatures {
+			if route.Profile.Features[feature] != CapabilityNative {
+				compatible = false
+				break
+			}
+		}
+		if !compatible {
 			continue
 		}
 		if query.HomeRegion != "" && route.HomeRegion != "" && route.HomeRegion != query.HomeRegion {

@@ -46,6 +46,21 @@ var experimentEvidenceMigration string
 //go:embed migrations/000011_cache_refresh_continuation_budget.sql
 var cacheRefreshContinuationBudgetMigration string
 
+//go:embed migrations/000012_access_control.sql
+var accessControlMigration string
+
+//go:embed migrations/000013_usage_principal.sql
+var usagePrincipalMigration string
+
+//go:embed migrations/000014_quota_reservations.sql
+var quotaReservationsMigration string
+
+//go:embed migrations/000015_usage_rollups.sql
+var usageRollupsMigration string
+
+//go:embed migrations/000016_refresh_principal_and_quota_reconciliation.sql
+var refreshPrincipalAndQuotaReconciliationMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -87,6 +102,21 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, cacheRefreshContinuationBudgetMigration); err != nil {
 		return fmt.Errorf("migrate cache refresh continuation budget: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, accessControlMigration); err != nil {
+		return fmt.Errorf("migrate access control: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, usagePrincipalMigration); err != nil {
+		return fmt.Errorf("migrate usage principal: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, quotaReservationsMigration); err != nil {
+		return fmt.Errorf("migrate quota reservations: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, usageRollupsMigration); err != nil {
+		return fmt.Errorf("migrate usage rollups: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, refreshPrincipalAndQuotaReconciliationMigration); err != nil {
+		return fmt.Errorf("migrate refresh principal and quota reconciliation: %w", err)
 	}
 	return nil
 }
@@ -507,14 +537,17 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO usage_ledger (
-			id, tenant_id, response_id, attempt_id, price_snapshot_id, provider_usage,
+			id, tenant_id, api_key_id, quota_reservation_id, response_id, attempt_id, price_snapshot_id, provider_usage,
 			input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, amount, currency, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		usage.ID, tenantID, response.ID, usage.AttemptID, usage.PriceSnapshot.ID, providerUsage,
+		) VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		usage.ID, tenantID, usage.APIKeyID, usage.QuotaReservationID, response.ID, usage.AttemptID, usage.PriceSnapshot.ID, providerUsage,
 		usage.Usage.InputTokens, usage.Usage.CachedInputTokens, usage.Usage.CacheWriteInputTokens, usage.Usage.OutputTokens,
 		usage.AmountMicros, usage.Currency, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert immutable usage: %w", err)
+	}
+	if err := insertUsageRollups(ctx, tx, tenantID, usage); err != nil {
+		return err
 	}
 	grossSaving, attribution := observedDiscount(usage)
 	if _, err := tx.ExecContext(ctx, `
@@ -559,6 +592,100 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 		return err
 	}
 	return tx.Commit()
+}
+
+type DailyUsage struct {
+	Date                  time.Time
+	Provider              string
+	Model                 string
+	Currency              string
+	ResponseCount         int64
+	InputTokens           int64
+	CachedInputTokens     int64
+	CacheWriteInputTokens int64
+	OutputTokens          int64
+	AmountMicros          int64
+}
+
+func (s *PostgresResponseStore) APIKeyDailyUsage(
+	ctx context.Context,
+	tenantID, apiKeyID string,
+	from, through time.Time,
+) ([]DailyUsage, error) {
+	if tenantID == "" || apiKeyID == "" {
+		return nil, errors.New("API key usage requires Tenant and API key identities")
+	}
+	from = from.UTC()
+	through = through.UTC()
+	if through.Before(from) {
+		return nil, errors.New("usage range end precedes start")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT usage_date, provider, model, currency, response_count,
+		       input_tokens, cached_input_tokens, cache_write_input_tokens,
+		       output_tokens, amount_micros
+		FROM api_key_usage_daily
+		WHERE tenant_id = $1 AND api_key_id = $2
+		  AND usage_date >= $3::date AND usage_date <= $4::date
+		ORDER BY usage_date, provider, model, currency`, tenantID, apiKeyID, from, through)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []DailyUsage
+	for rows.Next() {
+		var usage DailyUsage
+		if err := rows.Scan(
+			&usage.Date, &usage.Provider, &usage.Model, &usage.Currency, &usage.ResponseCount,
+			&usage.InputTokens, &usage.CachedInputTokens, &usage.CacheWriteInputTokens,
+			&usage.OutputTokens, &usage.AmountMicros,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, usage)
+	}
+	return result, rows.Err()
+}
+
+func insertUsageRollups(ctx context.Context, tx *sql.Tx, tenantID string, usage core.UsageRecord) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO tenant_usage_daily (
+			usage_date, tenant_id, provider, model, currency, response_count,
+			input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, amount_micros
+		) VALUES (($1 AT TIME ZONE 'UTC')::date,$2,$3,$4,$5,1,$6,$7,$8,$9,$10)
+		ON CONFLICT (usage_date, tenant_id, provider, model, currency) DO UPDATE SET
+			response_count = tenant_usage_daily.response_count + 1,
+			input_tokens = tenant_usage_daily.input_tokens + EXCLUDED.input_tokens,
+			cached_input_tokens = tenant_usage_daily.cached_input_tokens + EXCLUDED.cached_input_tokens,
+			cache_write_input_tokens = tenant_usage_daily.cache_write_input_tokens + EXCLUDED.cache_write_input_tokens,
+			output_tokens = tenant_usage_daily.output_tokens + EXCLUDED.output_tokens,
+			amount_micros = tenant_usage_daily.amount_micros + EXCLUDED.amount_micros,
+			updated_at = now()`, usage.CreatedAt, tenantID, usage.PriceSnapshot.Provider, usage.PriceSnapshot.Model,
+		usage.Currency, usage.Usage.InputTokens, usage.Usage.CachedInputTokens,
+		usage.Usage.CacheWriteInputTokens, usage.Usage.OutputTokens, usage.AmountMicros); err != nil {
+		return fmt.Errorf("update Tenant usage rollup: %w", err)
+	}
+	if usage.APIKeyID == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO api_key_usage_daily (
+			usage_date, tenant_id, api_key_id, provider, model, currency, response_count,
+			input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, amount_micros
+		) VALUES (($1 AT TIME ZONE 'UTC')::date,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11)
+		ON CONFLICT (usage_date, tenant_id, api_key_id, provider, model, currency) DO UPDATE SET
+			response_count = api_key_usage_daily.response_count + 1,
+			input_tokens = api_key_usage_daily.input_tokens + EXCLUDED.input_tokens,
+			cached_input_tokens = api_key_usage_daily.cached_input_tokens + EXCLUDED.cached_input_tokens,
+			cache_write_input_tokens = api_key_usage_daily.cache_write_input_tokens + EXCLUDED.cache_write_input_tokens,
+			output_tokens = api_key_usage_daily.output_tokens + EXCLUDED.output_tokens,
+			amount_micros = api_key_usage_daily.amount_micros + EXCLUDED.amount_micros,
+			updated_at = now()`, usage.CreatedAt, tenantID, usage.APIKeyID, usage.PriceSnapshot.Provider,
+		usage.PriceSnapshot.Model, usage.Currency, usage.Usage.InputTokens, usage.Usage.CachedInputTokens,
+		usage.Usage.CacheWriteInputTokens, usage.Usage.OutputTokens, usage.AmountMicros); err != nil {
+		return fmt.Errorf("update API key usage rollup: %w", err)
+	}
+	return nil
 }
 
 func insertExperimentEvidence(ctx context.Context, tx *sql.Tx, tenantID, responseID string, usage core.UsageRecord, providerUsage json.RawMessage) error {
@@ -949,7 +1076,7 @@ func lockConversation(ctx context.Context, tx *sql.Tx, tenantID, conversationID 
 	var metadata []byte
 	err := tx.QueryRowContext(ctx, `
 		SELECT c.id, extract(epoch FROM c.created_at)::bigint, c.home_region, c.execution_epoch, c.revision,
-		       COALESCE(active_response_id, ''), metadata
+		       COALESCE(c.active_response_id, ''), c.metadata
 		FROM conversations c
 		JOIN tenants t ON t.id = c.tenant_id AND t.home_region = c.home_region AND t.execution_epoch = c.execution_epoch
 		WHERE c.tenant_id = $1 AND c.id = $2 AND c.deleted_at IS NULL

@@ -132,7 +132,7 @@ func (a *Adapter) CurrentCacheAnchor(_ context.Context, request core.Request) (p
 	if err != nil {
 		return provider.CacheAnchor{}, false, err
 	}
-	anchor, err := a.anchor(request.TenantID, payload)
+	anchor, err := a.anchor(request.TenantID, request.APIKeyID, payload)
 	return anchor, err == nil, err
 }
 
@@ -152,7 +152,7 @@ func (a *Adapter) BuildCacheAnchor(_ context.Context, request core.Request, resp
 	if err != nil {
 		return provider.CacheObservation{}, err
 	}
-	anchor, err := a.anchor(request.TenantID, payload)
+	anchor, err := a.anchor(request.TenantID, request.APIKeyID, payload)
 	if err != nil {
 		return provider.CacheObservation{}, err
 	}
@@ -162,7 +162,7 @@ func (a *Adapter) BuildCacheAnchor(_ context.Context, request core.Request, resp
 	}, nil
 }
 
-func (a *Adapter) anchor(tenantID string, payload map[string]any) (provider.CacheAnchor, error) {
+func (a *Adapter) anchor(tenantID, apiKeyID string, payload map[string]any) (provider.CacheAnchor, error) {
 	serialized, err := json.Marshal(payload)
 	if err != nil {
 		return provider.CacheAnchor{}, err
@@ -170,7 +170,7 @@ func (a *Adapter) anchor(tenantID string, payload map[string]any) (provider.Cach
 	digest := sha256.Sum256(serialized)
 	hash := hex.EncodeToString(digest[:])
 	return provider.CacheAnchor{
-		TenantID: tenantID, RouteID: a.routeID, Provider: "anthropic", Model: a.model,
+		TenantID: tenantID, APIKeyID: apiKeyID, RouteID: a.routeID, Provider: "anthropic", Model: a.model,
 		CredentialScope: a.credentialScope, Region: a.region, CacheKey: hash[:32],
 		PrefixHash: "sha256:" + hash, SerializedPrefix: serialized,
 	}, nil

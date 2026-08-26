@@ -10,9 +10,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
@@ -20,23 +22,20 @@ import (
 )
 
 type Authenticator interface {
-	Authenticate(*http.Request) (string, error)
+	Authenticate(context.Context, string) (access.Principal, error)
 }
 
 type StaticAuthenticator map[string]string
 
-func (a StaticAuthenticator) Authenticate(request *http.Request) (string, error) {
-	value := request.Header.Get("Authorization")
-	token, ok := strings.CutPrefix(value, "Bearer ")
-	if !ok || token == "" {
-		return "", errors.New("missing bearer token")
-	}
+func (a StaticAuthenticator) Authenticate(_ context.Context, token string) (access.Principal, error) {
 	tenantID, ok := a[token]
 	if !ok || tenantID == "" {
-		return "", errors.New("invalid bearer token")
+		return access.Principal{}, errors.New("invalid bearer token")
 	}
-	return tenantID, nil
+	return access.Principal{TenantID: tenantID}, nil
 }
+
+type principalContextKey struct{}
 
 type Config struct {
 	Runtime               *runtime.Runtime
@@ -93,9 +92,12 @@ func (s *Server) listModels(responseWriter http.ResponseWriter, request *http.Re
 		writeError(responseWriter, http.StatusServiceUnavailable, "model_catalog_unavailable", "model catalog is unavailable", "")
 		return
 	}
-	models, err := s.modelCatalog.ListModels(request.Context(), provider.ModelCatalogQuery{
-		TenantID: tenantID(request), HomeRegion: s.homeRegion(request),
-	})
+	codexRequest := isCodexModelRequest(request)
+	query := provider.ModelCatalogQuery{TenantID: tenantID(request), HomeRegion: s.homeRegion(request)}
+	if codexRequest {
+		query.RequiredFeatures = []string{"responses_native", "tools", "reasoning"}
+	}
+	models, err := s.modelCatalog.ListModels(request.Context(), query)
 	if err != nil {
 		writeError(responseWriter, http.StatusServiceUnavailable, "model_catalog_unavailable", err.Error(), "")
 		return
@@ -110,7 +112,64 @@ func (s *Server) listModels(responseWriter http.ResponseWriter, request *http.Re
 	for _, model := range models {
 		data = append(data, modelObject{ID: model.ID, Object: "model", Created: model.Created, OwnedBy: "gateway"})
 	}
+	// Codex asks the same endpoint for richer model metadata and identifies
+	// itself through a query parameter or client header. Keep the default
+	// response OpenAI SDK compatible while exposing the custom-provider shape.
+	if codexRequest {
+		codexModels := make([]map[string]any, 0, len(models))
+		for index, model := range models {
+			codexModels = append(codexModels, codexModelObject(model.ID, index+1))
+		}
+		writeJSON(responseWriter, http.StatusOK, map[string]any{"models": codexModels})
+		return
+	}
 	writeJSON(responseWriter, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+func isCodexModelRequest(request *http.Request) bool {
+	if request.URL.Query().Has("client_version") {
+		return true
+	}
+	clientMarkers := request.UserAgent() + " " + request.Header.Get("Originator") + " " + request.Header.Get("X-OpenAI-Client-User-Agent")
+	return strings.Contains(strings.ToLower(clientMarkers), "codex")
+}
+
+func codexModelObject(modelID string, priority int) map[string]any {
+	return map[string]any{
+		"slug":                              modelID,
+		"display_name":                      modelID,
+		"description":                       "Model routed by LLM Gateway.",
+		"model_messages":                    map[string]string{"instructions_template": "You are Codex, an agentic coding assistant. Follow developer and user instructions. Use the provided tools to inspect and modify the workspace, and continue until the task is complete."},
+		"default_reasoning_level":           "low",
+		"supported_reasoning_levels":        []map[string]string{{"effort": "low", "description": "Low reasoning effort"}},
+		"shell_type":                        "shell_command",
+		"visibility":                        "list",
+		"supported_in_api":                  true,
+		"priority":                          priority,
+		"context_window":                    200000,
+		"max_context_window":                200000,
+		"effective_context_window_percent":  95,
+		"input_modalities":                  []string{"text", "image"},
+		"supports_search_tool":              false,
+		"supports_image_detail_original":    false,
+		"support_verbosity":                 false,
+		"default_verbosity":                 "low",
+		"default_reasoning_summary":         "none",
+		"apply_patch_tool_type":             "freeform",
+		"web_search_tool_type":              "text",
+		"tool_mode":                         "default",
+		"use_responses_lite":                false,
+		"node_repl_auto_review_required":    false,
+		"node_repl_disabled":                true,
+		"experimental_supported_tools":      []string{},
+		"additional_speed_tiers":            []string{},
+		"service_tiers":                     []any{},
+		"include_apps_usage_instructions":   false,
+		"include_plugin_usage_instructions": false,
+		"include_skills_usage_instructions": false,
+		"multi_agent_version":               "v1",
+		"truncation_policy":                 map[string]any{"mode": "tokens", "limit": 10000},
+	}
 }
 
 func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
@@ -118,20 +177,37 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 		writeJSON(responseWriter, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	tenantID, err := s.authenticator.Authenticate(request)
+	token, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
 		writeError(responseWriter, http.StatusUnauthorized, "authentication_error", err.Error(), "")
 		return
 	}
+	principal, err := s.authenticator.Authenticate(request.Context(), token)
+	if err != nil {
+		writeError(responseWriter, http.StatusUnauthorized, "authentication_error", err.Error(), "")
+		return
+	}
+	if principal.TenantID == "" {
+		writeError(responseWriter, http.StatusUnauthorized, "authentication_error", "invalid authenticated principal", "")
+		return
+	}
+	request = request.WithContext(context.WithValue(request.Context(), principalContextKey{}, principal))
 	if request.Method == http.MethodPost || request.Method == http.MethodDelete {
-		homeRegion := s.homeRegions[tenantID]
+		homeRegion := s.homeRegion(request)
 		if homeRegion != "" && homeRegion != s.localRegion {
 			s.forwardToHomeRegion(responseWriter, request, homeRegion)
 			return
 		}
 	}
-	request.Header.Set("X-Authenticated-Tenant-ID", tenantID)
 	s.mux.ServeHTTP(responseWriter, request)
+}
+
+func bearerToken(value string) (string, error) {
+	token, ok := strings.CutPrefix(value, "Bearer ")
+	if !ok || token == "" {
+		return "", errors.New("missing bearer token")
+	}
+	return token, nil
 }
 
 func (s *Server) forwardToHomeRegion(responseWriter http.ResponseWriter, request *http.Request, homeRegion string) {
@@ -190,6 +266,16 @@ type createResponseRequest struct {
 	CompatibilityMode  core.CompatibilityMode      `json:"compatibility_mode"`
 	Tools              []json.RawMessage           `json:"tools,omitempty"`
 	ToolChoice         json.RawMessage             `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool                       `json:"parallel_tool_calls,omitempty"`
+	Reasoning          json.RawMessage             `json:"reasoning,omitempty"`
+	Include            []string                    `json:"include,omitempty"`
+	PromptCacheKey     string                      `json:"prompt_cache_key,omitempty"`
+	ClientMetadata     json.RawMessage             `json:"client_metadata,omitempty"`
+	Text               json.RawMessage             `json:"text,omitempty"`
+	ServiceTier        string                      `json:"service_tier,omitempty"`
+	Truncation         string                      `json:"truncation,omitempty"`
+	MaxToolCalls       *int                        `json:"max_tool_calls,omitempty"`
+	SafetyIdentifier   string                      `json:"safety_identifier,omitempty"`
 	Temperature        *float64                    `json:"temperature,omitempty"`
 	TopP               *float64                    `json:"top_p,omitempty"`
 	MaxOutputTokens    *int                        `json:"max_output_tokens,omitempty"`
@@ -232,22 +318,33 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 		return
 	}
 	canonical := core.Request{
-		TenantID: request.Header.Get("X-Authenticated-Tenant-ID"), Model: payload.Model, Input: input,
+		TenantID: tenantID(request), APIKeyID: apiKeyID(request), Model: payload.Model, Input: input,
 		Stream: payload.Stream, Background: payload.Background, Store: storeResponse,
 		PreviousResponseID: payload.PreviousResponseID, ConversationID: payload.Conversation,
 		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: requestedFeatures(input), Metadata: payload.Metadata,
-		HomeRegion:      s.homeRegion(request),
-		ExecutionEpoch:  s.executionEpoch(request),
-		IdempotencyKey:  strings.TrimSpace(request.Header.Get("Idempotency-Key")),
-		Tools:           payload.Tools,
-		ToolChoice:      payload.ToolChoice,
-		Temperature:     payload.Temperature,
-		TopP:            payload.TopP,
-		MaxOutputTokens: payload.MaxOutputTokens,
-		Stop:            payload.Stop,
-		EndUserID:       payload.User,
-		CacheProtection: payload.CacheProtection,
+		HomeRegion:        s.homeRegion(request),
+		ExecutionEpoch:    s.executionEpoch(request),
+		IdempotencyKey:    strings.TrimSpace(request.Header.Get("Idempotency-Key")),
+		Tools:             payload.Tools,
+		ToolChoice:        payload.ToolChoice,
+		ParallelToolCalls: payload.ParallelToolCalls,
+		Reasoning:         payload.Reasoning,
+		Include:           append([]string(nil), payload.Include...),
+		PromptCacheKey:    payload.PromptCacheKey,
+		ClientMetadata:    payload.ClientMetadata,
+		Text:              payload.Text,
+		ServiceTier:       payload.ServiceTier,
+		Truncation:        payload.Truncation,
+		MaxToolCalls:      payload.MaxToolCalls,
+		SafetyIdentifier:  payload.SafetyIdentifier,
+		Temperature:       payload.Temperature,
+		TopP:              payload.TopP,
+		MaxOutputTokens:   payload.MaxOutputTokens,
+		Stop:              payload.Stop,
+		EndUserID:         payload.User,
+		CacheProtection:   payload.CacheProtection,
 	}
+	canonical.TenantPolicy, canonical.APIKeyPolicy = requestPolicies(request)
 	if len(payload.Tools) > 0 || hasJSONValue(payload.ToolChoice) {
 		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "tools")
 	}
@@ -256,6 +353,12 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 	}
 	if payload.User != "" {
 		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "end_user_id")
+	}
+	if hasJSONValue(payload.Reasoning) || slices.Contains(payload.Include, "reasoning.encrypted_content") {
+		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "reasoning")
+	}
+	if requiresNativeResponses(payload) {
+		canonical.RequestedFeatures = append(canonical.RequestedFeatures, "responses_native")
 	}
 	if err := validateCacheProtection(payload.CacheProtection); err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
@@ -567,13 +670,14 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 		maxOutputTokens = payload.MaxTokens
 	}
 	canonical := core.Request{
-		TenantID: tenantID(request), Model: payload.Model, Input: items, Stream: payload.Stream, Store: true,
+		TenantID: tenantID(request), APIKeyID: apiKeyID(request), Model: payload.Model, Input: items, Stream: payload.Stream, Store: true,
 		CompatibilityMode: payload.CompatibilityMode, RequestedFeatures: features, Metadata: payload.Metadata,
 		HomeRegion: s.homeRegion(request), ExecutionEpoch: s.executionEpoch(request),
 		Tools: payload.Tools, ToolChoice: payload.ToolChoice, Temperature: payload.Temperature,
 		TopP: payload.TopP, MaxOutputTokens: maxOutputTokens, Stop: payload.Stop, EndUserID: payload.User,
 		CacheProtection: payload.CacheProtection,
 	}
+	canonical.TenantPolicy, canonical.APIKeyPolicy = requestPolicies(request)
 	if err := validateCacheProtection(payload.CacheProtection); err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "cache_protection")
 		return
@@ -917,6 +1021,25 @@ func requestedFeatures(items []core.Item) []string {
 	return features
 }
 
+func requiresNativeResponses(payload createResponseRequest) bool {
+	if payload.ParallelToolCalls != nil || hasJSONValue(payload.Reasoning) || len(payload.Include) > 0 ||
+		payload.PromptCacheKey != "" || hasJSONValue(payload.ClientMetadata) || hasJSONValue(payload.Text) ||
+		payload.ServiceTier != "" || payload.Truncation != "" || payload.MaxToolCalls != nil || payload.SafetyIdentifier != "" {
+		return true
+	}
+	for _, raw := range payload.Tools {
+		var tool struct {
+			Type     string          `json:"type"`
+			Name     string          `json:"name"`
+			Function json.RawMessage `json:"function"`
+		}
+		if json.Unmarshal(raw, &tool) != nil || tool.Type != "function" || tool.Name != "" || len(tool.Function) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func validateCacheProtection(policy *core.CacheProtectionPolicy) error {
 	if policy == nil || !policy.Enabled {
 		return nil
@@ -952,9 +1075,34 @@ func decodeBody(request *http.Request, target any) error {
 	return nil
 }
 
-func tenantID(request *http.Request) string { return request.Header.Get("X-Authenticated-Tenant-ID") }
+func authenticatedPrincipal(request *http.Request) access.Principal {
+	principal, _ := request.Context().Value(principalContextKey{}).(access.Principal)
+	return principal
+}
+
+func tenantID(request *http.Request) string { return authenticatedPrincipal(request).TenantID }
+
+func apiKeyID(request *http.Request) string { return authenticatedPrincipal(request).APIKeyID }
+
+func requestPolicies(request *http.Request) (*core.TenantPolicy, *core.APIKeyPolicy) {
+	principal := authenticatedPrincipal(request)
+	var tenantPolicy *core.TenantPolicy
+	var apiKeyPolicy *core.APIKeyPolicy
+	if principal.TenantPolicy.Revision > 0 {
+		policy := principal.TenantPolicy
+		tenantPolicy = &policy
+	}
+	if principal.APIKeyPolicy.Revision > 0 {
+		policy := principal.APIKeyPolicy
+		apiKeyPolicy = &policy
+	}
+	return tenantPolicy, apiKeyPolicy
+}
 
 func (s *Server) homeRegion(request *http.Request) string {
+	if region := authenticatedPrincipal(request).HomeRegion; region != "" {
+		return region
+	}
 	if region := s.homeRegions[tenantID(request)]; region != "" {
 		return region
 	}
@@ -962,6 +1110,9 @@ func (s *Server) homeRegion(request *http.Request) string {
 }
 
 func (s *Server) executionEpoch(request *http.Request) int64 {
+	if epoch := authenticatedPrincipal(request).ExecutionEpoch; epoch > 0 {
+		return epoch
+	}
 	if epoch := s.executionEpochs[tenantID(request)]; epoch > 0 {
 		return epoch
 	}

@@ -80,11 +80,11 @@ func (r *PostgresIntentRepository) Reserve(ctx context.Context, intent Intent) (
 	resultPayload, _ := json.Marshal(intent.ProviderResult)
 	result, err = tx.ExecContext(ctx, `
 		INSERT INTO cache_refresh_intents (
-			tenant_id, id, cache_lease_id, cache_lease_revision, fencing_token, status,
+			tenant_id, id, sponsor_api_key_id, cache_lease_id, cache_lease_revision, fencing_token, status,
 			expected_net_saving, scheduled_for, provider_result, candidate, error, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULLIF($11,''),$12,$13)
+		) VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7,$8,$9,$10,$11,NULLIF($12,''),$13,$14)
 		ON CONFLICT (tenant_id, cache_lease_id, cache_lease_revision) DO NOTHING`,
-		intent.TenantID, intent.ID, intent.CacheLeaseID, intent.CacheLeaseRevision, intent.FencingToken,
+		intent.TenantID, intent.ID, lease.Anchor.APIKeyID, intent.CacheLeaseID, intent.CacheLeaseRevision, intent.FencingToken,
 		intent.Status, intent.ExpectedNetSavingMicros, intent.ScheduledFor, resultPayload, candidate,
 		intent.Error, intent.CreatedAt, intent.UpdatedAt,
 	)
@@ -169,7 +169,7 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		if err := ensureRefreshPriceSnapshot(ctx, tx, intent.Candidate.RefreshPriceSnapshot); err != nil {
 			return Intent{}, err
 		}
-		refreshCost := actualRefreshCost(intent)
+		refreshCost := ActualRefreshCost(intent)
 		providerUsage := intent.ProviderResult.ProviderUsage
 		if len(providerUsage) == 0 || !json.Valid(providerUsage) {
 			providerUsage = json.RawMessage(`{}`)
@@ -178,16 +178,36 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		usage := intent.ProviderResult.Usage
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO cache_refresh_usage_ledger (
-				id, tenant_id, cache_refresh_intent_id, cache_lease_id, price_snapshot_id,
+				id, tenant_id, api_key_id, cache_refresh_intent_id, cache_lease_id, price_snapshot_id,
 				provider_usage, input_tokens, cached_input_tokens, cache_write_input_tokens,
 				output_tokens, amount, currency, usage_reliable, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-			usageID, intent.TenantID, intent.ID, intent.CacheLeaseID,
+			) VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			usageID, intent.TenantID, intent.Anchor.APIKeyID, intent.ID, intent.CacheLeaseID,
 			intent.Candidate.RefreshPriceSnapshot.ID, providerUsage, usage.InputTokens,
 			usage.CachedInputTokens, usage.CacheWriteInputTokens, usage.OutputTokens,
 			refreshCost, intent.Candidate.RefreshPriceSnapshot.Currency, intent.ProviderResult.UsageReliable, intent.UpdatedAt,
 		); err != nil {
 			return Intent{}, fmt.Errorf("insert immutable refresh usage: %w", err)
+		}
+		if intent.Anchor.APIKeyID != "" {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO api_key_refresh_usage_daily (
+					usage_date, tenant_id, api_key_id, provider, model, currency, refresh_count,
+					input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, amount_micros
+				) VALUES (($1 AT TIME ZONE 'UTC')::date,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11)
+				ON CONFLICT (usage_date, tenant_id, api_key_id, provider, model, currency) DO UPDATE SET
+					refresh_count = api_key_refresh_usage_daily.refresh_count + 1,
+					input_tokens = api_key_refresh_usage_daily.input_tokens + EXCLUDED.input_tokens,
+					cached_input_tokens = api_key_refresh_usage_daily.cached_input_tokens + EXCLUDED.cached_input_tokens,
+					cache_write_input_tokens = api_key_refresh_usage_daily.cache_write_input_tokens + EXCLUDED.cache_write_input_tokens,
+					output_tokens = api_key_refresh_usage_daily.output_tokens + EXCLUDED.output_tokens,
+					amount_micros = api_key_refresh_usage_daily.amount_micros + EXCLUDED.amount_micros,
+					updated_at = now()`, intent.UpdatedAt, intent.TenantID, intent.Anchor.APIKeyID,
+				intent.Candidate.RefreshPriceSnapshot.Provider, intent.Candidate.RefreshPriceSnapshot.Model,
+				intent.Candidate.RefreshPriceSnapshot.Currency, usage.InputTokens, usage.CachedInputTokens,
+				usage.CacheWriteInputTokens, usage.OutputTokens, refreshCost); err != nil {
+				return Intent{}, fmt.Errorf("update API key refresh usage rollup: %w", err)
+			}
 		}
 		result, err := tx.ExecContext(ctx, `
 			UPDATE cache_leases

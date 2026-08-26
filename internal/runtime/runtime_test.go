@@ -13,6 +13,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	gatewayruntime "github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
@@ -62,6 +63,29 @@ func TestVisibleProviderFailureIsPersistedWithoutFallback(t *testing.T) {
 	}
 	if persisted.Status != core.ResponseStatusFailed || persisted.OutputText() != "partial" {
 		t.Fatalf("persisted response = %#v, want failed with partial output", persisted)
+	}
+}
+
+func TestProviderFailureKeepsHardQuotaReservationUncertain(t *testing.T) {
+	t.Parallel()
+	requestsPerMinute := int64(1)
+	controller := &quotaControllerStub{}
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(testRoute("failing", executorFunc(
+		func(context.Context, core.Request) (provider.EventStream, error) {
+			return nil, errors.New("connection reset after request admission")
+		},
+	))), gatewayruntime.Options{QuotaController: controller})
+	_, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", APIKeyID: "key-a", Model: "gateway-model", Store: true,
+		RequestedFeatures: []string{"text"},
+		TenantPolicy:      &core.TenantPolicy{Revision: 1, Limits: core.QuotaLimits{RequestsPerMinute: &requestsPerMinute}},
+		APIKeyPolicy:      &core.APIKeyPolicy{Revision: 1},
+	})
+	if err == nil {
+		t.Fatal("provider failure error = nil")
+	}
+	if controller.uncertainID != "reservation-1" || controller.releasedID != "" {
+		t.Fatalf("quota uncertain/released = %q/%q", controller.uncertainID, controller.releasedID)
 	}
 }
 
@@ -413,6 +437,26 @@ func TestResponseFinalizationRecordsNormalizedUsageAgainstImmutablePriceSnapshot
 	}
 }
 
+func TestResponseUsageIsAttributedToAuthenticatedAPIKey(t *testing.T) {
+	t.Parallel()
+	responseStore := store.NewMemoryResponseStore()
+	engine := gatewayruntime.New(responseStore, provider.NewStaticRouter(provider.NewEchoExecutor()))
+	response, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", APIKeyID: "key-a", Model: "echo-v1", Store: true,
+		RequestedFeatures: []string{"text"},
+		Input: []core.Item{{
+			Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "attribute me"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := responseStore.UsageRecords("tenant-a", response.ID)
+	if len(records) != 1 || records[0].APIKeyID != "key-a" {
+		t.Fatalf("usage records = %#v, want API key attribution", records)
+	}
+}
+
 func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	t.Parallel()
 
@@ -452,7 +496,8 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 		TenantPolicies: map[string]core.TenantPolicy{"tenant-a": {AllowCacheProtection: &allowCache}},
 	})
 	response, err := engine.Execute(context.Background(), core.Request{
-		TenantID: "tenant-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		TenantID: "tenant-a", APIKeyID: "key-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		APIKeyPolicy: &core.APIKeyPolicy{Revision: 1, AllowCacheProtection: true},
 		CacheProtection: &core.CacheProtectionPolicy{
 			Enabled: true, MaxSpendMicros: 1_000_000, MaxRefreshes: 1,
 			MaxProtectionWindowSec: 3600, SafetyMarginMicros: 100_000,
@@ -471,7 +516,8 @@ func TestOptInResponsePlansProviderGeneratedCacheProtection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(completed) != 1 || completed[0].Status != cacheprotection.IntentSucceeded || adapter.refreshCalls.Load() != 1 {
+	if len(completed) != 1 || completed[0].Status != cacheprotection.IntentSucceeded ||
+		completed[0].Anchor.APIKeyID != "key-a" || adapter.refreshCalls.Load() != 1 {
 		t.Fatalf("cache protection result = %#v, refresh calls = %d", completed, adapter.refreshCalls.Load())
 	}
 }
@@ -574,6 +620,33 @@ type cacheAdapterStub struct {
 	currentAnchorCalls atomic.Int64
 	buildAnchorCalls   atomic.Int64
 }
+
+type quotaControllerStub struct {
+	uncertainID string
+	releasedID  string
+}
+
+func (s *quotaControllerStub) Reserve(context.Context, quota.ReservationRequest) (quota.Reservation, error) {
+	return quota.Reservation{ID: "reservation-1"}, nil
+}
+
+func (s *quotaControllerStub) ReserveRefresh(context.Context, quota.RefreshReservationRequest) (quota.Reservation, error) {
+	return quota.Reservation{}, nil
+}
+
+func (s *quotaControllerStub) Commit(context.Context, string, quota.ActualUsage) error { return nil }
+
+func (s *quotaControllerStub) Release(_ context.Context, id string) error {
+	s.releasedID = id
+	return nil
+}
+
+func (s *quotaControllerStub) Uncertain(_ context.Context, id string) error {
+	s.uncertainID = id
+	return nil
+}
+
+func (s *quotaControllerStub) Reconcile(context.Context, int) (int, error) { return 0, nil }
 
 type failingRenewalStore struct {
 	*store.MemoryResponseStore

@@ -13,11 +13,69 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	gatewayruntime "github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
+
+func TestPostgresUsageIsAttributedAndProjectedByAPIKey(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("usage-key-%d", time.Now().UnixNano())
+	accessService, err := access.NewPostgresService(db, []byte("integration-test-pepper"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accessService.CreateTenant(ctx, access.Tenant{
+		ID: tenantID, Slug: tenantID, DisplayName: "Usage key tenant", Status: access.TenantActive,
+		HomeRegion: "local", ExecutionEpoch: 1, Policy: core.TenantPolicy{Revision: 1},
+	}, access.ChangeActor{Type: "test", ID: "integration"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	key, err := accessService.ImportAPIKey(ctx, access.APIKeySpec{
+		TenantID: tenantID, Name: "usage key", RawKey: "gw_test_usage_" + tenantID,
+		Policy: core.APIKeyPolicy{Revision: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	response := core.Response{
+		ID: "response-usage-key", Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
+		Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{},
+	}
+	if err := responseStore.Create(ctx, tenantID, response); err != nil {
+		t.Fatal(err)
+	}
+	response.Status = core.ResponseStatusCompleted
+	usage := core.UsageRecord{
+		ID: "usage-key", TenantID: tenantID, APIKeyID: key.ID, ResponseID: response.ID, AttemptID: "attempt-key",
+		PriceSnapshot: core.PriceSnapshot{
+			ID: "price-usage-key-" + tenantID, Provider: "provider-" + tenantID, Model: "model", Region: "local",
+			Currency: "USD", InputPerMillionMicros: 1_000_000, OutputPerMillionMicros: 2_000_000,
+			EffectiveAt: now.Unix(), Source: "integration-test",
+		},
+		ProviderUsage: []byte(`{}`), Usage: core.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		AmountMicros: 20, Currency: "USD", CreatedAt: now,
+	}
+	if err := responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, usage); err != nil {
+		t.Fatal(err)
+	}
+	report, err := responseStore.APIKeyDailyUsage(ctx, tenantID, key.ID, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report) != 1 || report[0].ResponseCount != 1 || report[0].InputTokens != 10 ||
+		report[0].OutputTokens != 5 || report[0].AmountMicros != 20 || report[0].Currency != "USD" {
+		t.Fatalf("API key daily usage = %#v", report)
+	}
+}
 
 func TestPostgresStoreFalseLeavesNoResponseContentOrOutboxSecret(t *testing.T) {
 	db, ctx := integrationDatabase(t)
