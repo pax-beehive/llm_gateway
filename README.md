@@ -85,6 +85,8 @@ CONTROL_PLANE_DB_ROLE=tenant_admin_runtime
 CONTROL_IAM_JWKS_URL=https://iam.example/.well-known/jwks.json
 CONTROL_IAM_ISSUER=https://iam.example
 CONTROL_IAM_AUDIENCE=llm-gateway-control-plane
+CONTROL_API_KEY_CURRENT_DIGEST_VERSION=2
+CONTROL_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}
 ```
 
 Run schema migration as a separate owner job, then apply least-privilege grants
@@ -98,7 +100,7 @@ Tenant mutations atomically append `control_outbox`; that is durable enqueue,
 not delivery proof. Relay, consumer receipts, lag, and repair surfaces are also
 implemented by ADR 0008 before physical database separation.
 
-In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. Keep `GATEWAY_API_KEY_PEPPER` stable and secret. Rotating it currently requires reissuing or explicitly reimporting keys.
+In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. The single `GATEWAY_API_KEY_PEPPER` variable is the version-1 compatibility form. During a bounded rotation, configure `GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}` and `GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2`; at most eight versions may be active. New issuance/import uses the current version, while configured prior versions remain verifiable. Remove an old pepper only after the control plane proves no active key still references that digest version.
 
 Environment key maps are only for an explicit, idempotent first bootstrap. A raw bootstrap key must contain at least 24 characters. After a successful bootstrap, remove the raw-key variables and disable the flag; subsequent replicas load access state only from PostgreSQL:
 

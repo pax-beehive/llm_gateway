@@ -35,3 +35,15 @@ func TestProductionIdentityVerifierFailsClosedWithoutIAMConfiguration(t *testing
 		t.Fatal("production verifier unexpectedly accepted missing IAM configuration")
 	}
 }
+
+func TestCredentialPepperRingUsesExplicitCurrentVersion(t *testing.T) {
+	t.Setenv("CONTROL_API_KEY_PEPPERS_JSON", `{"1":"old-control-pepper","2":"current-control-pepper"}`)
+	t.Setenv("CONTROL_API_KEY_CURRENT_DIGEST_VERSION", "2")
+	ring, err := credentialPepperRingFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ring.CurrentVersion != 2 || string(ring.Peppers[1]) != "old-control-pepper" || string(ring.Peppers[2]) != "current-control-pepper" {
+		t.Fatalf("pepper ring = %#v", ring)
+	}
+}

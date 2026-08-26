@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -86,18 +87,36 @@ type Principal struct {
 }
 
 type PostgresService struct {
-	db     *sql.DB
-	pepper []byte
+	db             *sql.DB
+	peppers        map[int16][]byte
+	currentVersion int16
 }
 
 func NewPostgresService(db *sql.DB, pepper []byte) (*PostgresService, error) {
+	return NewPostgresServiceWithPeppers(db, 1, map[int16][]byte{1: pepper})
+}
+
+func NewPostgresServiceWithPeppers(db *sql.DB, currentVersion int16, peppers map[int16][]byte) (*PostgresService, error) {
 	if db == nil {
 		return nil, errors.New("access service requires PostgreSQL")
 	}
-	if len(pepper) < 16 {
-		return nil, errors.New("API key pepper must contain at least 16 bytes")
+	if currentVersion <= 0 {
+		return nil, errors.New("current API key digest version must be positive")
 	}
-	return &PostgresService{db: db, pepper: append([]byte(nil), pepper...)}, nil
+	if len(peppers) == 0 || len(peppers) > 8 {
+		return nil, errors.New("API key authentication requires between one and eight active digest versions")
+	}
+	cloned := make(map[int16][]byte, len(peppers))
+	for version, pepper := range peppers {
+		if version <= 0 || len(pepper) < 16 {
+			return nil, errors.New("API key peppers require positive versions and at least 16 bytes")
+		}
+		cloned[version] = append([]byte(nil), pepper...)
+	}
+	if len(cloned[currentVersion]) == 0 {
+		return nil, errors.New("current API key digest version has no pepper")
+	}
+	return &PostgresService{db: db, peppers: cloned, currentVersion: currentVersion}, nil
 }
 
 func (s *PostgresService) CreateTenant(ctx context.Context, tenant Tenant, actor ChangeActor) error {
@@ -179,7 +198,7 @@ func (s *PostgresService) ImportAPIKey(ctx context.Context, spec APIKeySpec) (AP
 	if _, err := quota.EffectiveLimits(core.QuotaLimits{}, spec.Policy.Limits); err != nil {
 		return APIKey{}, fmt.Errorf("validate API key policy: %w", err)
 	}
-	digest := s.digest(spec.RawKey)
+	digest := s.digest(s.currentVersion, spec.RawKey)
 	id := "key_" + hex.EncodeToString(digest[:12])
 	prefix := spec.RawKey
 	if len(prefix) > 12 {
@@ -200,11 +219,11 @@ func (s *PostgresService) ImportAPIKey(ctx context.Context, spec APIKeySpec) (AP
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO api_keys (
-			id, tenant_id, name, key_prefix, secret_digest, policy_revision,
+			id, tenant_id, name, key_prefix, secret_digest, digest_version, policy_revision,
 			policy, metadata, expires_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		ON CONFLICT (secret_digest) DO NOTHING`,
-		id, spec.TenantID, strings.TrimSpace(spec.Name), prefix, digest,
+		id, spec.TenantID, strings.TrimSpace(spec.Name), prefix, digest, s.currentVersion,
 		spec.Policy.Revision, policyPayload, metadata, spec.ExpiresAt,
 	); err != nil {
 		return APIKey{}, fmt.Errorf("import API key: %w", err)
@@ -353,16 +372,36 @@ func (s *PostgresService) Authenticate(ctx context.Context, rawKey string) (Prin
 	if rawKey == "" {
 		return Principal{}, ErrInvalidAPIKey
 	}
-	return scanPrincipal(s.db.QueryRowContext(ctx, `
-		SELECT t.id, k.id, t.home_region, t.execution_epoch,
-		       t.policy_revision, t.policy, k.policy_revision, k.policy
-		FROM api_keys k
-		JOIN tenants t ON t.id = k.tenant_id
-		WHERE k.secret_digest = $1
-		  AND k.digest_version = 1
-		  AND k.status = 'active'
-		  AND t.status = 'active'
-		  AND (k.expires_at IS NULL OR k.expires_at > now())`, s.digest(rawKey)))
+	versions := make([]int, 0, len(s.peppers)-1)
+	for version := range s.peppers {
+		if version == s.currentVersion {
+			continue
+		}
+		versions = append(versions, int(version))
+	}
+	slices.Sort(versions)
+	slices.Reverse(versions)
+	versions = append([]int{int(s.currentVersion)}, versions...)
+	for _, candidate := range versions {
+		version := int16(candidate)
+		principal, err := scanPrincipal(s.db.QueryRowContext(ctx, `
+			SELECT t.id, k.id, t.home_region, t.execution_epoch,
+			       t.policy_revision, t.policy, k.policy_revision, k.policy
+			FROM api_keys k
+			JOIN tenants t ON t.id = k.tenant_id
+			WHERE k.secret_digest = $1
+			  AND k.digest_version = $2
+			  AND k.status = 'active'
+			  AND t.status = 'active'
+			  AND (k.expires_at IS NULL OR k.expires_at > now())`, s.digest(version, rawKey), version))
+		if err == nil {
+			return principal, nil
+		}
+		if !errors.Is(err, ErrInvalidAPIKey) {
+			return Principal{}, err
+		}
+	}
+	return Principal{}, ErrInvalidAPIKey
 }
 
 // LookupPrincipal revalidates a previously authenticated principal for delayed
@@ -524,8 +563,8 @@ func (s *PostgresService) PublishTenantPolicy(
 	return tx.Commit()
 }
 
-func (s *PostgresService) digest(rawKey string) []byte {
-	mac := hmac.New(sha256.New, s.pepper)
+func (s *PostgresService) digest(version int16, rawKey string) []byte {
+	mac := hmac.New(sha256.New, s.peppers[version])
 	_, _ = mac.Write([]byte(rawKey))
 	return mac.Sum(nil)
 }

@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -48,16 +50,22 @@ type Administration interface {
 
 type Config struct {
 	Administration Administration
+	Credentials    CredentialAdministration
 	Verifier       IdentityVerifier
+}
+
+type CredentialAdministration interface {
+	Issue(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error)
 }
 
 type Server struct {
 	administration Administration
+	credentials    CredentialAdministration
 	verifier       IdentityVerifier
 }
 
 func New(config Config) http.Handler {
-	return &Server{administration: config.Administration, verifier: config.Verifier}
+	return &Server{administration: config.Administration, credentials: config.Credentials, verifier: config.Verifier}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -126,6 +134,12 @@ func (server *Server) route(writer http.ResponseWriter, request *http.Request, a
 		return
 	}
 	switch parts[1] {
+	case "gateway-api-keys":
+		if request.Method != http.MethodPost {
+			methodNotAllowed(writer, http.MethodPost)
+			return
+		}
+		server.issueGatewayAPIKey(writer, request, actor, tenantID)
 	case "transitions":
 		if request.Method != http.MethodPost {
 			methodNotAllowed(writer, http.MethodPost)
@@ -149,6 +163,54 @@ func (server *Server) route(writer http.ResponseWriter, request *http.Request, a
 		server.listPolicyRevisions(writer, request, actor, tenantID)
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
+	}
+}
+
+type issueGatewayAPIKeyRequest struct {
+	Name      string            `json:"name"`
+	Metadata  map[string]any    `json:"metadata"`
+	ExpiresAt *time.Time        `json:"expires_at"`
+	Policy    core.APIKeyPolicy `json:"policy"`
+	Reason    string            `json:"reason"`
+}
+
+func (server *Server) issueGatewayAPIKey(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID string) {
+	if server.credentials == nil {
+		writeAPIError(writer, http.StatusServiceUnavailable, "service_unavailable", "Gateway Credential Administration is not configured")
+		return
+	}
+	var input issueGatewayAPIKeyRequest
+	if !decodeBody(writer, request, &input) {
+		return
+	}
+	actor.Reason = input.Reason
+	result, err := server.credentials.Issue(request.Context(), actor, request.Header.Get("Idempotency-Key"), credentialadmin.IssueCommand{
+		TenantID: tenantID, Name: input.Name, Metadata: input.Metadata, ExpiresAt: input.ExpiresAt, Policy: input.Policy,
+	})
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", etag(result.Credential.Revision))
+	writer.Header().Set("Location", "/control/v1/tenants/"+url.PathEscape(tenantID)+"/gateway-api-keys/"+url.PathEscape(result.Credential.ID))
+	if result.Replay {
+		writer.Header().Set("Idempotency-Replayed", "true")
+	}
+	response := credentialResource(result.Credential)
+	if result.RawSecret != "" {
+		response["secret"] = result.RawSecret
+	}
+	writeJSON(writer, http.StatusCreated, response)
+}
+
+func credentialResource(credential credentialadmin.Credential) map[string]any {
+	return map[string]any{
+		"id": credential.ID, "tenant_id": credential.TenantID, "name": credential.Name,
+		"prefix": credential.Prefix, "digest_version": credential.DigestVersion, "status": credential.Status,
+		"revision": credential.Revision, "policy": credential.Policy, "metadata": credential.Metadata,
+		"expires_at": credential.ExpiresAt, "revoked_at": credential.RevokedAt,
+		"predecessor_id": credential.PredecessorID, "replacement_id": credential.ReplacementID,
+		"grace_expires_at": credential.GraceExpiresAt,
 	}
 }
 
@@ -426,6 +488,25 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 	case errors.Is(err, tenantadmin.ErrPolicyDenied):
 		writeAPIError(writer, http.StatusForbidden, "policy_denied", err.Error())
 	case errors.Is(err, tenantadmin.ErrInvalidArgument):
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
+	default:
+		writeAPIError(writer, http.StatusInternalServerError, "internal_error", "control-plane operation failed")
+	}
+}
+
+func writeCredentialError(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, credentialadmin.ErrNotFound):
+		writeAPIError(writer, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, credentialadmin.ErrAlreadyExists):
+		writeAPIError(writer, http.StatusConflict, "already_exists", err.Error())
+	case errors.Is(err, credentialadmin.ErrRevisionConflict):
+		writeAPIError(writer, http.StatusConflict, "revision_conflict", err.Error())
+	case errors.Is(err, credentialadmin.ErrIdempotencyConflict):
+		writeAPIError(writer, http.StatusConflict, "idempotency_conflict", err.Error())
+	case errors.Is(err, credentialadmin.ErrPolicyDenied):
+		writeAPIError(writer, http.StatusForbidden, "policy_denied", err.Error())
+	case errors.Is(err, credentialadmin.ErrInvalidArgument):
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
 		writeAPIError(writer, http.StatusInternalServerError, "internal_error", "control-plane operation failed")

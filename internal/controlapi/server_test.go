@@ -12,6 +12,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -106,9 +107,51 @@ func TestInvalidHumanAssertionIsRejectedBeforeAdministration(t *testing.T) {
 	}
 }
 
+func TestIssueGatewayAPIKeyReturnsOneTimeSecretFromCredentialModule(t *testing.T) {
+	credentials := credentialAdministrationFunc(func(_ context.Context, actor tenantadmin.ActorEnvelope, key string, command credentialadmin.IssueCommand) (credentialadmin.IssueResult, error) {
+		if actor.ID != "user-1" || actor.Reason != "new workload" || key != "issue-1" || command.TenantID != "tenant-a" {
+			t.Fatalf("actor/key/command = %#v / %q / %#v", actor, key, command)
+		}
+		return credentialadmin.IssueResult{
+			Credential: credentialadmin.Credential{
+				ID: "gak_123", TenantID: "tenant-a", Name: command.Name, Prefix: "gw_prefix",
+				DigestVersion: 2, Status: access.APIKeyActive, Revision: 1, Policy: core.APIKeyPolicy{Revision: 1},
+			},
+			RawSecret: "gw_one_time_secret",
+		}, nil
+	})
+	handler := controlapi.New(controlapi.Config{
+		Administration: &fakeAdministration{}, Credentials: credentials,
+		Verifier: fixedVerifier(controlapi.VerifiedIdentity{ActorType: "human", ActorID: "user-1", Scopes: []string{tenantadmin.ScopePlatformWrite}}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/control/v1/tenants/tenant-a/gateway-api-keys", jsonBody(t, map[string]any{
+		"name": "workload", "policy": map[string]any{"revision": 1}, "reason": "new workload",
+	}))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "issue-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("status/headers/body = %d / %#v / %s", response.Code, response.Header(), response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["secret"] != "gw_one_time_secret" || body["id"] != "gak_123" {
+		t.Fatalf("issued body = %#v", body)
+	}
+}
+
 type fakeAdministration struct {
 	create func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.CreateTenantCommand) (tenantadmin.MutationResult, error)
 	update func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.UpdateTenantCommand) (tenantadmin.MutationResult, error)
+}
+
+type credentialAdministrationFunc func(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error)
+
+func (function credentialAdministrationFunc) Issue(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command credentialadmin.IssueCommand) (credentialadmin.IssueResult, error) {
+	return function(ctx, actor, key, command)
 }
 
 func (f *fakeAdministration) CreateTenant(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command tenantadmin.CreateTenantCommand) (tenantadmin.MutationResult, error) {

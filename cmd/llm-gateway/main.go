@@ -281,7 +281,11 @@ func configureAuthenticator(
 		}
 		return httpapi.StaticAuthenticator(apiKeys), nil
 	}
-	service, err := access.NewPostgresService(db, []byte(os.Getenv("GATEWAY_API_KEY_PEPPER")))
+	currentDigestVersion, digestPeppers, err := gatewayAPIKeyPepperRingFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	service, err := access.NewPostgresServiceWithPeppers(db, currentDigestVersion, digestPeppers)
 	if err != nil {
 		return nil, fmt.Errorf("configure persistent API key authentication: %w", err)
 	}
@@ -363,6 +367,31 @@ func configureAuthenticator(
 		}
 	}
 	return service, nil
+}
+
+func gatewayAPIKeyPepperRingFromEnv() (int16, map[int16][]byte, error) {
+	encoded := strings.TrimSpace(os.Getenv("GATEWAY_API_KEY_PEPPERS_JSON"))
+	if encoded == "" {
+		return 1, map[int16][]byte{1: []byte(os.Getenv("GATEWAY_API_KEY_PEPPER"))}, nil
+	}
+	var configured map[string]string
+	if err := json.Unmarshal([]byte(encoded), &configured); err != nil {
+		return 0, nil, fmt.Errorf("GATEWAY_API_KEY_PEPPERS_JSON: %w", err)
+	}
+	currentValue := strings.TrimSpace(os.Getenv("GATEWAY_API_KEY_CURRENT_DIGEST_VERSION"))
+	current, err := strconv.ParseInt(currentValue, 10, 16)
+	if err != nil || current <= 0 {
+		return 0, nil, errors.New("GATEWAY_API_KEY_CURRENT_DIGEST_VERSION must be a positive integer")
+	}
+	peppers := make(map[int16][]byte, len(configured))
+	for versionValue, pepper := range configured {
+		version, err := strconv.ParseInt(versionValue, 10, 16)
+		if err != nil || version <= 0 {
+			return 0, nil, errors.New("GATEWAY_API_KEY_PEPPERS_JSON keys must be positive digest versions")
+		}
+		peppers[int16(version)] = []byte(pepper)
+	}
+	return int16(current), peppers, nil
 }
 
 func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRouter, error) {

@@ -14,7 +14,11 @@ BEGIN
        OR has_column_privilege('llm_gateway_tenant_admin_test', 'tenants', 'home_region', 'UPDATE')
        OR NOT has_table_privilege('llm_gateway_tenant_admin_test', 'control_audit_events', 'INSERT')
        OR has_table_privilege('llm_gateway_tenant_admin_test', 'control_audit_events', 'DELETE')
+       OR NOT has_table_privilege('llm_gateway_tenant_admin_test', 'api_keys', 'INSERT')
+       OR NOT has_column_privilege('llm_gateway_tenant_admin_test', 'api_keys', 'status', 'UPDATE')
+       OR has_column_privilege('llm_gateway_tenant_admin_test', 'api_keys', 'secret_digest', 'UPDATE')
        OR NOT has_table_privilege('llm_gateway_runtime_test', 'tenants', 'SELECT')
+       OR NOT has_table_privilege('llm_gateway_runtime_test', 'api_keys', 'SELECT')
        OR has_table_privilege('llm_gateway_runtime_test', 'tenants', 'INSERT')
        OR has_table_privilege('llm_gateway_runtime_test', 'tenant_policy_revisions', 'UPDATE') THEN
         RAISE EXCEPTION 'Tenant Administration role isolation assertion failed';

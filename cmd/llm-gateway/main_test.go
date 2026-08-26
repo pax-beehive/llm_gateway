@@ -368,6 +368,18 @@ func TestRoutesFromJSONRejectsSplitAnthropicCacheTransport(t *testing.T) {
 	}
 }
 
+func TestGatewayAPIKeyPepperRingSupportsBoundedVersionMigration(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEY_PEPPERS_JSON", `{"1":"old-pepper-at-least-16","2":"current-pepper-at-least-16"}`)
+	t.Setenv("GATEWAY_API_KEY_CURRENT_DIGEST_VERSION", "2")
+	current, peppers, err := gatewayAPIKeyPepperRingFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current != 2 || string(peppers[1]) != "old-pepper-at-least-16" || string(peppers[2]) != "current-pepper-at-least-16" {
+		t.Fatalf("pepper ring = current %d versions %#v", current, peppers)
+	}
+}
+
 type recordingConfigurationRepository struct {
 	publishCalls int
 }

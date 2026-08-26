@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
+	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
@@ -75,6 +78,9 @@ func run() error {
 		if err := tenantadmin.Migrate(ctx, database); err != nil {
 			return err
 		}
+		if err := credentialadmin.Migrate(ctx, database); err != nil {
+			return err
+		}
 	}
 	administration, err := tenantadmin.NewService(database, time.Now)
 	if err != nil {
@@ -84,7 +90,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	api := controlapi.New(controlapi.Config{Administration: administration, Verifier: verifier})
+	pepperRing, err := credentialPepperRingFromEnv()
+	if err != nil {
+		return err
+	}
+	credentials, err := credentialadmin.NewService(database, pepperRing, time.Now, nil)
+	if err != nil {
+		return fmt.Errorf("configure Gateway Credential Administration: %w", err)
+	}
+	api := controlapi.New(controlapi.Config{Administration: administration, Credentials: credentials, Verifier: verifier})
 	mux := http.NewServeMux()
 	mux.Handle("/", api)
 	address := envOr("CONTROL_PLANE_ADDR", ":8081")
@@ -155,6 +169,31 @@ func assertDatabaseRole(ctx context.Context, database *sql.DB, devMode bool) err
 		return fmt.Errorf("control-plane database role mismatch: connected as %q", current)
 	}
 	return nil
+}
+
+func credentialPepperRingFromEnv() (credentialadmin.PepperRing, error) {
+	encoded := strings.TrimSpace(os.Getenv("CONTROL_API_KEY_PEPPERS_JSON"))
+	currentValue := strings.TrimSpace(os.Getenv("CONTROL_API_KEY_CURRENT_DIGEST_VERSION"))
+	if encoded == "" || currentValue == "" {
+		return credentialadmin.PepperRing{}, errors.New("CONTROL_API_KEY_PEPPERS_JSON and CONTROL_API_KEY_CURRENT_DIGEST_VERSION are required")
+	}
+	var configured map[string]string
+	if err := json.Unmarshal([]byte(encoded), &configured); err != nil {
+		return credentialadmin.PepperRing{}, fmt.Errorf("CONTROL_API_KEY_PEPPERS_JSON: %w", err)
+	}
+	current, err := strconv.ParseInt(currentValue, 10, 16)
+	if err != nil || current <= 0 {
+		return credentialadmin.PepperRing{}, errors.New("CONTROL_API_KEY_CURRENT_DIGEST_VERSION must be a positive integer")
+	}
+	peppers := make(map[int16][]byte, len(configured))
+	for versionValue, pepper := range configured {
+		version, err := strconv.ParseInt(versionValue, 10, 16)
+		if err != nil || version <= 0 {
+			return credentialadmin.PepperRing{}, errors.New("CONTROL_API_KEY_PEPPERS_JSON keys must be positive digest versions")
+		}
+		peppers[int16(version)] = []byte(pepper)
+	}
+	return credentialadmin.PepperRing{CurrentVersion: int16(current), Peppers: peppers}, nil
 }
 
 func envOr(name, fallback string) string {

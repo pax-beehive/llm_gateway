@@ -15,6 +15,8 @@ SELECT EXISTS (
     WHERE relation.oid IN (
         'tenants'::regclass,
         'tenant_policy_revisions'::regclass,
+        'api_keys'::regclass,
+        'api_key_policy_revisions'::regclass,
         'control_command_idempotency'::regclass,
         'control_audit_events'::regclass,
         'control_outbox'::regclass
@@ -28,6 +30,8 @@ SELECT EXISTS (
 REVOKE ALL PRIVILEGES ON TABLE
     tenants,
     tenant_policy_revisions,
+    api_keys,
+    api_key_policy_revisions,
     control_command_idempotency,
     control_audit_events,
     control_outbox
@@ -36,6 +40,8 @@ FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON TABLE
     tenants,
     tenant_policy_revisions,
+    api_keys,
+    api_key_policy_revisions,
     control_command_idempotency,
     control_audit_events,
     control_outbox
@@ -54,6 +60,22 @@ GRANT UPDATE (
     updated_at
 ) ON tenants TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE tenant_policy_revisions TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE api_keys TO :"tenant_admin_role";
+GRANT UPDATE (
+    name,
+    status,
+    revision,
+    policy_revision,
+    policy,
+    metadata,
+    expires_at,
+    revoked_at,
+    updated_at,
+    predecessor_id,
+    replacement_id,
+    grace_expires_at
+) ON api_keys TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE api_key_policy_revisions TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_command_idempotency TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_audit_events TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_outbox TO :"tenant_admin_role";
@@ -61,4 +83,4 @@ GRANT UPDATE (publish_attempts, published_at, last_error) ON control_outbox TO :
 
 -- The temporary Gateway adapter is read-only until ADR 0004 replaces it with
 -- the local Gateway Access Projection.
-GRANT SELECT ON TABLE tenants, tenant_policy_revisions TO :"gateway_role";
+GRANT SELECT ON TABLE tenants, tenant_policy_revisions, api_keys, api_key_policy_revisions TO :"gateway_role";

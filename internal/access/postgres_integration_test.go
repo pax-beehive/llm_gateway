@@ -78,6 +78,43 @@ func TestPersistedAPIKeyAuthenticatesCurrentTenantAndKeyPolicy(t *testing.T) {
 	if err != nil || repeated.ID != key.ID {
 		t.Fatalf("idempotent API key bootstrap = %#v / %v", repeated, err)
 	}
+	rotatingService, err := access.NewPostgresServiceWithPeppers(db, 2, map[int16][]byte{
+		1: []byte("integration-test-pepper"),
+		2: []byte("integration-test-pepper-v2"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rotatingService.Authenticate(ctx, rawKey); err != nil {
+		t.Fatalf("prior digest version did not authenticate during migration: %v", err)
+	}
+	versionTwoRawKey := "gw_test_version_two_" + tenantID
+	versionTwoKey, err := rotatingService.ImportAPIKey(ctx, access.APIKeySpec{
+		TenantID: tenantID, Name: "version two key", RawKey: versionTwoRawKey,
+		Policy: core.APIKeyPolicy{Revision: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var digestVersion int16
+	if err := db.QueryRowContext(ctx, `SELECT digest_version FROM api_keys WHERE id = $1`, versionTwoKey.ID).Scan(&digestVersion); err != nil {
+		t.Fatal(err)
+	}
+	if digestVersion != 2 {
+		t.Fatalf("new key digest version = %d, want 2", digestVersion)
+	}
+	if _, err := rotatingService.Authenticate(ctx, versionTwoRawKey); err != nil {
+		t.Fatalf("current digest version did not authenticate: %v", err)
+	}
+	retiredService, err := access.NewPostgresServiceWithPeppers(db, 2, map[int16][]byte{
+		2: []byte("integration-test-pepper-v2"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := retiredService.Authenticate(ctx, rawKey); !errors.Is(err, access.ErrInvalidAPIKey) {
+		t.Fatalf("retired digest version authentication = %v", err)
+	}
 	updatedKey, err := service.UpdateAPIKeyMetadata(ctx, tenantID, key.ID, key.Revision, map[string]any{
 		"environment": "integration", "owner": "platform",
 	})

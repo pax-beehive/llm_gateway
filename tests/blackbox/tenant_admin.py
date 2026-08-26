@@ -55,6 +55,29 @@ def main() -> None:
     require(headers.get("Etag") == '"1"', f"create ETag={headers.get('Etag')!r}")
     require(tenant["id"] == tenant_id and tenant["revision"] == 1, f"created={tenant!r}")
 
+    issue_payload = {
+        "name": "black-box workload",
+        "metadata": {"suite": "tenant-admin-blackbox"},
+        "policy": {"revision": 1},
+        "reason": "black-box credential issuance",
+    }
+    status, _, issued = request(
+        "POST",
+        f"/control/v1/tenants/{tenant_id}/gateway-api-keys",
+        issue_payload,
+        {"Idempotency-Key": "issue-" + suffix},
+    )
+    require(status == 201 and issued.get("secret", "").startswith("gw_"), f"issued={issued!r}")
+    status, replay_headers, replayed = request(
+        "POST",
+        f"/control/v1/tenants/{tenant_id}/gateway-api-keys",
+        issue_payload,
+        {"Idempotency-Key": "issue-" + suffix},
+    )
+    require(status == 201 and replayed["id"] == issued["id"], f"replayed={replayed!r}")
+    require("secret" not in replayed, "idempotent replay revealed the raw Gateway API Key")
+    require(replay_headers.get("Idempotency-Replayed") == "true", f"replay headers={replay_headers!r}")
+
     status, headers, policy = request(
         "PUT",
         f"/control/v1/tenants/{tenant_id}/policy",

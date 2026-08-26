@@ -11,14 +11,15 @@ test:
 test-race:
 	GOCACHE=$(GOCACHE) go test -race ./...
 
-test-integration: test-tenant-admin-roles
+test-integration:
 	@if [ -z "$(TEST_DATABASE_URL)" ]; then \
 		echo "TEST_DATABASE_URL is required; integration tests must not be skipped" >&2; \
 		exit 1; \
 	fi
 	GOCACHE=$(GOCACHE) go test -count=1 -p=1 -tags=integration \
 		./internal/access ./internal/store ./internal/configuration ./internal/cacheprotection \
-		./internal/quota ./internal/httpapi ./internal/tenantadmin ./cmd/llm-gateway
+		./internal/quota ./internal/httpapi ./internal/tenantadmin ./internal/credentialadmin ./cmd/llm-gateway
+	$(MAKE) test-tenant-admin-roles TEST_DATABASE_URL="$(TEST_DATABASE_URL)"
 
 integration-up:
 	docker compose up -d --wait postgres
@@ -68,6 +69,8 @@ run-dev:
 run-control-plane-dev:
 	GOCACHE=$(GOCACHE) CONTROL_PLANE_DEV_MODE=true CONTROL_PLANE_MIGRATE=true \
 	CONTROL_PLANE_DEV_TOKEN="$${CONTROL_PLANE_TOKEN:-local-control-admin-token}" \
+	CONTROL_API_KEY_CURRENT_DIGEST_VERSION=1 \
+	CONTROL_API_KEY_PEPPERS_JSON='{"1":"local-control-api-key-pepper"}' \
 	CONTROL_PLANE_DATABASE_URL="$${CONTROL_PLANE_DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
 	go run ./cmd/control-plane
 
