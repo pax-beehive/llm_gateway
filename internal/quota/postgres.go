@@ -15,26 +15,33 @@ import (
 var ErrReservationNotFound = errors.New("quota reservation not found")
 
 type ReservationRequest struct {
-	TenantID             string
-	APIKeyID             string
-	ResponseID           string
-	TenantPolicyRevision int64
-	APIKeyPolicyRevision int64
-	TenantLimits         core.QuotaLimits
-	APIKeyLimits         core.QuotaLimits
-	Requests             int64
-	ReservedInputTokens  int64
-	ReservedOutputTokens int64
-	ReservedSpendMicros  int64
-	Currency             string
-	ExpiresAt            time.Time
+	TenantID                    string
+	APIKeyID                    string
+	ResponseID                  string
+	CapabilityOperationID       string
+	Capability                  core.Capability
+	HomeRegion                  string
+	ExecutionEpoch              int64
+	TenantPolicyRevision        int64
+	APIKeyPolicyRevision        int64
+	TenantLimits                core.QuotaLimits
+	APIKeyLimits                core.QuotaLimits
+	Requests                    int64
+	ReservedInputTokens         int64
+	ReservedOutputTokens        int64
+	ReservedSpendMicros         int64
+	ReservedEmbeddingInputUnits int64
+	ReservedRerankDocuments     int64
+	Currency                    string
+	ExpiresAt                   time.Time
 }
 
 type Reservation struct {
-	ID         string
-	TenantID   string
-	APIKeyID   string
-	ResponseID string
+	ID          string
+	TenantID    string
+	APIKeyID    string
+	ResponseID  string
+	OperationID string
 }
 
 type RefreshReservationRequest struct {
@@ -51,10 +58,12 @@ type RefreshReservationRequest struct {
 }
 
 type ActualUsage struct {
-	Requests     int64
-	InputTokens  int64
-	OutputTokens int64
-	SpendMicros  int64
+	Requests            int64
+	InputTokens         int64
+	OutputTokens        int64
+	SpendMicros         int64
+	EmbeddingInputUnits int64
+	RerankDocuments     int64
 }
 
 type Counter struct {
@@ -112,6 +121,12 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 	if exceeds(effective.MaxCostMicros, request.ReservedSpendMicros) {
 		return Reservation{}, fmt.Errorf("%w: max request cost", ErrExceeded)
 	}
+	if exceeds(effective.EmbeddingInputUnits, request.ReservedEmbeddingInputUnits) {
+		return Reservation{}, fmt.Errorf("%w: embedding input units", ErrExceeded)
+	}
+	if exceeds(effective.RerankDocuments, request.ReservedRerankDocuments) {
+		return Reservation{}, fmt.Errorf("%w: rerank documents", ErrExceeded)
+	}
 	now := c.now().UTC()
 	minuteStart := now.Truncate(time.Minute)
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
@@ -125,6 +140,21 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 		return Reservation{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if request.CapabilityOperationID != "" {
+		var homeRegion string
+		var executionEpoch int64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT home_region, execution_epoch FROM tenants WHERE id = $1 FOR SHARE`, request.TenantID).Scan(
+			&homeRegion, &executionEpoch,
+		); errors.Is(err, sql.ErrNoRows) {
+			return Reservation{}, errors.New("capability quota writer fencing conflict")
+		} else if err != nil {
+			return Reservation{}, err
+		}
+		if homeRegion != request.HomeRegion || executionEpoch != request.ExecutionEpoch {
+			return Reservation{}, errors.New("capability quota writer fencing conflict")
+		}
+	}
 	if err := lockQuotaScopes(ctx, tx, request.TenantID, request.APIKeyID); err != nil {
 		return Reservation{}, err
 	}
@@ -137,24 +167,36 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 		request.Requests, tokens, request.ReservedSpendMicros, request.Currency, minuteStart, dayStart, monthStart); err != nil {
 		return Reservation{}, err
 	}
+	kind := "response"
+	if request.CapabilityOperationID != "" {
+		kind = "capability"
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO quota_reservations (
-			id, tenant_id, api_key_id, response_id, tenant_policy_revision, api_key_policy_revision,
+			id, tenant_id, api_key_id, response_id, capability_operation_id, capability,
+			capability_home_region, capability_execution_epoch, kind,
+			tenant_policy_revision, api_key_policy_revision,
 			currency, reserved_requests, reserved_input_tokens, reserved_output_tokens,
-			reserved_spend_micros, minute_window_start, day_window_start, month_window_start,
+			reserved_spend_micros, reserved_embedding_input_units, reserved_rerank_documents,
+			minute_window_start, day_window_start, month_window_start,
 			status, expires_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'reserved',$15)`,
-		id, request.TenantID, request.APIKeyID, request.ResponseID,
+		) VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,0),$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,'reserved',$22)`,
+		id, request.TenantID, request.APIKeyID, request.ResponseID, request.CapabilityOperationID, request.Capability,
+		request.HomeRegion, request.ExecutionEpoch, kind,
 		request.TenantPolicyRevision, request.APIKeyPolicyRevision, request.Currency,
 		request.Requests, request.ReservedInputTokens, request.ReservedOutputTokens,
-		request.ReservedSpendMicros, minuteStart, dayStart, monthStart, request.ExpiresAt,
+		request.ReservedSpendMicros, request.ReservedEmbeddingInputUnits, request.ReservedRerankDocuments,
+		minuteStart, dayStart, monthStart, request.ExpiresAt,
 	); err != nil {
 		return Reservation{}, fmt.Errorf("persist quota reservation: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Reservation{}, err
 	}
-	return Reservation{ID: id, TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: request.ResponseID}, nil
+	return Reservation{
+		ID: id, TenantID: request.TenantID, APIKeyID: request.APIKeyID,
+		ResponseID: request.ResponseID, OperationID: request.CapabilityOperationID,
+	}, nil
 }
 
 func (c *PostgresController) ReserveRefresh(ctx context.Context, request RefreshReservationRequest) (Reservation, error) {
@@ -216,7 +258,8 @@ func (c *PostgresController) ReserveRefresh(ctx context.Context, request Refresh
 }
 
 func (c *PostgresController) Commit(ctx context.Context, reservationID string, actual ActualUsage) error {
-	if actual.Requests < 0 || actual.InputTokens < 0 || actual.OutputTokens < 0 || actual.SpendMicros < 0 {
+	if actual.Requests < 0 || actual.InputTokens < 0 || actual.OutputTokens < 0 || actual.SpendMicros < 0 ||
+		actual.EmbeddingInputUnits < 0 || actual.RerankDocuments < 0 {
 		return errors.New("actual quota usage cannot be negative")
 	}
 	if actual.InputTokens > int64(^uint64(0)>>1)-actual.OutputTokens {
@@ -291,21 +334,25 @@ func (c *PostgresController) APIKeySnapshot(ctx context.Context, tenantID, apiKe
 }
 
 type reservationRecord struct {
-	id                   string
-	tenantID             string
-	apiKeyID             string
-	status               string
-	kind                 string
-	responseID           string
-	refreshIntentID      string
-	currency             string
-	reservedRequests     int64
-	reservedInputTokens  int64
-	reservedOutputTokens int64
-	reservedSpendMicros  int64
-	minuteStart          time.Time
-	dayStart             time.Time
-	monthStart           time.Time
+	id                          string
+	tenantID                    string
+	apiKeyID                    string
+	status                      string
+	kind                        string
+	responseID                  string
+	refreshIntentID             string
+	capabilityOperationID       string
+	capability                  core.Capability
+	currency                    string
+	reservedRequests            int64
+	reservedInputTokens         int64
+	reservedOutputTokens        int64
+	reservedSpendMicros         int64
+	reservedEmbeddingInputUnits int64
+	reservedRerankDocuments     int64
+	minuteStart                 time.Time
+	dayStart                    time.Time
+	monthStart                  time.Time
 }
 
 func (c *PostgresController) finish(ctx context.Context, reservationID, targetStatus string, actual ActualUsage) error {
@@ -316,12 +363,16 @@ func (c *PostgresController) finish(ctx context.Context, reservationID, targetSt
 	defer func() { _ = tx.Rollback() }()
 	var record reservationRecord
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, tenant_id, api_key_id, status, kind, COALESCE(response_id,''), COALESCE(cache_refresh_intent_id,''), currency, reserved_requests,
+		SELECT id, tenant_id, api_key_id, status, kind, COALESCE(response_id,''), COALESCE(cache_refresh_intent_id,''),
+		       COALESCE(capability_operation_id,''), COALESCE(capability,''), currency, reserved_requests,
 		       reserved_input_tokens, reserved_output_tokens, reserved_spend_micros,
+		       reserved_embedding_input_units, reserved_rerank_documents,
 		       minute_window_start, day_window_start, month_window_start
 		FROM quota_reservations WHERE id = $1 FOR UPDATE`, reservationID).Scan(
-		&record.id, &record.tenantID, &record.apiKeyID, &record.status, &record.kind, &record.responseID, &record.refreshIntentID, &record.currency, &record.reservedRequests,
+		&record.id, &record.tenantID, &record.apiKeyID, &record.status, &record.kind, &record.responseID, &record.refreshIntentID,
+		&record.capabilityOperationID, &record.capability, &record.currency, &record.reservedRequests,
 		&record.reservedInputTokens, &record.reservedOutputTokens, &record.reservedSpendMicros,
+		&record.reservedEmbeddingInputUnits, &record.reservedRerankDocuments,
 		&record.minuteStart, &record.dayStart, &record.monthStart,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -356,6 +407,9 @@ func (c *PostgresController) Reconcile(ctx context.Context, limit int) (int, err
 			OR (kind = 'cache_refresh' AND EXISTS (
 				SELECT 1 FROM cache_refresh_usage_ledger u WHERE u.tenant_id = quota_reservations.tenant_id
 				  AND u.cache_refresh_intent_id = quota_reservations.cache_refresh_intent_id))
+			OR (kind = 'capability' AND EXISTS (
+				SELECT 1 FROM capability_usage_ledger u WHERE u.tenant_id = quota_reservations.tenant_id
+				  AND u.quota_reservation_id = quota_reservations.id))
 		)
 		ORDER BY expires_at, id LIMIT $2`, c.now().UTC(), limit)
 	if err != nil {
@@ -394,12 +448,16 @@ func (c *PostgresController) reconcileOne(ctx context.Context, id string) (bool,
 	defer func() { _ = tx.Rollback() }()
 	var record reservationRecord
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, tenant_id, api_key_id, status, kind, COALESCE(response_id,''), COALESCE(cache_refresh_intent_id,''), currency,
+		SELECT id, tenant_id, api_key_id, status, kind, COALESCE(response_id,''), COALESCE(cache_refresh_intent_id,''),
+		       COALESCE(capability_operation_id,''), COALESCE(capability,''), currency,
 		       reserved_requests, reserved_input_tokens, reserved_output_tokens, reserved_spend_micros,
+		       reserved_embedding_input_units, reserved_rerank_documents,
 		       minute_window_start, day_window_start, month_window_start
 		FROM quota_reservations WHERE id = $1 FOR UPDATE`, id).Scan(
-		&record.id, &record.tenantID, &record.apiKeyID, &record.status, &record.kind, &record.responseID, &record.refreshIntentID, &record.currency,
+		&record.id, &record.tenantID, &record.apiKeyID, &record.status, &record.kind, &record.responseID, &record.refreshIntentID,
+		&record.capabilityOperationID, &record.capability, &record.currency,
 		&record.reservedRequests, &record.reservedInputTokens, &record.reservedOutputTokens, &record.reservedSpendMicros,
+		&record.reservedEmbeddingInputUnits, &record.reservedRerankDocuments,
 		&record.minuteStart, &record.dayStart, &record.monthStart)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, tx.Commit()
@@ -425,7 +483,8 @@ func (c *PostgresController) reconcileOne(ctx context.Context, id string) (bool,
 		}
 		target = "uncertain"
 		actual = ActualUsage{Requests: record.reservedRequests, InputTokens: record.reservedInputTokens,
-			OutputTokens: record.reservedOutputTokens, SpendMicros: record.reservedSpendMicros}
+			OutputTokens: record.reservedOutputTokens, SpendMicros: record.reservedSpendMicros,
+			EmbeddingInputUnits: record.reservedEmbeddingInputUnits, RerankDocuments: record.reservedRerankDocuments}
 	}
 	if err := settleReservationTx(ctx, tx, record, target, actual); err != nil {
 		return false, err
@@ -442,6 +501,15 @@ func reservationUsageTx(ctx context.Context, tx *sql.Tx, record reservationRecor
 			FROM cache_refresh_usage_ledger
 			WHERE tenant_id = $1 AND cache_refresh_intent_id = $2`, record.tenantID, record.refreshIntentID).Scan(
 			&actual.Requests, &actual.InputTokens, &actual.OutputTokens, &actual.SpendMicros)
+	} else if record.kind == "capability" {
+		err = tx.QueryRowContext(ctx, `
+			SELECT 1, 0, 0, amount_micros,
+			       CASE WHEN capability = 'embeddings' THEN input_units ELSE 0 END,
+			       CASE WHEN capability = 'rerank' THEN documents ELSE 0 END
+			FROM capability_usage_ledger
+			WHERE tenant_id = $1 AND quota_reservation_id = $2`, record.tenantID, record.id).Scan(
+			&actual.Requests, &actual.InputTokens, &actual.OutputTokens, &actual.SpendMicros,
+			&actual.EmbeddingInputUnits, &actual.RerankDocuments)
 	} else {
 		err = tx.QueryRowContext(ctx, `
 			SELECT 1, input_tokens, output_tokens, amount::bigint
@@ -489,8 +557,10 @@ func settleReservationTx(ctx context.Context, tx *sql.Tx, record reservationReco
 	_, err := tx.ExecContext(ctx, `
 		UPDATE quota_reservations
 		SET status = $2, committed_requests = $3, committed_input_tokens = $4,
-		    committed_output_tokens = $5, committed_spend_micros = $6, updated_at = now()
-		WHERE id = $1`, record.id, targetStatus, actual.Requests, actual.InputTokens, actual.OutputTokens, actual.SpendMicros)
+		    committed_output_tokens = $5, committed_spend_micros = $6,
+		    committed_embedding_input_units = $7, committed_rerank_documents = $8, updated_at = now()
+		WHERE id = $1`, record.id, targetStatus, actual.Requests, actual.InputTokens, actual.OutputTokens, actual.SpendMicros,
+		actual.EmbeddingInputUnits, actual.RerankDocuments)
 	return err
 }
 
@@ -613,13 +683,23 @@ func lockQuotaScopes(ctx context.Context, tx *sql.Tx, tenantID, apiKeyID string)
 }
 
 func validateReservationRequest(request ReservationRequest) error {
-	if request.TenantID == "" || request.APIKeyID == "" || request.ResponseID == "" {
-		return errors.New("quota reservation requires Tenant, API key, and Response identities")
+	if request.TenantID == "" || request.APIKeyID == "" {
+		return errors.New("quota reservation requires Tenant and API key identities")
+	}
+	responseIdentity := request.ResponseID != "" && request.CapabilityOperationID == "" && request.Capability == ""
+	capabilityIdentity := request.ResponseID == "" && request.CapabilityOperationID != "" &&
+		(request.Capability == core.CapabilityEmbeddings || request.Capability == core.CapabilityModeration || request.Capability == core.CapabilityRerank)
+	if !responseIdentity && !capabilityIdentity {
+		return errors.New("quota reservation requires exactly one Response or capability operation identity")
+	}
+	if capabilityIdentity && (request.HomeRegion == "" || request.ExecutionEpoch <= 0) {
+		return errors.New("capability quota reservation requires Home Region and execution epoch")
 	}
 	if request.TenantPolicyRevision <= 0 || request.APIKeyPolicyRevision <= 0 {
 		return errors.New("quota reservation requires positive policy revisions")
 	}
-	if request.Requests < 0 || request.ReservedInputTokens < 0 || request.ReservedOutputTokens < 0 || request.ReservedSpendMicros < 0 {
+	if request.Requests < 0 || request.ReservedInputTokens < 0 || request.ReservedOutputTokens < 0 || request.ReservedSpendMicros < 0 ||
+		request.ReservedEmbeddingInputUnits < 0 || request.ReservedRerankDocuments < 0 {
 		return errors.New("reserved quota amounts cannot be negative")
 	}
 	if request.ReservedInputTokens > int64(^uint64(0)>>1)-request.ReservedOutputTokens {

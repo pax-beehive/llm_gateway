@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -246,6 +247,48 @@ func TestRoutesFromJSONAcceptsFirstReleaseProviders(t *testing.T) {
 				t.Fatalf("routes = %#v, want configured %s route", routes, providerName)
 			}
 		})
+	}
+}
+
+func TestRoutesFromJSONWiresOnlyDeclaredStageACapabilities(t *testing.T) {
+	t.Setenv("STAGE_A_PROVIDER_KEY", "test-key")
+	payload := []byte(`[{
+		"id":"stage-a-route","provider":"openai","public_model":"gateway-stage-a",
+		"provider_model":"provider-stage-a","base_url":"https://provider.test/v1",
+		"api_key_env":"STAGE_A_PROVIDER_KEY","region":"local","home_region":"local",
+		"tenant_ids":["tenant-a"],
+		"credential_scope":"tenant-primary","healthy":true,
+		"capabilities":{"embeddings":"native","moderation":"native","rerank":"translated"},
+		"embedding_path":"/embeddings-v2","moderation_path":"/moderations-v2","rerank_path":"/rank",
+		"embedding_dimensions":768,
+		"embedding_input_cost_per_million":0.02,
+		"moderation_input_cost_per_million":0.01,
+		"rerank_document_cost_per_thousand":0.5,
+		"price_snapshot_id":"stage-a-price","price_effective_at":"2026-01-01T00:00:00Z",
+		"price_source":"contract","currency":"USD"
+	}]`)
+	routes, err := routesFromJSON(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || routes[0].EmbeddingExecutor == nil || routes[0].ModerationExecutor == nil || routes[0].RerankExecutor == nil {
+		t.Fatalf("route executors = %#v", routes)
+	}
+	if len(routes[0].TenantIDs) != 1 || routes[0].TenantIDs[0] != "tenant-a" {
+		t.Fatalf("route Tenant visibility = %#v", routes[0].TenantIDs)
+	}
+	price := routes[0].PriceSnapshot
+	if price.EmbeddingInputPerMillionMicros != 20_000 || price.ModerationInputPerMillionMicros != 10_000 || price.RerankDocumentPerThousandMicros != 500_000 {
+		t.Fatalf("capability prices = %#v", price)
+	}
+
+	payload = bytes.Replace(payload, []byte(`"moderation":"native","rerank":"translated"`), []byte(`"moderation":"unsupported","rerank":"unsupported"`), 1)
+	routes, err = routesFromJSON(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes[0].EmbeddingExecutor == nil || routes[0].ModerationExecutor != nil || routes[0].RerankExecutor != nil {
+		t.Fatalf("undeclared capability executors = %#v", routes[0])
 	}
 }
 

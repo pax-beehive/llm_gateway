@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
+	"github.com/toddzheng/llm-gateway/internal/capability"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
@@ -39,6 +40,8 @@ type principalContextKey struct{}
 
 type Config struct {
 	Runtime               *runtime.Runtime
+	CapabilityRuntime     *capability.Runtime
+	CapabilityCatalog     provider.CapabilityCatalog
 	ModelCatalog          provider.ModelCatalog
 	Authenticator         Authenticator
 	TenantHomeRegions     map[string]string
@@ -49,15 +52,17 @@ type Config struct {
 }
 
 type Server struct {
-	runtime         *runtime.Runtime
-	modelCatalog    provider.ModelCatalog
-	authenticator   Authenticator
-	homeRegions     map[string]string
-	executionEpochs map[string]int64
-	localRegion     string
-	homeRegionURLs  map[string]string
-	forwardClient   *http.Client
-	mux             *http.ServeMux
+	runtime           *runtime.Runtime
+	capabilityRuntime *capability.Runtime
+	capabilityCatalog provider.CapabilityCatalog
+	modelCatalog      provider.ModelCatalog
+	authenticator     Authenticator
+	homeRegions       map[string]string
+	executionEpochs   map[string]int64
+	localRegion       string
+	homeRegionURLs    map[string]string
+	forwardClient     *http.Client
+	mux               *http.ServeMux
 }
 
 func New(config Config) http.Handler {
@@ -68,7 +73,8 @@ func New(config Config) http.Handler {
 		config.ForwardClient = http.DefaultClient
 	}
 	server := &Server{
-		runtime: config.Runtime, modelCatalog: config.ModelCatalog, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
+		runtime: config.Runtime, capabilityRuntime: config.CapabilityRuntime, capabilityCatalog: config.CapabilityCatalog,
+		modelCatalog: config.ModelCatalog, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
 		executionEpochs: config.TenantExecutionEpochs, localRegion: config.LocalRegion,
 		homeRegionURLs: config.HomeRegionURLs, forwardClient: config.ForwardClient, mux: http.NewServeMux(),
 	}
@@ -78,6 +84,10 @@ func New(config Config) http.Handler {
 	server.mux.HandleFunc("POST /v1/responses/{response_id}/cancel", server.cancelResponse)
 	server.mux.HandleFunc("GET /v1/responses/{response_id}/input_items", server.inputItems)
 	server.mux.HandleFunc("POST /v1/chat/completions", server.chatCompletions)
+	server.mux.HandleFunc("POST /v1/embeddings", server.embeddings)
+	server.mux.HandleFunc("POST /v1/moderations", server.moderations)
+	server.mux.HandleFunc("POST /v1/rerank", server.rerank)
+	server.mux.HandleFunc("GET /v1/capabilities", server.listCapabilities)
 	server.mux.HandleFunc("GET /v1/models", server.listModels)
 	server.mux.HandleFunc("POST /v1/conversations", server.createConversation)
 	server.mux.HandleFunc("GET /v1/conversations/{conversation_id}", server.getConversation)
@@ -85,6 +95,320 @@ func New(config Config) http.Handler {
 	server.mux.HandleFunc("GET /v1/conversations/{conversation_id}/items", server.conversationItems)
 	server.mux.HandleFunc("POST /v1/conversations/{conversation_id}/items", server.appendConversationItems)
 	return server
+}
+
+func (s *Server) listCapabilities(responseWriter http.ResponseWriter, request *http.Request) {
+	if s.capabilityCatalog == nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "capability_catalog_unavailable", "capability catalog is unavailable", "")
+		return
+	}
+	entries, err := s.capabilityCatalog.ListCapabilities(request.Context(), provider.CapabilityCatalogQuery{
+		TenantID: tenantID(request), HomeRegion: s.homeRegion(request),
+	})
+	if err != nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "capability_catalog_unavailable", err.Error(), "")
+		return
+	}
+	data := make([]map[string]any, len(entries))
+	for index, entry := range entries {
+		data[index] = map[string]any{
+			"id": entry.ID, "object": "capability_profile", "created": entry.Created, "capabilities": entry.Capabilities,
+		}
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+type embeddingRequest struct {
+	Model             string                 `json:"model"`
+	Input             json.RawMessage        `json:"input"`
+	EncodingFormat    string                 `json:"encoding_format,omitempty"`
+	Dimensions        *int                   `json:"dimensions,omitempty"`
+	EndUserID         string                 `json:"user,omitempty"`
+	CompatibilityMode core.CompatibilityMode `json:"compatibility_mode,omitempty"`
+}
+
+func (s *Server) embeddings(responseWriter http.ResponseWriter, request *http.Request) {
+	if s.capabilityRuntime == nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "capability_unavailable", "embedding capability is unavailable", "")
+		return
+	}
+	var payload embeddingRequest
+	if err := decodeBody(request, &payload); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return
+	}
+	if payload.Model == "" {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model is required", "model")
+		return
+	}
+	if payload.EncodingFormat != "" && payload.EncodingFormat != "float" && payload.EncodingFormat != "base64" {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "encoding_format must be float or base64", "encoding_format")
+		return
+	}
+	if payload.Dimensions != nil && (*payload.Dimensions <= 0 || *payload.Dimensions > 4096) {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "dimensions must be between 1 and 4096", "dimensions")
+		return
+	}
+	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "compatibility_mode")
+		return
+	}
+	input, err := decodeEmbeddingInput(payload.Input)
+	if err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "input")
+		return
+	}
+	tenantPolicy, apiKeyPolicy := requestPolicies(request)
+	operationID, result, err := s.capabilityRuntime.Embed(request.Context(), core.EmbeddingRequest{
+		CapabilityPrincipal: core.CapabilityPrincipal{
+			TenantID: tenantID(request), APIKeyID: apiKeyID(request), HomeRegion: s.homeRegion(request),
+			ExecutionEpoch:    s.executionEpoch(request),
+			CompatibilityMode: payload.CompatibilityMode, TenantPolicy: tenantPolicy, APIKeyPolicy: apiKeyPolicy,
+		},
+		Model: payload.Model, Input: input, EncodingFormat: payload.EncodingFormat, Dimensions: payload.Dimensions, EndUserID: payload.EndUserID,
+	})
+	if operationID != "" {
+		responseWriter.Header().Set("X-Gateway-Operation-ID", operationID)
+	}
+	if err != nil {
+		writeCapabilityError(responseWriter, err)
+		return
+	}
+	data := make([]map[string]any, 0, len(result.Data))
+	for _, item := range result.Data {
+		embedding := any(item.Embedding)
+		if item.Base64 != "" {
+			embedding = item.Base64
+		}
+		data = append(data, map[string]any{"object": "embedding", "index": item.Index, "embedding": embedding})
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{
+		"object": "list", "data": data, "model": result.Model,
+		"usage": map[string]int64{"prompt_tokens": result.InputUnits, "total_tokens": result.InputUnits},
+	})
+}
+
+func decodeEmbeddingInput(raw json.RawMessage) ([]core.EmbeddingInput, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, errors.New("input is required")
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if text == "" {
+			return nil, errors.New("input text cannot be empty")
+		}
+		return []core.EmbeddingInput{{Text: &text}}, nil
+	}
+	var texts []string
+	if json.Unmarshal(raw, &texts) == nil {
+		if len(texts) == 0 {
+			return nil, errors.New("input cannot be empty")
+		}
+		result := make([]core.EmbeddingInput, len(texts))
+		for index := range texts {
+			if texts[index] == "" {
+				return nil, errors.New("input text cannot be empty")
+			}
+			value := texts[index]
+			result[index].Text = &value
+		}
+		return result, nil
+	}
+	var tokens []int64
+	if json.Unmarshal(raw, &tokens) == nil && len(tokens) > 0 {
+		return []core.EmbeddingInput{{Tokens: tokens}}, nil
+	}
+	var tokenSets [][]int64
+	if json.Unmarshal(raw, &tokenSets) == nil && len(tokenSets) > 0 {
+		result := make([]core.EmbeddingInput, len(tokenSets))
+		for index := range tokenSets {
+			if len(tokenSets[index]) == 0 {
+				return nil, errors.New("token input cannot be empty")
+			}
+			result[index].Tokens = tokenSets[index]
+		}
+		return result, nil
+	}
+	return nil, errors.New("input must be text, text array, token array, or token-array list")
+}
+
+type moderationRequest struct {
+	Model             string                 `json:"model"`
+	Input             json.RawMessage        `json:"input"`
+	EndUserID         string                 `json:"user,omitempty"`
+	CompatibilityMode core.CompatibilityMode `json:"compatibility_mode,omitempty"`
+}
+
+func (s *Server) moderations(responseWriter http.ResponseWriter, request *http.Request) {
+	if s.capabilityRuntime == nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "capability_unavailable", "moderation capability is unavailable", "")
+		return
+	}
+	var payload moderationRequest
+	if err := decodeBody(request, &payload); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return
+	}
+	if payload.Model == "" {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model is required", "model")
+		return
+	}
+	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "compatibility_mode")
+		return
+	}
+	input, err := decodeStringOrStrings(payload.Input)
+	if err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "input")
+		return
+	}
+	tenantPolicy, apiKeyPolicy := requestPolicies(request)
+	operationID, result, err := s.capabilityRuntime.Moderate(request.Context(), core.ModerationRequest{
+		CapabilityPrincipal: core.CapabilityPrincipal{
+			TenantID: tenantID(request), APIKeyID: apiKeyID(request), HomeRegion: s.homeRegion(request),
+			ExecutionEpoch:    s.executionEpoch(request),
+			CompatibilityMode: payload.CompatibilityMode, TenantPolicy: tenantPolicy, APIKeyPolicy: apiKeyPolicy,
+		},
+		Model: payload.Model, Input: input, EndUserID: payload.EndUserID,
+	})
+	if operationID != "" {
+		responseWriter.Header().Set("X-Gateway-Operation-ID", operationID)
+	}
+	if err != nil {
+		writeCapabilityError(responseWriter, err)
+		return
+	}
+	results := make([]map[string]any, len(result.Results))
+	for index, item := range result.Results {
+		results[index] = map[string]any{
+			"flagged": item.Flagged, "categories": item.Categories, "category_scores": item.CategoryScores,
+		}
+		if len(item.CategoryAppliedInputTypes) > 0 {
+			results[index]["category_applied_input_types"] = item.CategoryAppliedInputTypes
+		}
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{"id": result.ID, "model": result.Model, "results": results})
+}
+
+func decodeStringOrStrings(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, errors.New("input is required")
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if text == "" {
+			return nil, errors.New("input text cannot be empty")
+		}
+		return []string{text}, nil
+	}
+	var texts []string
+	if json.Unmarshal(raw, &texts) != nil || len(texts) == 0 {
+		return nil, errors.New("input must be text or a non-empty text array")
+	}
+	for _, value := range texts {
+		if value == "" {
+			return nil, errors.New("input text cannot be empty")
+		}
+	}
+	return texts, nil
+}
+
+type rerankRequest struct {
+	Model             string                 `json:"model"`
+	Query             string                 `json:"query"`
+	Documents         []json.RawMessage      `json:"documents"`
+	TopN              *int                   `json:"top_n,omitempty"`
+	ReturnDocuments   bool                   `json:"return_documents,omitempty"`
+	CompatibilityMode core.CompatibilityMode `json:"compatibility_mode,omitempty"`
+}
+
+func (s *Server) rerank(responseWriter http.ResponseWriter, request *http.Request) {
+	if s.capabilityRuntime == nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "capability_unavailable", "rerank capability is unavailable", "")
+		return
+	}
+	var payload rerankRequest
+	if err := decodeBody(request, &payload); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return
+	}
+	if payload.Model == "" || payload.Query == "" {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model and query are required", "")
+		return
+	}
+	if payload.TopN != nil && (*payload.TopN <= 0 || *payload.TopN > len(payload.Documents)) {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "top_n must be positive and no greater than the document count", "top_n")
+		return
+	}
+	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "compatibility_mode")
+		return
+	}
+	documents, err := decodeRerankDocuments(payload.Documents)
+	if err != nil {
+		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "documents")
+		return
+	}
+	tenantPolicy, apiKeyPolicy := requestPolicies(request)
+	operationID, result, err := s.capabilityRuntime.Rerank(request.Context(), core.RerankRequest{
+		CapabilityPrincipal: core.CapabilityPrincipal{
+			TenantID: tenantID(request), APIKeyID: apiKeyID(request), HomeRegion: s.homeRegion(request),
+			ExecutionEpoch:    s.executionEpoch(request),
+			CompatibilityMode: payload.CompatibilityMode, TenantPolicy: tenantPolicy, APIKeyPolicy: apiKeyPolicy,
+		},
+		Model: payload.Model, Query: payload.Query, Documents: documents, TopN: payload.TopN, ReturnDocuments: payload.ReturnDocuments,
+	})
+	if operationID != "" {
+		responseWriter.Header().Set("X-Gateway-Operation-ID", operationID)
+	}
+	if err != nil {
+		writeCapabilityError(responseWriter, err)
+		return
+	}
+	results := make([]map[string]any, len(result.Results))
+	for index, item := range result.Results {
+		results[index] = map[string]any{"index": item.Index, "relevance_score": item.RelevanceScore}
+		if item.Document != nil {
+			results[index]["document"] = map[string]string{"text": item.Document.Text}
+		}
+	}
+	writeJSON(responseWriter, http.StatusOK, map[string]any{"id": result.ID, "model": result.Model, "results": results})
+}
+
+func decodeRerankDocuments(raw []json.RawMessage) ([]core.RerankDocument, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("documents are required")
+	}
+	documents := make([]core.RerankDocument, len(raw))
+	for index, encoded := range raw {
+		var text string
+		if json.Unmarshal(encoded, &text) != nil {
+			var object struct {
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(encoded, &object) != nil {
+				return nil, fmt.Errorf("document %d must be text or an object with text", index)
+			}
+			text = object.Text
+		}
+		if text == "" {
+			return nil, fmt.Errorf("document %d text cannot be empty", index)
+		}
+		documents[index] = core.RerankDocument{Text: text}
+	}
+	return documents, nil
+}
+
+func writeCapabilityError(responseWriter http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	code := "capability_error"
+	if errors.Is(err, capability.ErrRouteNotFound) {
+		status = http.StatusBadRequest
+	} else if errors.Is(err, capability.ErrQuotaExceeded) {
+		status = http.StatusTooManyRequests
+		code = "rate_limit_exceeded"
+	}
+	writeError(responseWriter, status, code, err.Error(), "")
 }
 
 func (s *Server) listModels(responseWriter http.ResponseWriter, request *http.Request) {

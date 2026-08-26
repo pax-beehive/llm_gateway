@@ -61,6 +61,12 @@ var usageRollupsMigration string
 //go:embed migrations/000016_refresh_principal_and_quota_reconciliation.sql
 var refreshPrincipalAndQuotaReconciliationMigration string
 
+//go:embed migrations/000017_capability_usage.sql
+var capabilityUsageMigration string
+
+//go:embed migrations/000018_capability_quota.sql
+var capabilityQuotaMigration string
+
 type PostgresResponseStore struct {
 	db *sql.DB
 }
@@ -118,7 +124,124 @@ func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, refreshPrincipalAndQuotaReconciliationMigration); err != nil {
 		return fmt.Errorf("migrate refresh principal and quota reconciliation: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, capabilityUsageMigration); err != nil {
+		return fmt.Errorf("migrate capability usage: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, capabilityQuotaMigration); err != nil {
+		return fmt.Errorf("migrate capability quota: %w", err)
+	}
 	return nil
+}
+
+func (s *PostgresResponseStore) RecordCapabilityUsage(ctx context.Context, usage core.CapabilityUsageRecord) error {
+	if usage.ID == "" || usage.TenantID == "" || usage.APIKeyID == "" || usage.OperationID == "" ||
+		usage.HomeRegion == "" || usage.ExecutionEpoch <= 0 || usage.RouteID == "" ||
+		usage.Provider == "" || usage.Model == "" || usage.Currency == "" {
+		return errors.New("capability usage requires complete identity and attribution")
+	}
+	if usage.Capability != core.CapabilityEmbeddings && usage.Capability != core.CapabilityModeration && usage.Capability != core.CapabilityRerank {
+		return errors.New("capability usage has an unsupported capability")
+	}
+	if usage.InputUnits < 0 || usage.Dimensions < 0 || usage.Documents < 0 || usage.AmountMicros < 0 || usage.CreatedAt.IsZero() {
+		return errors.New("capability usage amounts and creation time are invalid")
+	}
+	if usage.PriceSnapshot.Provider != usage.Provider || usage.PriceSnapshot.Currency != usage.Currency {
+		return errors.New("capability usage price snapshot does not match attribution")
+	}
+	providerUsage := usage.ProviderUsage
+	if len(providerUsage) == 0 {
+		providerUsage = json.RawMessage(`{}`)
+	}
+	if err := core.ValidateCapabilityProviderUsage(providerUsage); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assertTenantWriter(ctx, tx, usage.TenantID, usage.HomeRegion, usage.ExecutionEpoch); err != nil {
+		return err
+	}
+	if err := ensurePriceSnapshot(ctx, tx, usage.PriceSnapshot); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO capability_usage_ledger (
+			id, tenant_id, api_key_id, operation_id, home_region, execution_epoch, quota_reservation_id, capability,
+			route_id, provider, model, price_snapshot_id, provider_usage,
+			input_units, dimensions, documents, amount_micros, currency, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		usage.ID, usage.TenantID, usage.APIKeyID, usage.OperationID, usage.HomeRegion, usage.ExecutionEpoch,
+		usage.QuotaReservationID, usage.Capability,
+		usage.RouteID, usage.Provider, usage.Model, usage.PriceSnapshot.ID, providerUsage,
+		usage.InputUnits, usage.Dimensions, usage.Documents, usage.AmountMicros, usage.Currency, usage.CreatedAt,
+	); err != nil {
+		return fmt.Errorf("insert immutable capability usage: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO capability_usage_daily (
+			usage_date, tenant_id, api_key_id, capability, provider, model, currency,
+			operation_count, input_units, documents, amount_micros
+		) VALUES (($1 AT TIME ZONE 'UTC')::date,$2,$3,$4,$5,$6,$7,1,$8,$9,$10)
+		ON CONFLICT (usage_date, tenant_id, api_key_id, capability, provider, model, currency) DO UPDATE SET
+			operation_count = capability_usage_daily.operation_count + 1,
+			input_units = capability_usage_daily.input_units + EXCLUDED.input_units,
+			documents = capability_usage_daily.documents + EXCLUDED.documents,
+			amount_micros = capability_usage_daily.amount_micros + EXCLUDED.amount_micros,
+			updated_at = now()`, usage.CreatedAt, usage.TenantID, usage.APIKeyID, usage.Capability,
+		usage.Provider, usage.Model, usage.Currency, usage.InputUnits, usage.Documents, usage.AmountMicros,
+	); err != nil {
+		return fmt.Errorf("update capability usage projection: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transactional_outbox (
+			tenant_id, aggregate_type, aggregate_id, aggregate_revision, event_type, payload
+		) VALUES ($1,'capability_usage',$2,1,'capability.usage_recorded',jsonb_build_object(
+			'operation_id',$2::text,'api_key_id',$3::text,'capability',$4::text,'provider',$5::text,'model',$6::text,
+			'input_units',$7::bigint,'dimensions',$8::bigint,'documents',$9::bigint,'amount_micros',$10::bigint,'currency',$11::text
+		))`, usage.TenantID, usage.OperationID, usage.APIKeyID, usage.Capability, usage.Provider, usage.Model,
+		usage.InputUnits, usage.Dimensions, usage.Documents, usage.AmountMicros, usage.Currency,
+	); err != nil {
+		return fmt.Errorf("record capability usage event: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresResponseStore) AssertCapabilityWriter(ctx context.Context, tenantID, homeRegion string, executionEpoch int64) error {
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM tenants
+			WHERE id = $1 AND home_region = $2 AND execution_epoch = $3
+		)`, tenantID, homeRegion, executionEpoch).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("%w: tenant home-region writer fencing conflict", ErrConflict)
+	}
+	return nil
+}
+
+func (s *PostgresResponseStore) ExecuteWithCapabilityWriterFence(
+	ctx context.Context,
+	tenantID string,
+	homeRegion string,
+	executionEpoch int64,
+	execute func(context.Context) error,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assertTenantWriter(ctx, tx, tenantID, homeRegion, executionEpoch); err != nil {
+		return err
+	}
+	if err := execute(ctx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *PostgresResponseStore) AcquireResponseSlot(ctx context.Context, tenantID, leaseID string, limit int, expiresAt time.Time) error {
@@ -791,12 +914,15 @@ func ensurePriceSnapshot(ctx context.Context, tx *sql.Tx, snapshot core.PriceSna
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO provider_price_snapshots (
 			id, provider, model, region, currency, input_per_million, cached_input_per_million,
-			cache_write_per_million, output_per_million, effective_at, source
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10), $11)
+			cache_write_per_million, output_per_million, embedding_input_per_million,
+			moderation_input_per_million, rerank_document_per_thousand, effective_at, source
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, to_timestamp($13), $14)
 		ON CONFLICT (id) DO NOTHING`,
 		snapshot.ID, snapshot.Provider, snapshot.Model, snapshot.Region, snapshot.Currency,
 		snapshot.InputPerMillionMicros, snapshot.CachedInputPerMillionMicros,
-		snapshot.CacheWritePerMillionMicros, snapshot.OutputPerMillionMicros, snapshot.EffectiveAt, snapshot.Source,
+		snapshot.CacheWritePerMillionMicros, snapshot.OutputPerMillionMicros,
+		snapshot.EmbeddingInputPerMillionMicros, snapshot.ModerationInputPerMillionMicros,
+		snapshot.RerankDocumentPerThousandMicros, snapshot.EffectiveAt, snapshot.Source,
 	); err != nil {
 		return fmt.Errorf("insert price snapshot: %w", err)
 	}
@@ -804,12 +930,15 @@ func ensurePriceSnapshot(ctx context.Context, tx *sql.Tx, snapshot core.PriceSna
 	err := tx.QueryRowContext(ctx, `
 		SELECT id, provider, model, region, currency,
 		       input_per_million::bigint, cached_input_per_million::bigint, cache_write_per_million::bigint,
-		       output_per_million::bigint,
+		       output_per_million::bigint, embedding_input_per_million, moderation_input_per_million,
+		       rerank_document_per_thousand,
 		       extract(epoch FROM effective_at)::bigint, source
 		FROM provider_price_snapshots WHERE id = $1`, snapshot.ID).Scan(
 		&existing.ID, &existing.Provider, &existing.Model, &existing.Region, &existing.Currency,
 		&existing.InputPerMillionMicros, &existing.CachedInputPerMillionMicros,
 		&existing.CacheWritePerMillionMicros, &existing.OutputPerMillionMicros,
+		&existing.EmbeddingInputPerMillionMicros, &existing.ModerationInputPerMillionMicros,
+		&existing.RerankDocumentPerThousandMicros,
 		&existing.EffectiveAt, &existing.Source,
 	)
 	if err != nil {
@@ -1116,16 +1245,18 @@ func lockConversation(ctx context.Context, tx *sql.Tx, tenantID, conversationID 
 }
 
 func assertTenantWriter(ctx context.Context, tx *sql.Tx, tenantID, homeRegion string, executionEpoch int64) error {
-	var exists bool
+	var currentHomeRegion string
+	var currentExecutionEpoch int64
 	if err := tx.QueryRowContext(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM tenants
-			WHERE id = $1 AND home_region = $2 AND execution_epoch = $3
-		)`, tenantID, homeRegion, executionEpoch).Scan(&exists); err != nil {
+		SELECT home_region, execution_epoch FROM tenants WHERE id = $1 FOR SHARE`, tenantID).Scan(
+		&currentHomeRegion, &currentExecutionEpoch,
+	); errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: tenant home-region writer fencing conflict", ErrConflict)
+	} else if err != nil {
 		return err
 	}
-	if !exists {
-		return errors.New("tenant home-region writer fencing conflict")
+	if currentHomeRegion != homeRegion || currentExecutionEpoch != executionEpoch {
+		return fmt.Errorf("%w: tenant home-region writer fencing conflict", ErrConflict)
 	}
 	return nil
 }

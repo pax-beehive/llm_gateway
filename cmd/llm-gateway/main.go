@@ -21,11 +21,13 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
+	"github.com/toddzheng/llm-gateway/internal/capability"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
+	"github.com/toddzheng/llm-gateway/internal/provider/openaicapabilities"
 	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
 	"github.com/toddzheng/llm-gateway/internal/provider/openairesponses"
 	"github.com/toddzheng/llm-gateway/internal/quota"
@@ -36,29 +38,37 @@ import (
 )
 
 type routeConfig struct {
-	ID                 string                                `json:"id"`
-	Provider           string                                `json:"provider"`
-	PublicModel        string                                `json:"public_model"`
-	ProviderModel      string                                `json:"provider_model"`
-	BaseURL            string                                `json:"base_url"`
-	APIKeyEnv          string                                `json:"api_key_env"`
-	Region             string                                `json:"region"`
-	HomeRegion         string                                `json:"home_region"`
-	CredentialScope    string                                `json:"credential_scope"`
-	Capabilities       map[string]provider.CapabilitySupport `json:"capabilities"`
-	CapabilityRevision int64                                 `json:"capability_revision"`
-	Headers            map[string]string                     `json:"headers"`
-	InputCost          float64                               `json:"input_cost_per_million"`
-	OutputCost         float64                               `json:"output_cost_per_million"`
-	CachedInputCost    float64                               `json:"cached_input_cost_per_million"`
-	CacheWriteCost     float64                               `json:"cache_write_cost_per_million"`
-	PriceSnapshotID    string                                `json:"price_snapshot_id"`
-	PriceEffectiveAt   string                                `json:"price_effective_at"`
-	PriceSource        string                                `json:"price_source"`
-	Currency           string                                `json:"currency"`
-	CacheUsageReliable bool                                  `json:"cache_usage_reliable"`
-	Healthy            *bool                                 `json:"healthy,omitempty"`
-	CacheRefresh       *cacheRefreshConfig                   `json:"cache_refresh,omitempty"`
+	ID                  string                                `json:"id"`
+	Provider            string                                `json:"provider"`
+	PublicModel         string                                `json:"public_model"`
+	ProviderModel       string                                `json:"provider_model"`
+	BaseURL             string                                `json:"base_url"`
+	APIKeyEnv           string                                `json:"api_key_env"`
+	Region              string                                `json:"region"`
+	HomeRegion          string                                `json:"home_region"`
+	TenantIDs           []string                              `json:"tenant_ids,omitempty"`
+	CredentialScope     string                                `json:"credential_scope"`
+	Capabilities        map[string]provider.CapabilitySupport `json:"capabilities"`
+	CapabilityRevision  int64                                 `json:"capability_revision"`
+	Headers             map[string]string                     `json:"headers"`
+	InputCost           float64                               `json:"input_cost_per_million"`
+	OutputCost          float64                               `json:"output_cost_per_million"`
+	EmbeddingInputCost  float64                               `json:"embedding_input_cost_per_million"`
+	ModerationInputCost float64                               `json:"moderation_input_cost_per_million"`
+	RerankDocumentCost  float64                               `json:"rerank_document_cost_per_thousand"`
+	EmbeddingPath       string                                `json:"embedding_path,omitempty"`
+	ModerationPath      string                                `json:"moderation_path,omitempty"`
+	RerankPath          string                                `json:"rerank_path,omitempty"`
+	EmbeddingDimensions int                                   `json:"embedding_dimensions,omitempty"`
+	CachedInputCost     float64                               `json:"cached_input_cost_per_million"`
+	CacheWriteCost      float64                               `json:"cache_write_cost_per_million"`
+	PriceSnapshotID     string                                `json:"price_snapshot_id"`
+	PriceEffectiveAt    string                                `json:"price_effective_at"`
+	PriceSource         string                                `json:"price_source"`
+	Currency            string                                `json:"currency"`
+	CacheUsageReliable  bool                                  `json:"cache_usage_reliable"`
+	Healthy             *bool                                 `json:"healthy,omitempty"`
+	CacheRefresh        *cacheRefreshConfig                   `json:"cache_refresh,omitempty"`
 }
 
 type cacheRefreshConfig struct {
@@ -175,6 +185,11 @@ func run() error {
 		TenantPolicies:  tenantPolicies,
 		QuotaController: quotaController,
 	})
+	capabilityUsageStore, ok := responseStore.(store.CapabilityUsageStore)
+	if !ok {
+		return errors.New("configured store does not support capability usage")
+	}
+	capabilityEngine := capability.New(capabilityUsageStore, router, capability.Options{QuotaController: quotaController})
 	if cacheProtectionMode != runtime.CacheProtectionOffMode {
 		go runCacheWorker(ctx, cacheCoordinator, router, principalSource, tenantPolicies)
 	}
@@ -183,7 +198,8 @@ func run() error {
 	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
 	handler := httpapi.New(httpapi.Config{
-		Runtime: engine, ModelCatalog: router, Authenticator: authenticator, TenantHomeRegions: homeRegions,
+		Runtime: engine, CapabilityRuntime: capabilityEngine, CapabilityCatalog: router,
+		ModelCatalog: router, Authenticator: authenticator, TenantHomeRegions: homeRegions,
 		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
 	})
 
@@ -351,7 +367,13 @@ func configureAuthenticator(
 
 func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRouter, error) {
 	if os.Getenv("GATEWAY_DEV_ECHO") == "true" {
-		return provider.NewStaticRouter(provider.NewEchoExecutor()), nil
+		var tenantIDs []string
+		if payload := os.Getenv("GATEWAY_DEV_ROUTE_TENANT_IDS_JSON"); payload != "" {
+			if err := json.Unmarshal([]byte(payload), &tenantIDs); err != nil {
+				return nil, fmt.Errorf("GATEWAY_DEV_ROUTE_TENANT_IDS_JSON: %w", err)
+			}
+		}
+		return provider.NewStaticRouterForTenants(provider.NewEchoExecutor(), tenantIDs), nil
 	}
 	if database == nil {
 		routes, err := routesFromJSON([]byte(os.Getenv("GATEWAY_ROUTES_JSON")))
@@ -447,12 +469,30 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		if !firstReleaseProvider(config.Provider) {
 			return nil, fmt.Errorf("route %d provider %q is outside the first-release scope; supported providers are openai, deepseek, anthropic, and gemini", index, config.Provider)
 		}
-		if !validNonNegativeCost(config.InputCost) || !validNonNegativeCost(config.OutputCost) || !validNonNegativeCost(config.CachedInputCost) {
+		if !validNonNegativeCost(config.InputCost) || !validNonNegativeCost(config.OutputCost) || !validNonNegativeCost(config.CachedInputCost) ||
+			!validNonNegativeCost(config.EmbeddingInputCost) || !validNonNegativeCost(config.ModerationInputCost) || !validNonNegativeCost(config.RerankDocumentCost) {
 			return nil, fmt.Errorf("route %q prices must be finite and non-negative", config.ID)
+		}
+		if config.EmbeddingDimensions < 0 {
+			return nil, fmt.Errorf("route %q embedding_dimensions cannot be negative", config.ID)
+		}
+		seenTenants := make(map[string]struct{}, len(config.TenantIDs))
+		for _, tenantID := range config.TenantIDs {
+			if tenantID == "" {
+				return nil, fmt.Errorf("route %q tenant_ids cannot contain an empty Tenant ID", config.ID)
+			}
+			if _, exists := seenTenants[tenantID]; exists {
+				return nil, fmt.Errorf("route %q tenant_ids contains duplicate %q", config.ID, tenantID)
+			}
+			seenTenants[tenantID] = struct{}{}
 		}
 		executor, cacheProtector, cacheAnchorBuilder, err := buildProviderComponents(config)
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", config.ID, err)
+		}
+		capabilityAdapter, err := buildCapabilityAdapter(config)
+		if err != nil {
+			return nil, fmt.Errorf("route %q capability adapter: %w", config.ID, err)
 		}
 		effectiveAt, err := time.Parse(time.RFC3339, config.PriceEffectiveAt)
 		if err != nil || config.PriceSnapshotID == "" || config.PriceSource == "" || config.Currency == "" {
@@ -462,9 +502,10 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", config.ID, err)
 		}
-		routes = append(routes, provider.Route{
+		route := provider.Route{
 			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
 			HomeRegion: config.HomeRegion, CredentialScope: config.CredentialScope, Healthy: config.Healthy == nil || *config.Healthy,
+			TenantIDs: append([]string(nil), config.TenantIDs...),
 			InputCost: config.InputCost, OutputCost: config.OutputCost, Executor: executor,
 			Profile: provider.CapabilityProfile{Revision: max(config.CapabilityRevision, 1), Features: config.Capabilities},
 			PriceSnapshot: core.PriceSnapshot{
@@ -472,14 +513,45 @@ func routesFromJSON(payload []byte) ([]provider.Route, error) {
 				Currency: config.Currency, InputPerMillionMicros: currencyMicros(config.InputCost),
 				CachedInputPerMillionMicros: currencyMicros(config.CachedInputCost),
 				CacheWritePerMillionMicros:  currencyMicros(cacheWriteCost), OutputPerMillionMicros: currencyMicros(config.OutputCost),
-				EffectiveAt: effectiveAt.Unix(), Source: config.PriceSource,
+				EmbeddingInputPerMillionMicros:  currencyMicros(config.EmbeddingInputCost),
+				ModerationInputPerMillionMicros: currencyMicros(config.ModerationInputCost),
+				RerankDocumentPerThousandMicros: currencyMicros(config.RerankDocumentCost),
+				EffectiveAt:                     effectiveAt.Unix(), Source: config.PriceSource,
 			},
 			CacheUsageReliable: config.CacheUsageReliable,
 			CacheProtector:     cacheProtector,
 			CacheAnchorBuilder: cacheAnchorBuilder,
-		})
+		}
+		if capabilityAdapter != nil {
+			if declaredCapability(config.Capabilities["embeddings"]) {
+				route.EmbeddingExecutor = capabilityAdapter
+			}
+			if declaredCapability(config.Capabilities["moderation"]) {
+				route.ModerationExecutor = capabilityAdapter
+			}
+			if declaredCapability(config.Capabilities["rerank"]) {
+				route.RerankExecutor = capabilityAdapter
+			}
+		}
+		routes = append(routes, route)
 	}
 	return routes, nil
+}
+
+func declaredCapability(support provider.CapabilitySupport) bool {
+	return support == provider.CapabilityNative || support == provider.CapabilityTranslated
+}
+
+func buildCapabilityAdapter(config routeConfig) (*openaicapabilities.Adapter, error) {
+	if !declaredCapability(config.Capabilities["embeddings"]) && !declaredCapability(config.Capabilities["moderation"]) &&
+		!declaredCapability(config.Capabilities["rerank"]) {
+		return nil, nil
+	}
+	return openaicapabilities.New(openaicapabilities.Config{
+		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
+		Headers: config.Headers, EmbeddingPath: config.EmbeddingPath, ModerationPath: config.ModerationPath,
+		RerankPath: config.RerankPath, DefaultDimensions: config.EmbeddingDimensions,
+	})
 }
 
 func firstReleaseProvider(name string) bool {

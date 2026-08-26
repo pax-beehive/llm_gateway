@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -40,6 +41,15 @@ type FinancialResponseFinalizer interface {
 	FinalizeWithUsage(context.Context, string, core.Response, int64, core.UsageRecord) error
 }
 
+type CapabilityUsageStore interface {
+	RecordCapabilityUsage(context.Context, core.CapabilityUsageRecord) error
+}
+
+type CapabilityAdmissionStore interface {
+	AssertCapabilityWriter(context.Context, string, string, int64) error
+	ExecuteWithCapabilityWriterFence(context.Context, string, string, int64, func(context.Context) error) error
+}
+
 type GlobalQuotaStore interface {
 	AcquireResponseSlot(context.Context, string, string, int, time.Time) error
 	RenewResponseSlot(context.Context, string, string, time.Time) error
@@ -56,20 +66,75 @@ type idempotencyRecord struct {
 }
 
 type MemoryResponseStore struct {
-	mu            sync.RWMutex
-	responses     map[string]map[string]core.Response
-	idempotency   map[string]map[string]idempotencyRecord
-	conversations map[string]map[string]core.Conversation
-	usageRecords  map[string]map[string]core.UsageRecord
+	mu                     sync.RWMutex
+	responses              map[string]map[string]core.Response
+	idempotency            map[string]map[string]idempotencyRecord
+	conversations          map[string]map[string]core.Conversation
+	usageRecords           map[string]map[string]core.UsageRecord
+	capabilityUsageRecords map[string][]core.CapabilityUsageRecord
 }
 
 func NewMemoryResponseStore() *MemoryResponseStore {
 	return &MemoryResponseStore{
-		responses:     make(map[string]map[string]core.Response),
-		idempotency:   make(map[string]map[string]idempotencyRecord),
-		conversations: make(map[string]map[string]core.Conversation),
-		usageRecords:  make(map[string]map[string]core.UsageRecord),
+		responses:              make(map[string]map[string]core.Response),
+		idempotency:            make(map[string]map[string]idempotencyRecord),
+		conversations:          make(map[string]map[string]core.Conversation),
+		usageRecords:           make(map[string]map[string]core.UsageRecord),
+		capabilityUsageRecords: make(map[string][]core.CapabilityUsageRecord),
 	}
+}
+
+func (s *MemoryResponseStore) RecordCapabilityUsage(_ context.Context, record core.CapabilityUsageRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if record.ID == "" || record.TenantID == "" || record.OperationID == "" || record.Capability == "" ||
+		record.HomeRegion == "" || record.ExecutionEpoch <= 0 {
+		return errors.New("capability usage identity is required")
+	}
+	if len(record.ProviderUsage) == 0 {
+		record.ProviderUsage = []byte(`{}`)
+	}
+	if err := core.ValidateCapabilityProviderUsage(record.ProviderUsage); err != nil {
+		return err
+	}
+	for _, existing := range s.capabilityUsageRecords[record.TenantID] {
+		if existing.ID == record.ID || existing.OperationID == record.OperationID {
+			return errors.New("capability usage already exists")
+		}
+	}
+	record.ProviderUsage = append([]byte(nil), record.ProviderUsage...)
+	s.capabilityUsageRecords[record.TenantID] = append(s.capabilityUsageRecords[record.TenantID], record)
+	return nil
+}
+
+func (s *MemoryResponseStore) AssertCapabilityWriter(_ context.Context, tenantID, homeRegion string, executionEpoch int64) error {
+	if tenantID == "" || homeRegion == "" || executionEpoch <= 0 {
+		return fmt.Errorf("%w: invalid capability writer identity", ErrConflict)
+	}
+	return nil
+}
+
+func (s *MemoryResponseStore) ExecuteWithCapabilityWriterFence(
+	ctx context.Context,
+	tenantID string,
+	homeRegion string,
+	executionEpoch int64,
+	execute func(context.Context) error,
+) error {
+	if err := s.AssertCapabilityWriter(ctx, tenantID, homeRegion, executionEpoch); err != nil {
+		return err
+	}
+	return execute(ctx)
+}
+
+func (s *MemoryResponseStore) CapabilityUsageRecords(tenantID string) []core.CapabilityUsageRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	records := append([]core.CapabilityUsageRecord(nil), s.capabilityUsageRecords[tenantID]...)
+	for index := range records {
+		records[index].ProviderUsage = append([]byte(nil), records[index].ProviderUsage...)
+	}
+	return records
 }
 
 func (s *MemoryResponseStore) FinalizeWithUsage(_ context.Context, tenantID string, response core.Response, expectedRevision int64, usage core.UsageRecord) error {

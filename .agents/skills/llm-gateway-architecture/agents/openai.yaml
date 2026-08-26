@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLM Gateway Architecture"
+  short_description: "Design gateway architecture and ADRs"
+  default_prompt: "Review this LLM Gateway architecture change against the domain model and relevant ADRs."

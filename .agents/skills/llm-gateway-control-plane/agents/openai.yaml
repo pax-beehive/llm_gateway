@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLM Gateway Control Plane"
+  short_description: "Build gateway control-plane slices"
+  default_prompt: "Implement this LLM Gateway control-plane slice against its ADR with PostgreSQL and black-box verification."

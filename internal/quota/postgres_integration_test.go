@@ -31,7 +31,8 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -50,6 +51,8 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM capability_usage_daily WHERE tenant_id = $1`, tenantID)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM capability_usage_ledger WHERE tenant_id = $1`, tenantID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM quota_reservations WHERE tenant_id = $1`, tenantID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM cache_refresh_intents WHERE tenant_id = $1`, tenantID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM cache_leases WHERE tenant_id = $1`, tenantID)
@@ -105,6 +108,49 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	}
 	if snapshot.MonthlySpend.Reserved != 0 || snapshot.MonthlySpend.Committed != 20 {
 		t.Fatalf("monthly spend snapshot = %#v", snapshot.MonthlySpend)
+	}
+	capabilityReservation, err := controller.Reserve(ctx, quota.ReservationRequest{
+		TenantID: tenantID, APIKeyID: key.ID, CapabilityOperationID: "embedding-operation", Capability: core.CapabilityEmbeddings,
+		HomeRegion: "local", ExecutionEpoch: 1,
+		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
+		TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
+		Requests: 1, ReservedSpendMicros: 10, ReservedEmbeddingInputUnits: 7,
+		Currency: "USD", ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := responseStore.RecordCapabilityUsage(ctx, core.CapabilityUsageRecord{
+		ID: "embedding-usage", TenantID: tenantID, APIKeyID: key.ID, OperationID: "embedding-operation",
+		HomeRegion: "local", ExecutionEpoch: 1,
+		QuotaReservationID: capabilityReservation.ID, Capability: core.CapabilityEmbeddings,
+		RouteID: "embedding-route", Provider: "openai-" + tenantID, Model: "embedding-model-" + tenantID,
+		PriceSnapshot: core.PriceSnapshot{
+			ID: "embedding-price-" + tenantID, Provider: "openai-" + tenantID, Model: "embedding-model-" + tenantID, Region: "local", Currency: "USD",
+			EmbeddingInputPerMillionMicros: 20_000, EffectiveAt: now.Unix(), Source: "integration-test",
+		},
+		ProviderUsage: []byte(`{"prompt_tokens":7}`), InputUnits: 7, Dimensions: 1536,
+		AmountMicros: 8, Currency: "USD", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	settled, err := controller.Reconcile(ctx, 10)
+	if err != nil || settled != 1 {
+		t.Fatalf("reconcile capability usage = %d / %v", settled, err)
+	}
+	snapshot, err = controller.APIKeySnapshot(ctx, tenantID, key.ID, "USD", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.MonthlySpend.Reserved != 0 || snapshot.MonthlySpend.Committed != 28 {
+		t.Fatalf("monthly spend after capability = %#v", snapshot.MonthlySpend)
+	}
+	var committedEmbeddingUnits int64
+	if err := db.QueryRowContext(ctx, `SELECT committed_embedding_input_units FROM quota_reservations WHERE id = $1`, capabilityReservation.ID).Scan(&committedEmbeddingUnits); err != nil {
+		t.Fatal(err)
+	}
+	if committedEmbeddingUnits != 7 {
+		t.Fatalf("committed embedding units = %d, want 7", committedEmbeddingUnits)
 	}
 	results := make(chan struct {
 		reservation quota.Reservation
@@ -187,7 +233,7 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 		t.Fatalf("uncertain reservation marker = %v / %v", uncertainMarked, err)
 	}
 	currentTime = now.Add(2 * time.Minute)
-	settled, err := controller.Reconcile(ctx, 10)
+	settled, err = controller.Reconcile(ctx, 10)
 	if err != nil || settled != 1 {
 		t.Fatalf("reconcile expired refresh reservation = %d / %v", settled, err)
 	}

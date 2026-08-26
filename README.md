@@ -1,6 +1,6 @@
 # Universal LLM Gateway
 
-A Responses-first, multi-tenant Go gateway implementing [ADR 0001](docs/adr/0001-build-universal-llm-gateway-core.md). It exposes OpenAI-compatible Responses and Chat Completions APIs, normalizes provider events behind capability-aware Model Routes, and persists lifecycle state with tenant-scoped CAS revisions. The first release is intentionally limited to OpenAI, DeepSeek, Anthropic (Claude), and Gemini.
+A Responses-first, multi-tenant Go gateway implementing [ADR 0001](docs/adr/0001-build-universal-llm-gateway-core.md). It exposes OpenAI-compatible Responses and Chat Completions APIs plus the Stage A capability interfaces from [ADR 0009](docs/adr/0009-expand-capability-specific-inference-interfaces.md): embeddings, moderations, and reranking. Provider behavior stays behind capability-aware Model Routes, and lifecycle state uses tenant-scoped CAS revisions. The first release is intentionally limited to OpenAI, DeepSeek, Anthropic (Claude), and Gemini.
 
 ## Run locally
 
@@ -32,6 +32,28 @@ List the authenticated Tenant's currently routable public models:
 
 ```sh
 curl -sS http://localhost:8080/v1/models \
+  -H 'Authorization: Bearer dev-token'
+```
+
+The deterministic development route also supports the Stage A interfaces:
+
+```sh
+curl -sS http://localhost:8080/v1/embeddings \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"echo-v1","input":["first","second"],"dimensions":8}'
+
+curl -sS http://localhost:8080/v1/moderations \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"echo-v1","input":"ordinary text"}'
+
+curl -sS http://localhost:8080/v1/rerank \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"echo-v1","query":"red apple","documents":["ocean","red apple tree"],"top_n":1}'
+
+curl -sS http://localhost:8080/v1/capabilities \
   -H 'Authorization: Bearer dev-token'
 ```
 
@@ -89,6 +111,7 @@ Example route:
     "api_key_env": "OPENAI_API_KEY",
     "region": "us-west",
     "home_region": "us-west",
+    "tenant_ids": ["tenant-a"],
     "credential_scope": "tenant-primary",
     "healthy": true,
     "capability_revision": 1,
@@ -96,8 +119,18 @@ Example route:
       "text": "native",
       "streaming": "native",
       "sampling": "native",
-      "tools": "translated"
+      "tools": "translated",
+      "embeddings": "native",
+      "moderation": "native",
+      "rerank": "translated"
     },
+    "embedding_path": "/embeddings",
+    "moderation_path": "/moderations",
+    "rerank_path": "/rerank",
+    "embedding_dimensions": 1536,
+    "embedding_input_cost_per_million": 0.02,
+    "moderation_input_cost_per_million": 0,
+    "rerank_document_cost_per_thousand": 0.5,
     "price_snapshot_id": "provider-model-usd-2026-08-24",
     "price_effective_at": "2026-08-24T00:00:00Z",
     "price_source": "provider-price-contract-2026-08-24",
@@ -142,6 +175,10 @@ The direct adapter uses one serializer for live execution, Cache Anchors, and ze
 
 Strict compatibility is the default. A feature classified as `translated` is considered only when the request sets `compatibility_mode` to `best_effort`; `unsupported` or undeclared features are rejected instead of silently dropped.
 
+Stage A uses narrow `EmbeddingExecutor`, `ModerationExecutor`, and `RerankExecutor` seams. Route configuration never infers one capability from another: `/v1/capabilities` publishes only healthy, Home Region-compatible declarations usable by the authenticated Tenant. `tenant_ids` is an optional route allowlist; omitting it makes the route available to every Tenant in that Home Region. The production HTTP adapter uses the configured Provider model and paths while returning the public model ID, with a bounded upstream request timeout. Offline conformance tests cover bearer/header forwarding, wire shapes, normalized usage, timeout/error classification, and content-free evidence.
+
+Capability requests reserve RPM and spend before the Provider call. Limit Policies can additionally set `embedding_input_units`, `rerank_documents`, and `capability_spend_micros`; Tenant/key intersection remains most restrictive. `capability_usage_ledger` is an immutable, content-free financial ledger with a separate daily projection. It stores counts, dimensions, document totals, raw Provider usage, price snapshot identity, and spend—but never vectors, moderation inputs/results, rerank queries, or documents. Ambiguous Provider outcomes keep their reservation `uncertain`.
+
 Tenant policies bound concurrent Responses and input-item counts, set an explicit content-retention period, and can independently allow stored Responses, Cache Protection, and content inspection. Tenant and Gateway API Key Limit Policies can additionally cap input/output tokens, per-request cost, requests and tokens per minute, daily/monthly Response spend, and daily/monthly refresh spend. PostgreSQL reserves these hard limits before Provider execution under Tenant-then-key locks, then settles them to actual usage. A crashed or ambiguous execution keeps its conservative reservation as `uncertain`; a reconciliation worker settles durable usage facts and never releases an externally ambiguous spend estimate. Stateful writes received outside the Home Region are forwarded to its configured gateway URL, or rejected with HTTP 421 when that route is unavailable. Model Routes can be drained with `"healthy": false` without deleting their versioned configuration.
 
 ## Verification
@@ -159,6 +196,14 @@ With `make run-dev` running in another terminal, exercise the public HTTP contra
 ```sh
 make test-openai-sdk-blackbox
 ```
+
+Exercise the Stage A capability contract with the dependency-free HTTP black box:
+
+```sh
+make test-stage-a-blackbox
+```
+
+It covers the authenticated capability catalog, embeddings, moderations, reranking, and deterministic result shapes without Provider spend.
 
 The black-box suite covers model discovery, Responses create/retrieve/input-items/delete, `previous_response_id`, Responses streaming, Chat Completions, Chat streaming, and Conversations. Override `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_MODEL` to target another deployment. It requires the `openai` Python package and defaults to the zero-cost local `echo-v1` route.
 
@@ -203,7 +248,7 @@ The core migration is embedded in the binary and runs only when `GATEWAY_MIGRATE
 
 Responses can continue a branch with `previous_response_id`, or use a mutable Conversation with `conversation`; these modes are intentionally mutually exclusive. Conversation create/get/delete and CAS item append are available under `/v1/conversations`. A Response transaction appends its new input while acquiring the Conversation, then appends terminal output and releases it during the same transaction that records final usage.
 
-Every successful execution records the normalized token counts, original provider usage payload, immutable price snapshot, calculated amount, authenticated Gateway API Key, observed cache-discount evidence, and transactional outbox events. `usage_ledger` and `cache_refresh_usage_ledger` are immutable facts; `tenant_usage_daily`, `api_key_usage_daily`, and `api_key_refresh_usage_daily` are transactionally maintained reporting projections and are not the billing source of truth. Provider cache discounts are not labeled as Cache Protection savings unless separate Protected Hit evidence exists.
+Every successful execution records the normalized usage, original provider usage payload, immutable price snapshot, calculated amount, authenticated Gateway API Key, and transactional outbox events. `usage_ledger`, `capability_usage_ledger`, and `cache_refresh_usage_ledger` are immutable facts; their daily tables are transactionally maintained reporting projections and are not the billing source of truth. Provider cache discounts are not labeled as Cache Protection savings unless separate Protected Hit evidence exists.
 
 Responses accepts typed text, image, immutable file-reference, and reasoning items plus `instructions`, client function `tools`, `tool_choice`, sampling controls, and streaming/background lifecycle controls. Inline `file_data` is rejected so large payloads cannot fall through into PostgreSQL; clients must upload to regional object storage and pass an immutable `file_id`. Chat Completions translates text/image content arrays and preserves assistant tool-call history in both streaming and non-streaming forms. Reasoning summaries, encrypted reasoning, provider metadata, and end-user identity remain typed capability fields; adapters must declare support and reject unsupported replay rather than dropping them.
 
@@ -217,4 +262,4 @@ Production Cache Protection defaults to `GATEWAY_CACHE_PROTECTION_MODE=off`. In 
 
 ## OpenTelemetry
 
-Set `OTEL_EXPORTER_OTLP_ENDPOINT` (or the signal-specific traces/metrics endpoint variables) to export W3C-propagated HTTP and provider traces plus Response, token, cost, provider-duration, and cache-outcome metrics over OTLP/HTTP. With no endpoint, instrumentation is a no-op. `OTEL_SERVICE_NAME` defaults to `llm-gateway`.
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (or the signal-specific traces/metrics endpoint variables) to export W3C-propagated HTTP and provider traces plus Response, token, cost, provider-duration, cache-outcome, and Stage A capability operation/error/latency/usage/spend metrics over OTLP/HTTP. Capability metric attributes are bounded to capability and Provider. With no endpoint, instrumentation is a no-op. `OTEL_SERVICE_NAME` defaults to `llm-gateway`.

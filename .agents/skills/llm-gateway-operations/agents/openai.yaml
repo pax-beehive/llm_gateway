@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLM Gateway Operations"
+  short_description: "Verify and operate the LLM Gateway"
+  default_prompt: "Verify or diagnose this LLM Gateway operation and report each evidence surface separately."

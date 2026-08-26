@@ -188,6 +188,9 @@ type QuotaLimits struct {
 	MonthlySpendMicros        *int64 `json:"monthly_spend_micros,omitempty"`
 	RefreshDailySpendMicros   *int64 `json:"refresh_daily_spend_micros,omitempty"`
 	RefreshMonthlySpendMicros *int64 `json:"refresh_monthly_spend_micros,omitempty"`
+	EmbeddingInputUnits       *int64 `json:"embedding_input_units,omitempty"`
+	RerankDocuments           *int64 `json:"rerank_documents,omitempty"`
+	CapabilitySpendMicros     *int64 `json:"capability_spend_micros,omitempty"`
 	Currency                  string `json:"currency,omitempty"`
 }
 
@@ -278,17 +281,20 @@ type Event struct {
 }
 
 type PriceSnapshot struct {
-	ID                          string `json:"id"`
-	Provider                    string `json:"provider"`
-	Model                       string `json:"model"`
-	Region                      string `json:"region"`
-	Currency                    string `json:"currency"`
-	InputPerMillionMicros       int64  `json:"input_per_million_micros"`
-	CachedInputPerMillionMicros int64  `json:"cached_input_per_million_micros"`
-	CacheWritePerMillionMicros  int64  `json:"cache_write_per_million_micros"`
-	OutputPerMillionMicros      int64  `json:"output_per_million_micros"`
-	EffectiveAt                 int64  `json:"effective_at"`
-	Source                      string `json:"source"`
+	ID                              string `json:"id"`
+	Provider                        string `json:"provider"`
+	Model                           string `json:"model"`
+	Region                          string `json:"region"`
+	Currency                        string `json:"currency"`
+	InputPerMillionMicros           int64  `json:"input_per_million_micros"`
+	CachedInputPerMillionMicros     int64  `json:"cached_input_per_million_micros"`
+	CacheWritePerMillionMicros      int64  `json:"cache_write_per_million_micros"`
+	OutputPerMillionMicros          int64  `json:"output_per_million_micros"`
+	EmbeddingInputPerMillionMicros  int64  `json:"embedding_input_per_million_micros,omitempty"`
+	ModerationInputPerMillionMicros int64  `json:"moderation_input_per_million_micros,omitempty"`
+	RerankDocumentPerThousandMicros int64  `json:"rerank_document_per_thousand_micros,omitempty"`
+	EffectiveAt                     int64  `json:"effective_at"`
+	Source                          string `json:"source"`
 }
 
 type UsageRecord struct {

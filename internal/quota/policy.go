@@ -33,6 +33,9 @@ func EffectiveLimits(tenant, apiKey core.QuotaLimits) (core.QuotaLimits, error) 
 		MonthlySpendMicros:        restrictive(tenant.MonthlySpendMicros, apiKey.MonthlySpendMicros),
 		RefreshDailySpendMicros:   restrictive(tenant.RefreshDailySpendMicros, apiKey.RefreshDailySpendMicros),
 		RefreshMonthlySpendMicros: restrictive(tenant.RefreshMonthlySpendMicros, apiKey.RefreshMonthlySpendMicros),
+		EmbeddingInputUnits:       restrictive(tenant.EmbeddingInputUnits, apiKey.EmbeddingInputUnits),
+		RerankDocuments:           restrictive(tenant.RerankDocuments, apiKey.RerankDocuments),
+		CapabilitySpendMicros:     restrictive(tenant.CapabilitySpendMicros, apiKey.CapabilitySpendMicros),
 		Currency:                  currency,
 	}, nil
 }
@@ -51,6 +54,9 @@ func validateLimits(scope string, limits core.QuotaLimits) error {
 		{"monthly_spend_micros", limits.MonthlySpendMicros},
 		{"refresh_daily_spend_micros", limits.RefreshDailySpendMicros},
 		{"refresh_monthly_spend_micros", limits.RefreshMonthlySpendMicros},
+		{"embedding_input_units", limits.EmbeddingInputUnits},
+		{"rerank_documents", limits.RerankDocuments},
+		{"capability_spend_micros", limits.CapabilitySpendMicros},
 	}
 	for _, candidate := range values {
 		if candidate.value != nil && *candidate.value < 0 {
@@ -87,5 +93,5 @@ func cloneLimit(limit *int64) *int64 {
 
 func hasSpendLimit(limits core.QuotaLimits) bool {
 	return limits.MaxCostMicros != nil || limits.DailySpendMicros != nil || limits.MonthlySpendMicros != nil ||
-		limits.RefreshDailySpendMicros != nil || limits.RefreshMonthlySpendMicros != nil
+		limits.RefreshDailySpendMicros != nil || limits.RefreshMonthlySpendMicros != nil || limits.CapabilitySpendMicros != nil
 }

@@ -86,11 +86,15 @@ type Route struct {
 	Region             string
 	CredentialScope    string
 	HomeRegion         string
+	TenantIDs          []string
 	Healthy            bool
 	InputCost          float64
 	OutputCost         float64
 	Profile            CapabilityProfile
 	Executor           ResponseExecutor
+	EmbeddingExecutor  EmbeddingExecutor
+	ModerationExecutor ModerationExecutor
+	RerankExecutor     RerankExecutor
 	CacheProtector     CacheProtector
 	CacheAnchorBuilder CacheAnchorBuilder
 	PriceSnapshot      core.PriceSnapshot
@@ -127,9 +131,13 @@ type routeSnapshot struct {
 }
 
 func NewStaticRouter(executor ResponseExecutor) *StaticRouter {
-	return NewVersionedRouter(1, []Route{{
+	return NewStaticRouterForTenants(executor, nil)
+}
+
+func NewStaticRouterForTenants(executor ResponseExecutor, tenantIDs []string) *StaticRouter {
+	route := Route{
 		ID: "echo-default", Provider: "echo", Model: "echo-v1", Region: "local",
-		HomeRegion: "local", Healthy: true, Executor: executor,
+		HomeRegion: "local", TenantIDs: append([]string(nil), tenantIDs...), Healthy: true, Executor: executor,
 		Profile: CapabilityProfile{Revision: 1, Features: map[string]CapabilitySupport{
 			"text": CapabilityNative, "streaming": CapabilityNative,
 		}},
@@ -138,7 +146,17 @@ func NewStaticRouter(executor ResponseExecutor) *StaticRouter {
 			EffectiveAt: 0, Source: "builtin-zero-cost",
 		},
 		CacheUsageReliable: true,
-	}})
+	}
+	if _, ok := executor.(EchoExecutor); ok {
+		deterministic := NewDeterministicCapabilityExecutor()
+		route.EmbeddingExecutor = deterministic
+		route.ModerationExecutor = deterministic
+		route.RerankExecutor = deterministic
+		route.Profile.Features["embeddings"] = CapabilityNative
+		route.Profile.Features["moderation"] = CapabilityNative
+		route.Profile.Features["rerank"] = CapabilityNative
+	}
+	return NewVersionedRouter(1, []Route{route})
 }
 
 func NewRouter(routes ...Route) *StaticRouter {
@@ -198,6 +216,9 @@ func (r *StaticRouter) ListModels(_ context.Context, query ModelCatalogQuery) ([
 		if !route.Healthy || route.Model == "" || route.Profile.Features["text"] != CapabilityNative {
 			continue
 		}
+		if !routeVisibleToTenant(route, query.TenantID) {
+			continue
+		}
 		compatible := true
 		for _, feature := range query.RequiredFeatures {
 			if route.Profile.Features[feature] != CapabilityNative {
@@ -245,6 +266,9 @@ func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Ro
 		if !route.Healthy || (request.Model != route.Model && request.Model != route.ID) {
 			continue
 		}
+		if !routeVisibleToTenant(route, request.TenantID) {
+			continue
+		}
 		if request.HomeRegion != "" && route.HomeRegion != "" && route.HomeRegion != request.HomeRegion {
 			continue
 		}
@@ -276,6 +300,18 @@ func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Ro
 		return iCost < jCost
 	})
 	return candidates, nil
+}
+
+func routeVisibleToTenant(route Route, tenantID string) bool {
+	if len(route.TenantIDs) == 0 {
+		return true
+	}
+	for _, allowed := range route.TenantIDs {
+		if allowed == tenantID {
+			return true
+		}
+	}
+	return false
 }
 
 type EchoExecutor struct{}

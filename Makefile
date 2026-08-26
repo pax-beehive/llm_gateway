@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-openai-sdk-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-openai-sdk-blackbox test-stage-a-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -29,6 +29,9 @@ test-integration-local: integration-up
 test-openai-sdk-blackbox:
 	python3 tests/blackbox/openai_sdk.py
 
+test-stage-a-blackbox:
+	python3 tests/blackbox/stage_a.py
+
 test-codex-sandbox-blackbox:
 	bash tests/blackbox/codex_sandbox_multiturn.sh
 
@@ -50,8 +53,9 @@ vet:
 
 run-dev:
 	GOCACHE=$(GOCACHE) GATEWAY_DEV_MEMORY_STORE=true GATEWAY_DEV_ECHO=true \
-	GATEWAY_API_KEYS_JSON='{"dev-token":"tenant-dev"}' \
-	GATEWAY_TENANT_HOME_REGIONS_JSON='{"tenant-dev":"local"}' \
+	GATEWAY_API_KEYS_JSON='{"dev-token":"tenant-dev","other-token":"tenant-other"}' \
+	GATEWAY_TENANT_HOME_REGIONS_JSON='{"tenant-dev":"local","tenant-other":"local"}' \
+	GATEWAY_DEV_ROUTE_TENANT_IDS_JSON='["tenant-dev"]' \
 	go run ./cmd/llm-gateway
 
 compose-up:

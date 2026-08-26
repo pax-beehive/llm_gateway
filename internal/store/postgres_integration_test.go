@@ -77,6 +77,117 @@ func TestPostgresUsageIsAttributedAndProjectedByAPIKey(t *testing.T) {
 	}
 }
 
+func TestPostgresCapabilityUsageIsImmutableContentFreeAndProjected(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := responseStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("capability-usage-%d", time.Now().UnixNano())
+	accessService, err := access.NewPostgresService(db, []byte("integration-test-pepper"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accessService.CreateTenant(ctx, access.Tenant{
+		ID: tenantID, Slug: tenantID, DisplayName: "Capability usage tenant", Status: access.TenantActive,
+		HomeRegion: "local", ExecutionEpoch: 1, Policy: core.TenantPolicy{Revision: 1},
+	}, access.ChangeActor{Type: "test", ID: "integration"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	key, err := accessService.ImportAPIKey(ctx, access.APIKeySpec{
+		TenantID: tenantID, Name: "capability key", RawKey: "gw_test_capability_" + tenantID,
+		Policy: core.APIKeyPolicy{Revision: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	record := core.CapabilityUsageRecord{
+		ID: "capability-usage-" + tenantID, TenantID: tenantID, APIKeyID: key.ID, OperationID: "capability-operation-1",
+		HomeRegion: "local", ExecutionEpoch: 1,
+		Capability: core.CapabilityEmbeddings, RouteID: "embedding-route", Provider: "openai", Model: "embedding-model",
+		PriceSnapshot: core.PriceSnapshot{
+			ID: "capability-price-" + tenantID, Provider: "openai", Model: "embedding-model", Region: "local",
+			Currency: "USD", EmbeddingInputPerMillionMicros: 20_000, EffectiveAt: now.Unix(), Source: "integration-test",
+		},
+		ProviderUsage: []byte(`{"prompt_tokens":7}`), InputUnits: 7, Dimensions: 1536,
+		AmountMicros: 1, Currency: "USD", CreatedAt: now,
+	}
+	if err := responseStore.RecordCapabilityUsage(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := responseStore.RecordCapabilityUsage(ctx, record); err == nil {
+		t.Fatal("duplicate immutable capability usage unexpectedly succeeded")
+	}
+	var capability string
+	var inputUnits, dimensions, amount, projectedOperations, projectedInputUnits int64
+	var providerUsage string
+	if err := db.QueryRowContext(ctx, `
+		SELECT capability, input_units, dimensions, amount_micros, provider_usage::text
+		FROM capability_usage_ledger WHERE tenant_id = $1 AND operation_id = $2`, tenantID, record.OperationID).Scan(
+		&capability, &inputUnits, &dimensions, &amount, &providerUsage,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if capability != "embeddings" || inputUnits != 7 || dimensions != 1536 || amount != 1 || providerUsage != `{"prompt_tokens": 7}` {
+		t.Fatalf("ledger row = %s/%d/%d/%d/%s", capability, inputUnits, dimensions, amount, providerUsage)
+	}
+	if err := db.QueryRowContext(ctx, `
+		SELECT operation_count, input_units FROM capability_usage_daily
+		WHERE tenant_id = $1 AND api_key_id = $2 AND capability = 'embeddings'`, tenantID, key.ID).Scan(
+		&projectedOperations, &projectedInputUnits,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if projectedOperations != 1 || projectedInputUnits != 7 {
+		t.Fatalf("capability projection = %d/%d", projectedOperations, projectedInputUnits)
+	}
+	var deleteAction string
+	if err := db.QueryRowContext(ctx, `
+		SELECT confdeltype::text FROM pg_constraint
+		WHERE conname = 'capability_usage_ledger_tenant_id_fkey'`).Scan(&deleteAction); err != nil {
+		t.Fatal(err)
+	}
+	if deleteAction != "r" {
+		t.Fatalf("capability ledger Tenant delete action = %q, want restrict", deleteAction)
+	}
+	providerStarted := make(chan struct{})
+	providerRelease := make(chan struct{})
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- responseStore.ExecuteWithCapabilityWriterFence(ctx, tenantID, "local", 1, func(context.Context) error {
+			close(providerStarted)
+			<-providerRelease
+			return nil
+		})
+	}()
+	<-providerStarted
+	promotionDone := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, `UPDATE tenants SET execution_epoch = 2 WHERE id = $1`, tenantID)
+		promotionDone <- err
+	}()
+	select {
+	case err := <-promotionDone:
+		t.Fatalf("execution-epoch promotion did not wait for Provider fence: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(providerRelease)
+	if err := <-fenceDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-promotionDone; err != nil {
+		t.Fatal(err)
+	}
+	stale := record
+	stale.ID += "-stale"
+	stale.OperationID += "-stale"
+	if err := responseStore.RecordCapabilityUsage(ctx, stale); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("stale capability writer error = %v, want conflict", err)
+	}
+}
+
 func TestPostgresStoreFalseLeavesNoResponseContentOrOutboxSecret(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
@@ -419,6 +530,7 @@ func cleanupTenant(t *testing.T, db *sql.DB, tenantID string) {
 	for _, statement := range []string{
 		`DELETE FROM tenant_response_slots WHERE tenant_id = $1`,
 		`DELETE FROM transactional_outbox WHERE tenant_id = $1`,
+		`DELETE FROM capability_usage_ledger WHERE tenant_id = $1`,
 		`DELETE FROM savings_ledger WHERE tenant_id = $1`,
 		`DELETE FROM usage_ledger WHERE tenant_id = $1`,
 		`DELETE FROM idempotency_keys WHERE tenant_id = $1`,
