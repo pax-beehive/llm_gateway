@@ -14,10 +14,10 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/secretcustody"
-	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -33,7 +33,7 @@ func TestRegisterProviderConnectionStoresOnlySecretReferenceAndEmitsEvidence(t *
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := providerconnection.Migrate(ctx, db); err != nil {
@@ -336,7 +336,7 @@ func providerConnectionDatabase(t *testing.T) (*sql.DB, context.Context) {
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := providerconnection.Migrate(ctx, db); err != nil {

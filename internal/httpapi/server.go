@@ -23,6 +23,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/capability"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
@@ -619,7 +620,7 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 		switch {
 		case errors.Is(err, errAPIKeyConcurrencyDenied):
 			writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "")
-		case errors.Is(err, store.ErrQuotaExceeded):
+		case errors.Is(err, quota.ErrExceeded):
 			writeError(responseWriter, http.StatusTooManyRequests, "policy_denied", "Gateway API Key concurrent Response limit exceeded", "")
 		default:
 			writeError(responseWriter, http.StatusServiceUnavailable, "policy_coordination_unavailable", "Gateway API Key concurrency coordination is unavailable", "")
@@ -798,7 +799,7 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
 	if s.apiKeyInflight[principal.APIKeyID] >= *limit {
-		return nil, nil, store.ErrQuotaExceeded
+		return nil, nil, quota.ErrExceeded
 	}
 	s.apiKeyInflight[principal.APIKeyID]++
 	return request, &apiKeyConcurrencyLease{

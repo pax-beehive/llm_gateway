@@ -36,7 +36,7 @@ func TestRoutesFromJSONUsesOneAnthropicAdapterForExecutionAndCacheLifecycle(t *t
 	t.Setenv("ANTHROPIC_TEST_KEY", "test-key")
 	payload := []byte(`[{
 		"id":"anthropic-us","provider":"anthropic","public_model":"claude",
-		"provider_model":"claude-test","base_url":"https://api.anthropic.test/v1",
+		"provider_model":"claude-test","base_url":"https://api.anthropic.com/v1",
 		"api_key_env":"ANTHROPIC_TEST_KEY","region":"us-west","home_region":"us-west",
 		"credential_scope":"tenant-primary","capabilities":{"text":"native","streaming":"native"},
 		"price_snapshot_id":"price-1","price_effective_at":"2026-01-01T00:00:00Z",
@@ -62,7 +62,7 @@ func TestRoutesFromJSONUsesOneAnthropicAdapterForExecutionAndCacheLifecycle(t *t
 func TestRoutesFromJSONCanDrainAnUnhealthyRoute(t *testing.T) {
 	payload := []byte(`[{
 		"id":"draining","provider":"openai","public_model":"gateway-model",
-		"provider_model":"provider-model","base_url":"https://provider.test/v1",
+		"provider_model":"provider-model","base_url":"https://api.openai.com/v1",
 		"region":"local","home_region":"local","healthy":false,
 		"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
 		"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
@@ -86,7 +86,7 @@ func TestRoutesFromJSONCanDrainAnUnhealthyRoute(t *testing.T) {
 func TestRoutesFromJSONRejectsProviderOutsideFirstReleaseScope(t *testing.T) {
 	payload := []byte(`[{
 		"id":"other-provider","provider":"other","public_model":"gateway-model",
-		"provider_model":"provider-model","base_url":"https://provider.test/v1",
+		"provider_model":"provider-model","base_url":"https://api.openai.com/v1",
 		"region":"local","home_region":"local","healthy":true,
 		"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
 		"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
@@ -100,7 +100,7 @@ func TestPublishRoutesRejectsUnsupportedProviderBeforeDurablePublication(t *test
 	repository := &recordingConfigurationRepository{}
 	payload := json.RawMessage(`[{
 		"id":"other-provider","provider":"other","public_model":"gateway-model",
-		"provider_model":"provider-model","base_url":"https://provider.test/v1",
+		"provider_model":"provider-model","base_url":"https://api.openai.com/v1",
 		"region":"local","home_region":"local","healthy":true,
 		"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
 		"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
@@ -229,16 +229,20 @@ func (s cachePrincipalSourceStub) LookupPrincipal(context.Context, string, strin
 
 func TestRoutesFromJSONAcceptsFirstReleaseProviders(t *testing.T) {
 	t.Setenv("PROVIDER_TEST_KEY", "test-key")
+	baseURLs := map[string]string{
+		"openai": "https://api.openai.com/v1", "deepseek": "https://api.deepseek.com/v1",
+		"anthropic": "https://api.anthropic.com/v1", "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+	}
 	for _, providerName := range []string{"openai", "deepseek", "anthropic", "gemini"} {
 		t.Run(providerName, func(t *testing.T) {
 			payload := []byte(fmt.Sprintf(`[{
 				"id":"%[1]s-route","provider":"%[1]s","public_model":"gateway-model",
-				"provider_model":"provider-model","base_url":"https://%[1]s.test/v1",
+				"provider_model":"provider-model","base_url":%[2]q,
 				"api_key_env":"PROVIDER_TEST_KEY","region":"local","home_region":"local",
 				"credential_scope":"tenant-primary","healthy":true,
 				"capabilities":{"text":"native"},"price_snapshot_id":"price-1",
 				"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD"
-			}]`, providerName))
+			}]`, providerName, baseURLs[providerName]))
 			routes, err := routesFromJSON(payload)
 			if err != nil {
 				t.Fatal(err)
@@ -254,7 +258,7 @@ func TestRoutesFromJSONWiresOnlyDeclaredStageACapabilities(t *testing.T) {
 	t.Setenv("STAGE_A_PROVIDER_KEY", "test-key")
 	payload := []byte(`[{
 		"id":"stage-a-route","provider":"openai","public_model":"gateway-stage-a",
-		"provider_model":"provider-stage-a","base_url":"https://provider.test/v1",
+		"provider_model":"provider-stage-a","base_url":"https://api.openai.com/v1",
 		"api_key_env":"STAGE_A_PROVIDER_KEY","region":"local","home_region":"local",
 		"tenant_ids":["tenant-a"],
 		"credential_scope":"tenant-primary","healthy":true,
@@ -296,12 +300,13 @@ func TestBuildProviderComponentsWiresProductionDialect(t *testing.T) {
 	t.Setenv("PROVIDER_DIALECT_TEST_KEY", "fake-key")
 	tests := []struct {
 		provider       string
+		baseURL        string
 		maxTokensField string
 		googleHeader   string
 	}{
-		{provider: "openai", maxTokensField: "max_output_tokens"},
-		{provider: "deepseek", maxTokensField: "max_tokens"},
-		{provider: "gemini", maxTokensField: "max_completion_tokens", googleHeader: "llm-gateway/0.1.0"},
+		{provider: "openai", baseURL: "https://api.openai.com/v1", maxTokensField: "max_output_tokens"},
+		{provider: "deepseek", baseURL: "https://api.deepseek.com/v1", maxTokensField: "max_tokens"},
+		{provider: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", maxTokensField: "max_completion_tokens", googleHeader: "llm-gateway/0.1.0"},
 	}
 	for _, test := range tests {
 		t.Run(test.provider, func(t *testing.T) {
@@ -322,7 +327,7 @@ func TestBuildProviderComponentsWiresProductionDialect(t *testing.T) {
 				}, nil
 			})}
 			executor, _, _, err := buildProviderComponentsWithHTTPClient(routeConfig{
-				Provider: test.provider, ProviderModel: "test-model", BaseURL: "https://provider.test/v1",
+				Provider: test.provider, ProviderModel: "test-model", BaseURL: test.baseURL,
 				APIKeyEnv: "PROVIDER_DIALECT_TEST_KEY",
 			}, client)
 			if err != nil {
@@ -357,7 +362,7 @@ func TestRoutesFromJSONRejectsSplitAnthropicCacheTransport(t *testing.T) {
 	t.Setenv("ANTHROPIC_TEST_KEY", "test-key")
 	payload := []byte(`[{
 		"id":"anthropic-us","provider":"anthropic","public_model":"claude",
-		"provider_model":"claude-test","base_url":"https://api.anthropic.test/v1",
+		"provider_model":"claude-test","base_url":"https://api.anthropic.com/v1",
 		"api_key_env":"ANTHROPIC_TEST_KEY","region":"us-west","home_region":"us-west",
 		"credential_scope":"tenant-primary","price_snapshot_id":"price-1",
 		"price_effective_at":"2026-01-01T00:00:00Z","price_source":"contract","currency":"USD",

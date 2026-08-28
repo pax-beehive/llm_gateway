@@ -4,68 +4,14 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
-
-//go:embed migrations/000001_core.sql
-var coreMigration string
-
-//go:embed migrations/000002_conversation_items.sql
-var conversationMigration string
-
-//go:embed migrations/000003_versioned_configuration.sql
-var configurationMigration string
-
-//go:embed migrations/000004_cache_protection_runtime.sql
-var cacheProtectionMigration string
-
-//go:embed migrations/000005_protected_hit_evidence.sql
-var protectedHitMigration string
-
-//go:embed migrations/000006_cache_write_usage.sql
-var cacheWriteUsageMigration string
-
-//go:embed migrations/000007_retention_and_epoch.sql
-var retentionAndEpochMigration string
-
-//go:embed migrations/000008_refresh_financial_evidence.sql
-var refreshFinancialEvidenceMigration string
-
-//go:embed migrations/000009_global_quota.sql
-var globalQuotaMigration string
-
-//go:embed migrations/000010_experiment_evidence.sql
-var experimentEvidenceMigration string
-
-//go:embed migrations/000011_cache_refresh_continuation_budget.sql
-var cacheRefreshContinuationBudgetMigration string
-
-//go:embed migrations/000012_access_control.sql
-var accessControlMigration string
-
-//go:embed migrations/000013_usage_principal.sql
-var usagePrincipalMigration string
-
-//go:embed migrations/000014_quota_reservations.sql
-var quotaReservationsMigration string
-
-//go:embed migrations/000015_usage_rollups.sql
-var usageRollupsMigration string
-
-//go:embed migrations/000016_refresh_principal_and_quota_reconciliation.sql
-var refreshPrincipalAndQuotaReconciliationMigration string
-
-//go:embed migrations/000017_capability_usage.sql
-var capabilityUsageMigration string
-
-//go:embed migrations/000018_capability_quota.sql
-var capabilityQuotaMigration string
 
 type PostgresResponseStore struct {
 	db *sql.DB
@@ -73,64 +19,6 @@ type PostgresResponseStore struct {
 
 func NewPostgresResponseStore(db *sql.DB) *PostgresResponseStore {
 	return &PostgresResponseStore{db: db}
-}
-
-func (s *PostgresResponseStore) Migrate(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, coreMigration); err != nil {
-		return fmt.Errorf("migrate response store: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, conversationMigration); err != nil {
-		return fmt.Errorf("migrate conversation store: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, configurationMigration); err != nil {
-		return fmt.Errorf("migrate configuration store: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, cacheProtectionMigration); err != nil {
-		return fmt.Errorf("migrate cache protection store: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, protectedHitMigration); err != nil {
-		return fmt.Errorf("migrate protected hit evidence: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, cacheWriteUsageMigration); err != nil {
-		return fmt.Errorf("migrate cache write usage: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, retentionAndEpochMigration); err != nil {
-		return fmt.Errorf("migrate retention and execution epoch: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, refreshFinancialEvidenceMigration); err != nil {
-		return fmt.Errorf("migrate refresh financial evidence: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, globalQuotaMigration); err != nil {
-		return fmt.Errorf("migrate global quota leases: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, experimentEvidenceMigration); err != nil {
-		return fmt.Errorf("migrate experiment evidence: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, cacheRefreshContinuationBudgetMigration); err != nil {
-		return fmt.Errorf("migrate cache refresh continuation budget: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, accessControlMigration); err != nil {
-		return fmt.Errorf("migrate access control: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, usagePrincipalMigration); err != nil {
-		return fmt.Errorf("migrate usage principal: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, quotaReservationsMigration); err != nil {
-		return fmt.Errorf("migrate quota reservations: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, usageRollupsMigration); err != nil {
-		return fmt.Errorf("migrate usage rollups: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, refreshPrincipalAndQuotaReconciliationMigration); err != nil {
-		return fmt.Errorf("migrate refresh principal and quota reconciliation: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, capabilityUsageMigration); err != nil {
-		return fmt.Errorf("migrate capability usage: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, capabilityQuotaMigration); err != nil {
-		return fmt.Errorf("migrate capability quota: %w", err)
-	}
-	return nil
 }
 
 func (s *PostgresResponseStore) RecordCapabilityUsage(ctx context.Context, usage core.CapabilityUsageRecord) error {
@@ -264,7 +152,7 @@ func (s *PostgresResponseStore) AcquireResponseSlot(ctx context.Context, tenantI
 		return err
 	}
 	if count >= limit {
-		return ErrQuotaExceeded
+		return quota.ErrExceeded
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tenant_response_slots (tenant_id, lease_id, expires_at)

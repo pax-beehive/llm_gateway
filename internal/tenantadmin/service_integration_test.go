@@ -16,13 +16,13 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
-	"github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
 func TestCreateTenantIsIdempotentAndCommitsAuditAndOutboxAtomically(t *testing.T) {
 	db, ctx := adminIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -90,7 +90,7 @@ func TestCreateTenantIsIdempotentAndCommitsAuditAndOutboxAtomically(t *testing.T
 
 func TestTenantQueriesUseStablePaginationAndEnforceActingTenantScope(t *testing.T) {
 	db, ctx := adminIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -143,7 +143,7 @@ func TestTenantQueriesUseStablePaginationAndEnforceActingTenantScope(t *testing.
 
 func TestTenantProfileAndLifecycleMutationsRequireCurrentRevision(t *testing.T) {
 	db, ctx := adminIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -254,7 +254,7 @@ func TestTenantProfileAndLifecycleMutationsRequireCurrentRevision(t *testing.T) 
 
 func TestTenantPolicyPublicationAndRestoreAppendImmutableRevisions(t *testing.T) {
 	db, ctx := adminIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -324,7 +324,7 @@ func TestTenantPolicyPublicationAndRestoreAppendImmutableRevisions(t *testing.T)
 
 func TestTenantLifecycleTransitionMatrix(t *testing.T) {
 	db, ctx := adminIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -378,7 +378,7 @@ func TestTenantLifecycleTransitionMatrix(t *testing.T) {
 
 func TestTenantWriteScopesCannotCrossActingTenant(t *testing.T) {
 	db, ctx := adminIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {

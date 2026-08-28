@@ -24,6 +24,10 @@ _Avoid_: Billing config, soft warning
 A durable, expiring claim against an effective Limit Policy made before a Provider side effect and later settled using actual Usage Ledger evidence.
 _Avoid_: Usage estimate, rate-limit check
 
+**Provider Attempt**:
+One bounded execution against one Model Route, with its own Quota Reservation, side-effect certainty, usage evidence, and terminal settlement.
+_Avoid_: Retry, Provider request
+
 **Usage Ledger**:
 The immutable financial fact for one Provider attempt or cache refresh, attributed to its Tenant and sponsoring Gateway API Key using the price snapshot in force at execution.
 _Avoid_: Usage counter, dashboard row

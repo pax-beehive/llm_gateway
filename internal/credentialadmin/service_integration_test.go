@@ -20,13 +20,13 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
-	"github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
 func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *testing.T) {
 	db, ctx := credentialIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -145,7 +145,7 @@ func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *te
 
 func TestPepperCoverageIncludesExpiredActiveKeysThatCanBeReactivated(t *testing.T) {
 	db, ctx := credentialIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -209,7 +209,7 @@ func TestPepperCoverageIncludesExpiredActiveKeysThatCanBeReactivated(t *testing.
 
 func TestGatewayAPIKeyQueriesAndProfileUpdateUseStablePaginationAndCAS(t *testing.T) {
 	db, ctx := credentialIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -300,7 +300,7 @@ func TestGatewayAPIKeyQueriesAndProfileUpdateUseStablePaginationAndCAS(t *testin
 
 func TestGatewayAPIKeyRotationReturnsSecretOnceAndGraceReconciliationRevokesPredecessor(t *testing.T) {
 	db, ctx := credentialIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {
@@ -385,7 +385,7 @@ func TestGatewayAPIKeyRotationReturnsSecretOnceAndGraceReconciliationRevokesPred
 
 func TestGatewayAPIKeyPolicyPublicationHistoryRestoreAndEffectiveIntersection(t *testing.T) {
 	db, ctx := credentialIntegrationDatabase(t)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {

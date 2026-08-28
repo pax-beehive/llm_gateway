@@ -15,50 +15,7 @@ var (
 	ErrConflict            = errors.New("response revision conflict")
 	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 	ErrConversationBusy    = errors.New("conversation already has an active response")
-	ErrQuotaExceeded       = errors.New("quota exceeded")
 )
-
-type ResponseStore interface {
-	Create(context.Context, string, core.Response) error
-	Get(context.Context, string, string) (core.Response, error)
-	Update(context.Context, string, core.Response, int64) error
-	Delete(context.Context, string, string, int64) error
-	ListInputItems(context.Context, string, string) ([]core.Item, error)
-}
-
-type IdempotentResponseStore interface {
-	CreateIdempotent(context.Context, string, core.Response, string, string, []byte) (core.Response, bool, error)
-}
-
-type ConversationStore interface {
-	CreateConversation(context.Context, string, core.Conversation) error
-	GetConversation(context.Context, string, string) (core.Conversation, error)
-	AppendConversationItems(context.Context, string, string, []core.Item, int64) (core.Conversation, error)
-	DeleteConversation(context.Context, string, string, int64) error
-}
-
-type FinancialResponseFinalizer interface {
-	FinalizeWithUsage(context.Context, string, core.Response, int64, core.UsageRecord) error
-}
-
-type CapabilityUsageStore interface {
-	RecordCapabilityUsage(context.Context, core.CapabilityUsageRecord) error
-}
-
-type CapabilityAdmissionStore interface {
-	AssertCapabilityWriter(context.Context, string, string, int64) error
-	ExecuteWithCapabilityWriterFence(context.Context, string, string, int64, func(context.Context) error) error
-}
-
-type GlobalQuotaStore interface {
-	AcquireResponseSlot(context.Context, string, string, int, time.Time) error
-	RenewResponseSlot(context.Context, string, string, time.Time) error
-	ReleaseResponseSlot(context.Context, string, string) error
-}
-
-type RetentionStore interface {
-	ScrubExpiredContent(context.Context, string, int) (int, error)
-}
 
 type idempotencyRecord struct {
 	requestHash []byte

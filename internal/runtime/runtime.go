@@ -17,6 +17,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/providerattempt"
 	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"go.opentelemetry.io/otel"
@@ -27,7 +28,7 @@ import (
 )
 
 type Runtime struct {
-	store               store.ResponseStore
+	store               ResponseStore
 	router              provider.Router
 	now                 func() time.Time
 	idleTimeout         time.Duration
@@ -76,15 +77,15 @@ const (
 
 var ErrProviderIdleTimeout = errors.New("provider stream idle timeout")
 
-var ErrQuotaExceeded = store.ErrQuotaExceeded
+var ErrQuotaExceeded = quota.ErrExceeded
 
 var ErrCacheProtectionNotAllowed = errors.New("Cache Protection not allowed")
 
-func New(responseStore store.ResponseStore, router provider.Router) *Runtime {
+func New(responseStore ResponseStore, router provider.Router) *Runtime {
 	return NewWithOptions(responseStore, router, Options{})
 }
 
-func NewWithOptions(responseStore store.ResponseStore, router provider.Router, options Options) *Runtime {
+func NewWithOptions(responseStore ResponseStore, router provider.Router, options Options) *Runtime {
 	if options.ProviderIdleTimeout <= 0 {
 		options.ProviderIdleTimeout = 90 * time.Second
 	}
@@ -178,7 +179,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	responseInput := prepareItems(request.Input)
 	request.Input = responseInput
 	if request.ConversationID != "" {
-		conversationStore, ok := r.store.(store.ConversationStore)
+		conversationStore, ok := r.store.(ConversationStore)
 		if !ok {
 			return core.Response{}, errors.New("configured Response Store does not support Conversations")
 		}
@@ -236,7 +237,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	}
 	responseSpan.SetAttributes(attribute.String("gateway.response.id", response.ID))
 	if request.IdempotencyKey != "" {
-		idempotentStore, ok := r.store.(store.IdempotentResponseStore)
+		idempotentStore, ok := r.store.(IdempotentResponseStore)
 		if !ok {
 			return core.Response{}, errors.New("configured Response Store does not support idempotency")
 		}
@@ -256,51 +257,12 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	if err != nil {
 		return r.fail(context.WithoutCancel(ctx), request.TenantID, response, "route_not_found", err)
 	}
-	var reservation *quota.Reservation
-	reservationSettled := false
-	reservationUsagePersisted := false
-	providerSideEffectStarted := false
-	if r.quotaController != nil && request.APIKeyID != "" && quota.HasLimits(effectiveLimits) {
-		estimate, estimateErr := quota.EstimateRequest(request, routes, effectiveLimits)
-		if estimateErr != nil {
-			return r.fail(context.WithoutCancel(ctx), request.TenantID, response, "quota_configuration_error", estimateErr)
+	var attemptReservations []*providerattempt.Attempt
+	defer func() {
+		for _, reservation := range attemptReservations {
+			r.settleIncompleteAttempt(reservation)
 		}
-		tenantPolicy, _ := r.tenantPolicy(request)
-		apiKeyPolicy := core.APIKeyPolicy{}
-		if request.APIKeyPolicy != nil {
-			apiKeyPolicy = *request.APIKeyPolicy
-		}
-		reserved, reserveErr := r.quotaController.Reserve(ctx, quota.ReservationRequest{
-			TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: response.ID,
-			TenantPolicyRevision: tenantPolicy.Revision, APIKeyPolicyRevision: apiKeyPolicy.Revision,
-			TenantLimits: tenantPolicy.Limits, APIKeyLimits: apiKeyPolicy.Limits,
-			Requests: 1, ReservedInputTokens: estimate.InputTokens, ReservedOutputTokens: estimate.OutputTokens,
-			ReservedSpendMicros: estimate.SpendMicros, Currency: estimate.Currency, ExpiresAt: now.Add(r.quotaLeaseTTL),
-		})
-		if reserveErr != nil {
-			if errors.Is(reserveErr, quota.ErrExceeded) {
-				reserveErr = fmt.Errorf("%w: %v", ErrQuotaExceeded, reserveErr)
-			}
-			return r.fail(context.WithoutCancel(ctx), request.TenantID, response, "quota_exceeded", reserveErr)
-		}
-		reservation = &reserved
-		defer func() {
-			if reservationSettled || reservationUsagePersisted {
-				return
-			}
-			settleCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			var settleErr error
-			if providerSideEffectStarted {
-				settleErr = r.quotaController.Uncertain(settleCtx, reserved.ID)
-			} else {
-				settleErr = r.quotaController.Commit(settleCtx, reserved.ID, quota.ActualUsage{Requests: 1})
-			}
-			if settleErr != nil && r.coordinationError != nil {
-				r.coordinationError(fmt.Errorf("settle incomplete quota reservation: %w", settleErr))
-			}
-		}()
-	}
+	}()
 	sequence := int64(0)
 	emitEvent := func(event core.Event) error {
 		if emit == nil {
@@ -349,9 +311,19 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			ID: newID("attempt"), RouteID: route.ID, Provider: route.Provider, ProviderModel: route.PriceSnapshot.Model,
 			Region: route.Region, StartedAt: attemptStart, PriceSnapshotID: route.PriceSnapshot.ID,
 		}
+		reservation, reserveErr := r.reserveResponseAttempt(executionCtx, request, response.ID, attempt.ID, route, effectiveLimits)
+		if reserveErr != nil {
+			if errors.Is(reserveErr, quota.ErrExceeded) {
+				reserveErr = fmt.Errorf("%w: %v", ErrQuotaExceeded, reserveErr)
+			}
+			return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "quota_exceeded", reserveErr)
+		}
+		if reservation != nil {
+			attemptReservations = append(attemptReservations, reservation)
+		}
 		response.Attempts = append(response.Attempts, attempt)
 		protectedHit := r.observeCustomerRequest(executionCtx, request, route)
-		providerSideEffectStarted = true
+		reservation.MarkSideEffectStarted()
 		stream, executeErr := route.Executor.Execute(executionCtx, request)
 		if executeErr != nil {
 			recordAttempt("request_error")
@@ -463,12 +435,12 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 			HoldoutCohort: r.experimentCohort(request, route), ExperimentRevision: r.experimentRevision(route),
 		}
 		if reservation != nil {
-			usageRecord.QuotaReservationID = reservation.ID
+			usageRecord.QuotaReservationID = reservation.ReservationID()
 		}
 		if protectedHit != nil && route.CacheUsageReliable && response.Usage.CachedInputTokens > 0 {
 			usageRecord.ProtectedHit = protectedHit
 		}
-		financialStore, supportsFinancialFinalization := r.store.(store.FinancialResponseFinalizer)
+		financialStore, supportsFinancialFinalization := r.store.(FinancialResponseFinalizer)
 		var persistErr error
 		if supportsFinancialFinalization {
 			if err := validatePriceSnapshot(route, usageRecord.PriceSnapshot); err != nil {
@@ -483,15 +455,14 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		if persistErr != nil {
 			return core.Response{}, fmt.Errorf("persist completed response and usage: %w", persistErr)
 		}
-		reservationUsagePersisted = true
+		reservation.MarkUsagePersisted()
 		if reservation != nil {
-			if err := r.quotaController.Commit(context.WithoutCancel(executionCtx), reservation.ID, quota.ActualUsage{
+			if err := reservation.Commit(context.WithoutCancel(executionCtx), quota.ActualUsage{
 				Requests: 1, InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens,
 				SpendMicros: usageRecord.AmountMicros,
 			}); err != nil {
 				return core.Response{}, fmt.Errorf("commit quota usage: %w", err)
 			}
-			reservationSettled = true
 		}
 		response.Revision++
 		r.responses.Add(executionCtx, 1, metric.WithAttributes(attribute.String("gateway.response.status", "completed")))
@@ -525,6 +496,56 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	return r.fail(context.WithoutCancel(executionCtx), request.TenantID, response, "provider_unavailable", lastErr)
 }
 
+func (r *Runtime) reserveResponseAttempt(
+	ctx context.Context,
+	request core.Request,
+	responseID string,
+	attemptID string,
+	route provider.Route,
+	effectiveLimits core.QuotaLimits,
+) (*providerattempt.Attempt, error) {
+	if r.quotaController == nil || request.APIKeyID == "" || !quota.HasLimits(effectiveLimits) {
+		return nil, nil
+	}
+	estimate, err := quota.EstimateRequest(request, []provider.Route{route}, effectiveLimits)
+	if err != nil {
+		return nil, fmt.Errorf("estimate Provider Attempt quota: %w", err)
+	}
+	tenantPolicy, _ := r.tenantPolicy(request)
+	apiKeyPolicy := core.APIKeyPolicy{}
+	if request.APIKeyPolicy != nil {
+		apiKeyPolicy = *request.APIKeyPolicy
+	}
+	reserved, err := r.quotaController.Reserve(ctx, quota.ReservationRequest{
+		TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: responseID, ResponseAttemptID: attemptID,
+		TenantPolicyRevision: tenantPolicy.Revision, APIKeyPolicyRevision: apiKeyPolicy.Revision,
+		TenantLimits: tenantPolicy.Limits, APIKeyLimits: apiKeyPolicy.Limits,
+		Requests: 1, ReservedInputTokens: estimate.InputTokens, ReservedOutputTokens: estimate.OutputTokens,
+		ReservedSpendMicros: estimate.SpendMicros, Currency: estimate.Currency, ExpiresAt: r.now().UTC().Add(r.quotaLeaseTTL),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return providerattempt.New(r.quotaController, &reserved), nil
+}
+
+func (r *Runtime) settleIncompleteAttempt(reservation *providerattempt.Attempt) {
+	if reservation == nil || reservation.Settled() || reservation.UsagePersisted() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var err error
+	if reservation.SideEffectStarted() {
+		err = reservation.Uncertain(ctx)
+	} else {
+		err = reservation.Commit(ctx, quota.ActualUsage{Requests: 1})
+	}
+	if err != nil && r.coordinationError != nil {
+		r.coordinationError(fmt.Errorf("settle incomplete Provider Attempt quota reservation: %w", err))
+	}
+}
+
 func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Context, func(), error) {
 	policy, configured := r.tenantPolicy(request)
 	if err := r.validateCacheProtectionAccess(request); err != nil {
@@ -541,7 +562,7 @@ func (r *Runtime) admit(ctx context.Context, request core.Request) (context.Cont
 	if !configured || policy.MaxConcurrentResponses <= 0 {
 		return ctx, func() {}, nil
 	}
-	if global, ok := r.store.(store.GlobalQuotaStore); ok {
+	if global, ok := r.store.(GlobalQuotaStore); ok {
 		leaseID := newID("quota")
 		if err := global.AcquireResponseSlot(ctx, request.TenantID, leaseID, policy.MaxConcurrentResponses, r.now().UTC().Add(r.quotaLeaseTTL)); err != nil {
 			return nil, nil, err
@@ -991,7 +1012,7 @@ func (r *Runtime) InputItems(ctx context.Context, tenantID, responseID string) (
 }
 
 func (r *Runtime) CreateConversation(ctx context.Context, tenantID, homeRegion string, executionEpoch int64, items []core.Item, metadata map[string]string) (core.Conversation, error) {
-	conversationStore, ok := r.store.(store.ConversationStore)
+	conversationStore, ok := r.store.(ConversationStore)
 	if !ok {
 		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
 	}
@@ -1006,7 +1027,7 @@ func (r *Runtime) CreateConversation(ctx context.Context, tenantID, homeRegion s
 }
 
 func (r *Runtime) GetConversation(ctx context.Context, tenantID, conversationID string) (core.Conversation, error) {
-	conversationStore, ok := r.store.(store.ConversationStore)
+	conversationStore, ok := r.store.(ConversationStore)
 	if !ok {
 		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
 	}
@@ -1014,7 +1035,7 @@ func (r *Runtime) GetConversation(ctx context.Context, tenantID, conversationID 
 }
 
 func (r *Runtime) AppendConversationItems(ctx context.Context, tenantID, conversationID, homeRegion string, executionEpoch int64, items []core.Item, expectedRevision int64) (core.Conversation, error) {
-	conversationStore, ok := r.store.(store.ConversationStore)
+	conversationStore, ok := r.store.(ConversationStore)
 	if !ok {
 		return core.Conversation{}, errors.New("configured Response Store does not support Conversations")
 	}
@@ -1029,7 +1050,7 @@ func (r *Runtime) AppendConversationItems(ctx context.Context, tenantID, convers
 }
 
 func (r *Runtime) DeleteConversation(ctx context.Context, tenantID, conversationID, homeRegion string, executionEpoch, expectedRevision int64) error {
-	conversationStore, ok := r.store.(store.ConversationStore)
+	conversationStore, ok := r.store.(ConversationStore)
 	if !ok {
 		return errors.New("configured Response Store does not support Conversations")
 	}

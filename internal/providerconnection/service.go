@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -315,9 +314,7 @@ func validateRegister(command RegisterCommand) error {
 		len(command.Secret) == 0 || len(command.Secret) > 64<<10 {
 		return fmt.Errorf("%w: ID, display name, region, credential scope, and bounded secret are required", ErrInvalidArgument)
 	}
-	switch command.Provider {
-	case "openai", "deepseek", "anthropic", "gemini":
-	default:
+	if _, err := provider.ParseIdentity(command.Provider); err != nil {
 		return fmt.Errorf("%w: unsupported Provider identity", ErrInvalidArgument)
 	}
 	if err := validateBaseURL(command.Provider, command.BaseURL); err != nil {
@@ -327,16 +324,11 @@ func validateRegister(command RegisterCommand) error {
 }
 
 func validateBaseURL(providerName, value string) error {
-	baseURL, err := url.Parse(value)
-	if err != nil || len(value) > 2048 || baseURL.Scheme != "https" || baseURL.Host == "" || baseURL.User != nil ||
-		baseURL.Fragment != "" || baseURL.RawQuery != "" {
-		return fmt.Errorf("%w: Base URL must be an absolute HTTPS URL without credentials, query, or fragments", ErrInvalidArgument)
+	identity, err := provider.ParseIdentity(providerName)
+	if err != nil {
+		return fmt.Errorf("%w: unsupported Provider identity", ErrInvalidArgument)
 	}
-	allowedHosts := map[string]string{
-		"openai": "api.openai.com", "deepseek": "api.deepseek.com",
-		"anthropic": "api.anthropic.com", "gemini": "generativelanguage.googleapis.com",
-	}
-	if baseURL.Hostname() != allowedHosts[providerName] || baseURL.Port() != "" {
+	if err := identity.ValidateBaseURL(value); err != nil {
 		return fmt.Errorf("%w: Base URL host is not registered for Provider identity", ErrPolicyDenied)
 	}
 	return nil
@@ -366,12 +358,8 @@ func validateCapabilityProfile(profile provider.CapabilityProfile, expectedRevis
 }
 
 func validProvider(value string) bool {
-	switch value {
-	case "openai", "deepseek", "anthropic", "gemini":
-		return true
-	default:
-		return false
-	}
+	_, err := provider.ParseIdentity(value)
+	return err == nil
 }
 
 func validStatus(value AdministrativeStatus) bool {

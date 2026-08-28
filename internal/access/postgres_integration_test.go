@@ -15,7 +15,7 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
-	"github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 )
 
 func TestPersistedAPIKeyAuthenticatesCurrentTenantAndKeyPolicy(t *testing.T) {
@@ -30,7 +30,7 @@ func TestPersistedAPIKeyAuthenticatesCurrentTenantAndKeyPolicy(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 

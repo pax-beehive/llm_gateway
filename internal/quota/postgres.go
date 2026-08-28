@@ -18,6 +18,7 @@ type ReservationRequest struct {
 	TenantID                    string
 	APIKeyID                    string
 	ResponseID                  string
+	ResponseAttemptID           string
 	CapabilityOperationID       string
 	Capability                  core.Capability
 	HomeRegion                  string
@@ -41,6 +42,7 @@ type Reservation struct {
 	TenantID    string
 	APIKeyID    string
 	ResponseID  string
+	AttemptID   string
 	OperationID string
 }
 
@@ -173,15 +175,15 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO quota_reservations (
-			id, tenant_id, api_key_id, response_id, capability_operation_id, capability,
+			id, tenant_id, api_key_id, response_id, response_attempt_id, capability_operation_id, capability,
 			capability_home_region, capability_execution_epoch, kind,
 			tenant_policy_revision, api_key_policy_revision,
 			currency, reserved_requests, reserved_input_tokens, reserved_output_tokens,
 			reserved_spend_micros, reserved_embedding_input_units, reserved_rerank_documents,
 			minute_window_start, day_window_start, month_window_start,
 			status, expires_at
-		) VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,0),$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,'reserved',$22)`,
-		id, request.TenantID, request.APIKeyID, request.ResponseID, request.CapabilityOperationID, request.Capability,
+		) VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),NULLIF($9,0),$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,'reserved',$23)`,
+		id, request.TenantID, request.APIKeyID, request.ResponseID, request.ResponseAttemptID, request.CapabilityOperationID, request.Capability,
 		request.HomeRegion, request.ExecutionEpoch, kind,
 		request.TenantPolicyRevision, request.APIKeyPolicyRevision, request.Currency,
 		request.Requests, request.ReservedInputTokens, request.ReservedOutputTokens,
@@ -195,7 +197,7 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 	}
 	return Reservation{
 		ID: id, TenantID: request.TenantID, APIKeyID: request.APIKeyID,
-		ResponseID: request.ResponseID, OperationID: request.CapabilityOperationID,
+		ResponseID: request.ResponseID, AttemptID: request.ResponseAttemptID, OperationID: request.CapabilityOperationID,
 	}, nil
 }
 
@@ -403,7 +405,7 @@ func (c *PostgresController) Reconcile(ctx context.Context, limit int) (int, err
 			expires_at <= $1
 			OR (kind = 'response' AND EXISTS (
 				SELECT 1 FROM usage_ledger u WHERE u.tenant_id = quota_reservations.tenant_id
-				  AND u.response_id = quota_reservations.response_id))
+				  AND u.quota_reservation_id = quota_reservations.id))
 			OR (kind = 'cache_refresh' AND EXISTS (
 				SELECT 1 FROM cache_refresh_usage_ledger u WHERE u.tenant_id = quota_reservations.tenant_id
 				  AND u.cache_refresh_intent_id = quota_reservations.cache_refresh_intent_id))
@@ -513,7 +515,7 @@ func reservationUsageTx(ctx context.Context, tx *sql.Tx, record reservationRecor
 	} else {
 		err = tx.QueryRowContext(ctx, `
 			SELECT 1, input_tokens, output_tokens, amount::bigint
-			FROM usage_ledger WHERE tenant_id = $1 AND response_id = $2`, record.tenantID, record.responseID).Scan(
+			FROM usage_ledger WHERE tenant_id = $1 AND quota_reservation_id = $2`, record.tenantID, record.id).Scan(
 			&actual.Requests, &actual.InputTokens, &actual.OutputTokens, &actual.SpendMicros)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
@@ -686,8 +688,8 @@ func validateReservationRequest(request ReservationRequest) error {
 	if request.TenantID == "" || request.APIKeyID == "" {
 		return errors.New("quota reservation requires Tenant and API key identities")
 	}
-	responseIdentity := request.ResponseID != "" && request.CapabilityOperationID == "" && request.Capability == ""
-	capabilityIdentity := request.ResponseID == "" && request.CapabilityOperationID != "" &&
+	responseIdentity := request.ResponseID != "" && request.ResponseAttemptID != "" && request.CapabilityOperationID == "" && request.Capability == ""
+	capabilityIdentity := request.ResponseID == "" && request.ResponseAttemptID == "" && request.CapabilityOperationID != "" &&
 		(request.Capability == core.CapabilityEmbeddings || request.Capability == core.CapabilityModeration || request.Capability == core.CapabilityRerank)
 	if !responseIdentity && !capabilityIdentity {
 		return errors.New("quota reservation requires exactly one Response or capability operation identity")

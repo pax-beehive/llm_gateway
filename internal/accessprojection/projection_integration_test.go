@@ -20,7 +20,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/accessprojection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
-	"github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -365,7 +365,7 @@ func TestControlOutboxEventsBuildLocalProjectionWithoutRuntimeControlPlaneCalls(
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenantadmin.Migrate(ctx, db); err != nil {

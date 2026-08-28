@@ -13,16 +13,17 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/toddzheng/llm-gateway/internal/provider"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-type Provider string
+type Provider = provider.Identity
 
 const (
-	OpenAI    Provider = "openai"
-	DeepSeek  Provider = "deepseek"
-	Anthropic Provider = "anthropic"
-	Gemini    Provider = "gemini"
+	OpenAI    Provider = provider.OpenAIIdentity
+	DeepSeek  Provider = provider.DeepSeekIdentity
+	Anthropic Provider = provider.AnthropicIdentity
+	Gemini    Provider = provider.GeminiIdentity
 )
 
 type Model struct {
@@ -67,9 +68,9 @@ type Client struct {
 }
 
 func New(config Config) (*Client, error) {
-	switch config.Provider {
-	case OpenAI, DeepSeek, Anthropic, Gemini:
-	default:
+	identity, err := provider.ParseIdentity(string(config.Provider))
+	profile, available := identity.Profile()
+	if err != nil || !available || !profile.ModelDiscovery {
 		return nil, fmt.Errorf("unsupported model discovery provider %q", config.Provider)
 	}
 	if strings.TrimSpace(config.APIKey) == "" {

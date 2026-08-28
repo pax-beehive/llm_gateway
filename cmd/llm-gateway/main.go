@@ -7,12 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,64 +24,21 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/capability"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
-	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
-	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
-	"github.com/toddzheng/llm-gateway/internal/provider/openaicapabilities"
-	"github.com/toddzheng/llm-gateway/internal/provider/openaicompat"
-	"github.com/toddzheng/llm-gateway/internal/provider/openairesponses"
 	"github.com/toddzheng/llm-gateway/internal/quota"
+	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
-	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-type routeConfig struct {
-	ID                  string                                `json:"id"`
-	Provider            string                                `json:"provider"`
-	PublicModel         string                                `json:"public_model"`
-	ProviderModel       string                                `json:"provider_model"`
-	BaseURL             string                                `json:"base_url"`
-	APIKeyEnv           string                                `json:"api_key_env"`
-	Region              string                                `json:"region"`
-	HomeRegion          string                                `json:"home_region"`
-	TenantIDs           []string                              `json:"tenant_ids,omitempty"`
-	CredentialScope     string                                `json:"credential_scope"`
-	Capabilities        map[string]provider.CapabilitySupport `json:"capabilities"`
-	CapabilityRevision  int64                                 `json:"capability_revision"`
-	Headers             map[string]string                     `json:"headers"`
-	InputCost           float64                               `json:"input_cost_per_million"`
-	OutputCost          float64                               `json:"output_cost_per_million"`
-	EmbeddingInputCost  float64                               `json:"embedding_input_cost_per_million"`
-	ModerationInputCost float64                               `json:"moderation_input_cost_per_million"`
-	RerankDocumentCost  float64                               `json:"rerank_document_cost_per_thousand"`
-	EmbeddingPath       string                                `json:"embedding_path,omitempty"`
-	ModerationPath      string                                `json:"moderation_path,omitempty"`
-	RerankPath          string                                `json:"rerank_path,omitempty"`
-	EmbeddingDimensions int                                   `json:"embedding_dimensions,omitempty"`
-	CachedInputCost     float64                               `json:"cached_input_cost_per_million"`
-	CacheWriteCost      float64                               `json:"cache_write_cost_per_million"`
-	PriceSnapshotID     string                                `json:"price_snapshot_id"`
-	PriceEffectiveAt    string                                `json:"price_effective_at"`
-	PriceSource         string                                `json:"price_source"`
-	Currency            string                                `json:"currency"`
-	CacheUsageReliable  bool                                  `json:"cache_usage_reliable"`
-	Healthy             *bool                                 `json:"healthy,omitempty"`
-	CacheRefresh        *cacheRefreshConfig                   `json:"cache_refresh,omitempty"`
-}
+type routeConfig = routingcatalog.RouteConfig
 
-type cacheRefreshConfig struct {
-	Kind                string  `json:"kind"`
-	BaseURL             string  `json:"base_url"`
-	APIKeyEnv           string  `json:"api_key_env"`
-	TTLSeconds          int64   `json:"ttl_seconds"`
-	APIVersion          string  `json:"api_version,omitempty"`
-	WriteCostPerMillion float64 `json:"write_cost_per_million"`
-}
+type cacheRefreshConfig = routingcatalog.CacheRefreshConfig
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
@@ -194,7 +149,7 @@ func run() error {
 		TenantPolicies:  tenantPolicies,
 		QuotaController: quotaController,
 	})
-	capabilityUsageStore, ok := responseStore.(store.CapabilityUsageStore)
+	capabilityUsageStore, ok := responseStore.(capability.Store)
 	if !ok {
 		return errors.New("configured store does not support capability usage")
 	}
@@ -249,7 +204,7 @@ func cacheProtectionModeFromEnv() (string, error) {
 	}
 }
 
-func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[string]int64, tenantPolicies map[string]core.TenantPolicy) (store.ResponseStore, *sql.DB, func(), error) {
+func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[string]int64, tenantPolicies map[string]core.TenantPolicy) (runtime.ResponseStore, *sql.DB, func(), error) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		if os.Getenv("GATEWAY_DEV_MEMORY_STORE") != "true" {
@@ -281,7 +236,7 @@ func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[
 	}
 	postgresStore := store.NewPostgresResponseStore(db)
 	if os.Getenv("GATEWAY_MIGRATE") == "true" {
-		if err := postgresStore.Migrate(ctx); err != nil {
+		if err := migrations.Migrate(ctx, db); err != nil {
 			cleanup()
 			return nil, nil, func() {}, err
 		}
@@ -310,92 +265,19 @@ func configureAuthenticator(
 	if err != nil {
 		return nil, fmt.Errorf("configure persistent API key authentication: %w", err)
 	}
-	bootstrapAccess := os.Getenv("GATEWAY_BOOTSTRAP_ACCESS") == "true"
-	if !bootstrapAccess {
-		if len(apiKeys) > 0 {
-			return nil, errors.New("GATEWAY_API_KEYS_JSON is bootstrap input; set GATEWAY_BOOTSTRAP_ACCESS=true or remove it")
-		}
-		return configureAccessProjection(ctx, db, service, nil, currentDigestVersion, digestPeppers)
+	if os.Getenv("GATEWAY_BOOTSTRAP_ACCESS") == "true" {
+		return nil, errors.New("Gateway startup no longer performs access bootstrap; run go run ./cmd/access-bootstrap")
 	}
-	if len(apiKeys) == 0 {
-		return nil, errors.New("GATEWAY_BOOTSTRAP_ACCESS=true requires GATEWAY_API_KEYS_JSON")
+	if len(apiKeys) > 0 {
+		return nil, errors.New("GATEWAY_API_KEYS_JSON is one-time input for cmd/access-bootstrap and must not be supplied to the Gateway data plane")
 	}
-	apiKeyPolicies, err := parseAPIKeyPoliciesEnv("GATEWAY_API_KEY_POLICIES_JSON")
-	if err != nil {
-		return nil, fmt.Errorf("GATEWAY_API_KEY_POLICIES_JSON: %w", err)
-	}
-	apiKeyMetadata, err := parseAPIKeyMetadataEnv("GATEWAY_API_KEY_METADATA_JSON")
-	if err != nil {
-		return nil, fmt.Errorf("GATEWAY_API_KEY_METADATA_JSON: %w", err)
-	}
-	for rawKey := range apiKeyPolicies {
-		if _, exists := apiKeys[rawKey]; !exists {
-			return nil, errors.New("GATEWAY_API_KEY_POLICIES_JSON contains a key absent from GATEWAY_API_KEYS_JSON")
-		}
-	}
-	for rawKey := range apiKeyMetadata {
-		if _, exists := apiKeys[rawKey]; !exists {
-			return nil, errors.New("GATEWAY_API_KEY_METADATA_JSON contains a key absent from GATEWAY_API_KEYS_JSON")
-		}
-	}
-	tenantIDs := make([]string, 0, len(apiKeys))
-	seen := make(map[string]struct{})
-	for _, tenantID := range apiKeys {
-		if tenantID == "" {
-			return nil, errors.New("bootstrap API key has an empty Tenant ID")
-		}
-		if _, exists := seen[tenantID]; exists {
-			continue
-		}
-		seen[tenantID] = struct{}{}
-		tenantIDs = append(tenantIDs, tenantID)
-	}
-	slices.Sort(tenantIDs)
-	for _, tenantID := range tenantIDs {
-		homeRegion := homeRegions[tenantID]
-		if homeRegion == "" {
-			return nil, fmt.Errorf("Tenant %q has no configured Home Region", tenantID)
-		}
-		executionEpoch := executionEpochs[tenantID]
-		if executionEpoch == 0 {
-			executionEpoch = 1
-		}
-		policy := tenantPolicies[tenantID]
-		if policy.Revision == 0 {
-			policy.Revision = 1
-		}
-		if err := service.CreateTenant(ctx, access.Tenant{
-			ID: tenantID, Slug: tenantID, DisplayName: tenantID, Status: access.TenantActive,
-			HomeRegion: homeRegion, ExecutionEpoch: executionEpoch, Policy: policy,
-		}, access.ChangeActor{Type: "bootstrap", ID: "gateway-startup"}); err != nil {
-			return nil, fmt.Errorf("bootstrap Tenant %q: %w", tenantID, err)
-		}
-	}
-	rawKeys := make([]string, 0, len(apiKeys))
-	for rawKey := range apiKeys {
-		rawKeys = append(rawKeys, rawKey)
-	}
-	slices.Sort(rawKeys)
-	for _, rawKey := range rawKeys {
-		keyPolicy := apiKeyPolicies[rawKey]
-		if keyPolicy.Revision == 0 {
-			keyPolicy.Revision = 1
-		}
-		if _, err := service.ImportAPIKey(ctx, access.APIKeySpec{
-			TenantID: apiKeys[rawKey], Name: "gateway bootstrap key", RawKey: rawKey,
-			Policy: keyPolicy, Metadata: apiKeyMetadata[rawKey],
-		}); err != nil {
-			return nil, fmt.Errorf("bootstrap API key for Tenant %q: %w", apiKeys[rawKey], err)
-		}
-	}
-	return configureAccessProjection(ctx, db, service, tenantIDs, currentDigestVersion, digestPeppers)
+	return configureAccessProjection(ctx, db, service, currentDigestVersion, digestPeppers)
 }
 
 func configureAccessProjection(
 	ctx context.Context,
 	database *sql.DB,
 	authoritative *access.PostgresService,
-	bootstrapTenantIDs []string,
 	currentDigestVersion int16,
 	digestPeppers map[int16][]byte,
 ) (httpapi.Authenticator, error) {
@@ -415,26 +297,6 @@ func configureAccessProjection(
 	}, time.Now)
 	if err != nil {
 		return nil, fmt.Errorf("configure Gateway Access Projection: %w", err)
-	}
-	if len(bootstrapTenantIDs) > 0 {
-		credentials, err := credentialadmin.NewService(database, credentialadmin.PepperRing{
-			CurrentVersion: currentDigestVersion, Peppers: digestPeppers,
-		}, time.Now, nil)
-		if err != nil {
-			return nil, err
-		}
-		actor := tenantadmin.ActorEnvelope{
-			Type: "system", ID: "gateway-access-projection-bootstrap", Scopes: []string{tenantadmin.ScopePlatformRead},
-		}
-		for _, tenantID := range bootstrapTenantIDs {
-			snapshot, err := credentials.BuildAccessSnapshot(ctx, actor, tenantID)
-			if err != nil {
-				return nil, fmt.Errorf("build Gateway Access Projection snapshot for Tenant %q: %w", tenantID, err)
-			}
-			if err := projection.ReplaceSnapshot(ctx, snapshot); err != nil {
-				return nil, fmt.Errorf("replace Gateway Access Projection snapshot for Tenant %q: %w", tenantID, err)
-			}
-		}
 	}
 	for {
 		result, err := projection.ConsumeControlOutboxBatch(ctx, 1000)
@@ -624,209 +486,15 @@ func publishRoutes(
 	payload json.RawMessage,
 	actor string,
 ) (configuration.Snapshot, []provider.Route, error) {
-	routes, err := routesFromJSON(payload)
-	if err != nil {
-		return configuration.Snapshot{}, nil, fmt.Errorf("validate model_routes revision %d: %w", revision, err)
-	}
-	snapshot, err := repository.Publish(ctx, "model_routes", expectedRevision, revision, payload, actor)
-	if err != nil {
-		return configuration.Snapshot{}, nil, err
-	}
-	return snapshot, routes, nil
+	return routingcatalog.Publish(ctx, repository, expectedRevision, revision, payload, actor)
 }
 
 func routesFromJSON(payload []byte) ([]provider.Route, error) {
-	var configs []routeConfig
-	if err := json.Unmarshal(payload, &configs); err != nil || len(configs) == 0 {
-		return nil, fmt.Errorf("configure at least one model route: %w", err)
-	}
-	routes := make([]provider.Route, 0, len(configs))
-	for index, config := range configs {
-		if config.ID == "" || config.PublicModel == "" || config.Provider == "" || config.Region == "" || config.HomeRegion == "" {
-			return nil, fmt.Errorf("route %d requires id, provider, public_model, region, and home_region", index)
-		}
-		if !firstReleaseProvider(config.Provider) {
-			return nil, fmt.Errorf("route %d provider %q is outside the first-release scope; supported providers are openai, deepseek, anthropic, and gemini", index, config.Provider)
-		}
-		if !validNonNegativeCost(config.InputCost) || !validNonNegativeCost(config.OutputCost) || !validNonNegativeCost(config.CachedInputCost) ||
-			!validNonNegativeCost(config.EmbeddingInputCost) || !validNonNegativeCost(config.ModerationInputCost) || !validNonNegativeCost(config.RerankDocumentCost) {
-			return nil, fmt.Errorf("route %q prices must be finite and non-negative", config.ID)
-		}
-		if config.EmbeddingDimensions < 0 {
-			return nil, fmt.Errorf("route %q embedding_dimensions cannot be negative", config.ID)
-		}
-		seenTenants := make(map[string]struct{}, len(config.TenantIDs))
-		for _, tenantID := range config.TenantIDs {
-			if tenantID == "" {
-				return nil, fmt.Errorf("route %q tenant_ids cannot contain an empty Tenant ID", config.ID)
-			}
-			if _, exists := seenTenants[tenantID]; exists {
-				return nil, fmt.Errorf("route %q tenant_ids contains duplicate %q", config.ID, tenantID)
-			}
-			seenTenants[tenantID] = struct{}{}
-		}
-		executor, cacheProtector, cacheAnchorBuilder, err := buildProviderComponents(config)
-		if err != nil {
-			return nil, fmt.Errorf("route %q: %w", config.ID, err)
-		}
-		capabilityAdapter, err := buildCapabilityAdapter(config)
-		if err != nil {
-			return nil, fmt.Errorf("route %q capability adapter: %w", config.ID, err)
-		}
-		effectiveAt, err := time.Parse(time.RFC3339, config.PriceEffectiveAt)
-		if err != nil || config.PriceSnapshotID == "" || config.PriceSource == "" || config.Currency == "" {
-			return nil, fmt.Errorf("route %q requires immutable price_snapshot_id, RFC3339 price_effective_at, price_source, and currency", config.ID)
-		}
-		cacheWriteCost, err := cacheWriteCostPerMillion(config)
-		if err != nil {
-			return nil, fmt.Errorf("route %q: %w", config.ID, err)
-		}
-		route := provider.Route{
-			ID: config.ID, Provider: config.Provider, Model: config.PublicModel, Region: config.Region,
-			HomeRegion: config.HomeRegion, CredentialScope: config.CredentialScope, Healthy: config.Healthy == nil || *config.Healthy,
-			TenantIDs: append([]string(nil), config.TenantIDs...),
-			InputCost: config.InputCost, OutputCost: config.OutputCost, Executor: executor,
-			Profile: provider.CapabilityProfile{Revision: max(config.CapabilityRevision, 1), Features: config.Capabilities},
-			PriceSnapshot: core.PriceSnapshot{
-				ID: config.PriceSnapshotID, Provider: config.Provider, Model: config.ProviderModel, Region: config.Region,
-				Currency: config.Currency, InputPerMillionMicros: currencyMicros(config.InputCost),
-				CachedInputPerMillionMicros: currencyMicros(config.CachedInputCost),
-				CacheWritePerMillionMicros:  currencyMicros(cacheWriteCost), OutputPerMillionMicros: currencyMicros(config.OutputCost),
-				EmbeddingInputPerMillionMicros:  currencyMicros(config.EmbeddingInputCost),
-				ModerationInputPerMillionMicros: currencyMicros(config.ModerationInputCost),
-				RerankDocumentPerThousandMicros: currencyMicros(config.RerankDocumentCost),
-				EffectiveAt:                     effectiveAt.Unix(), Source: config.PriceSource,
-			},
-			CacheUsageReliable: config.CacheUsageReliable,
-			CacheProtector:     cacheProtector,
-			CacheAnchorBuilder: cacheAnchorBuilder,
-		}
-		if capabilityAdapter != nil {
-			if declaredCapability(config.Capabilities["embeddings"]) {
-				route.EmbeddingExecutor = capabilityAdapter
-			}
-			if declaredCapability(config.Capabilities["moderation"]) {
-				route.ModerationExecutor = capabilityAdapter
-			}
-			if declaredCapability(config.Capabilities["rerank"]) {
-				route.RerankExecutor = capabilityAdapter
-			}
-		}
-		routes = append(routes, route)
-	}
-	return routes, nil
-}
-
-func declaredCapability(support provider.CapabilitySupport) bool {
-	return support == provider.CapabilityNative || support == provider.CapabilityTranslated
-}
-
-func buildCapabilityAdapter(config routeConfig) (*openaicapabilities.Adapter, error) {
-	if !declaredCapability(config.Capabilities["embeddings"]) && !declaredCapability(config.Capabilities["moderation"]) &&
-		!declaredCapability(config.Capabilities["rerank"]) {
-		return nil, nil
-	}
-	return openaicapabilities.New(openaicapabilities.Config{
-		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
-		Headers: config.Headers, EmbeddingPath: config.EmbeddingPath, ModerationPath: config.ModerationPath,
-		RerankPath: config.RerankPath, DefaultDimensions: config.EmbeddingDimensions,
-	})
-}
-
-func firstReleaseProvider(name string) bool {
-	switch name {
-	case "openai", "deepseek", "anthropic", "gemini":
-		return true
-	default:
-		return false
-	}
-}
-
-func buildProviderComponents(config routeConfig) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
-	return buildProviderComponentsWithHTTPClient(config, nil)
+	return routingcatalog.Parse(payload)
 }
 
 func buildProviderComponentsWithHTTPClient(config routeConfig, httpClient *http.Client) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
-	if config.Provider == "anthropic" {
-		var ttl time.Duration
-		var apiVersion string
-		var writeCostMicros int64
-		if refresh := config.CacheRefresh; refresh != nil {
-			if refresh.Kind != "anthropic" {
-				return nil, nil, nil, fmt.Errorf("Anthropic route cannot use %q cache refresh", refresh.Kind)
-			}
-			if refresh.TTLSeconds <= 0 || math.IsNaN(refresh.WriteCostPerMillion) || math.IsInf(refresh.WriteCostPerMillion, 0) || refresh.WriteCostPerMillion < 0 {
-				return nil, nil, nil, errors.New("Anthropic cache refresh requires positive ttl_seconds and finite non-negative write_cost_per_million")
-			}
-			if refresh.BaseURL != "" && strings.TrimRight(refresh.BaseURL, "/") != strings.TrimRight(config.BaseURL, "/") {
-				return nil, nil, nil, errors.New("Anthropic execution and cache refresh must use the same base_url")
-			}
-			if refresh.APIKeyEnv != "" && refresh.APIKeyEnv != config.APIKeyEnv {
-				return nil, nil, nil, errors.New("Anthropic execution and cache refresh must use the same credential")
-			}
-			ttl = time.Duration(refresh.TTLSeconds) * time.Second
-			apiVersion = refresh.APIVersion
-			cacheWriteCost, err := cacheWriteCostPerMillion(config)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			if cacheWriteCost <= 0 {
-				return nil, nil, nil, errors.New("Anthropic prompt caching requires positive cache_write_cost_per_million")
-			}
-			writeCostMicros = currencyMicros(cacheWriteCost)
-		}
-		adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{
-			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), APIVersion: apiVersion,
-			TTL: ttl, Model: config.ProviderModel, RouteID: config.ID,
-			HTTPClient:      httpClient,
-			CredentialScope: config.CredentialScope, Region: config.Region,
-			CacheWritePerMillionMicros: writeCostMicros,
-			EnablePromptCaching:        config.CacheRefresh != nil,
-		})
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		if config.CacheRefresh == nil {
-			return adapter, nil, nil, nil
-		}
-		return adapter, adapter, adapter, nil
-	}
-	if config.CacheRefresh != nil {
-		return nil, nil, nil, errors.New("proactive cache refresh is enabled only for conformance-tested direct Anthropic routes")
-	}
-	if config.Provider == "openai" {
-		executor, err := openairesponses.New(openairesponses.Config{
-			BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
-			HTTPClient: httpClient, Headers: config.Headers,
-		})
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		return executor, nil, nil, nil
-	}
-
-	executor, err := openaicompat.New(openaicompat.Config{
-		BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel,
-		Dialect: openaicompat.Dialect(config.Provider), HTTPClient: httpClient, Headers: config.Headers,
-	})
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return executor, nil, nil, nil
-}
-
-func cacheWriteCostPerMillion(config routeConfig) (float64, error) {
-	value := config.CacheWriteCost
-	if config.CacheRefresh != nil && config.CacheRefresh.WriteCostPerMillion != 0 {
-		if value != 0 && value != config.CacheRefresh.WriteCostPerMillion {
-			return 0, errors.New("cache write price is declared inconsistently")
-		}
-		value = config.CacheRefresh.WriteCostPerMillion
-	}
-	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-		return 0, errors.New("cache_write_cost_per_million must be finite and non-negative")
-	}
-	return value, nil
+	return routingcatalog.BuildProviderComponentsWithHTTPClient(config, httpClient)
 }
 
 func runCacheWorker(
@@ -957,8 +625,8 @@ func resolveCacheProtectorForTenant(
 	return router.ResolveCacheProtector(anchor)
 }
 
-func runRetentionWorker(ctx context.Context, responseStore store.ResponseStore, localRegion string) {
-	retentionStore, ok := responseStore.(store.RetentionStore)
+func runRetentionWorker(ctx context.Context, responseStore runtime.ResponseStore, localRegion string) {
+	retentionStore, ok := responseStore.(runtime.RetentionStore)
 	if !ok {
 		return
 	}
@@ -987,14 +655,6 @@ func runRetentionWorker(ctx context.Context, responseStore store.ResponseStore, 
 			run()
 		}
 	}
-}
-
-func currencyMicros(amount float64) int64 {
-	return int64(math.Round(amount * 1_000_000))
-}
-
-func validNonNegativeCost(amount float64) bool {
-	return !math.IsNaN(amount) && !math.IsInf(amount, 0) && amount >= 0
 }
 
 func parseInt64MapEnv(name string) (map[string]int64, error) {

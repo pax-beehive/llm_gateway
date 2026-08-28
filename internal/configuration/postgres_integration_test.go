@@ -15,7 +15,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/toddzheng/llm-gateway/internal/configuration"
-	"github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 )
 
 func TestPostgresConfigurationHistoryUsesCASAndKeepsImmutableRevisions(t *testing.T) {
@@ -30,7 +30,7 @@ func TestPostgresConfigurationHistoryUsesCASAndKeepsImmutableRevisions(t *testin
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	kind := fmt.Sprintf("routes-%d", time.Now().UnixNano())

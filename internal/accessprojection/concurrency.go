@@ -5,10 +5,10 @@ import (
 	"errors"
 	"time"
 
-	gatewaystore "github.com/toddzheng/llm-gateway/internal/store"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
-var ErrConcurrencyExceeded = gatewaystore.ErrQuotaExceeded
+var ErrConcurrencyExceeded = quota.ErrExceeded
 
 func (store *Store) AcquireAPIKeyResponseSlot(ctx context.Context, apiKeyID, leaseID string, limit int, expiresAt time.Time) error {
 	if apiKeyID == "" || leaseID == "" || limit <= 0 {

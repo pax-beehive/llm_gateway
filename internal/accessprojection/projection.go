@@ -56,33 +56,11 @@ type ApplyResult struct {
 	Lag         time.Duration
 }
 
-type TenantSnapshot struct {
-	ID             string
-	Status         access.TenantStatus
-	Revision       int64
-	HomeRegion     string
-	ExecutionEpoch int64
-	Policy         core.TenantPolicy
-}
-
-type KeySnapshot struct {
-	ID            string
-	Prefix        string
-	SecretDigest  []byte
-	DigestVersion int16
-	Status        access.APIKeyStatus
-	Revision      int64
-	Policy        core.APIKeyPolicy
-	ExpiresAt     *time.Time
-	RevokedAt     *time.Time
-	LastUsedAt    *time.Time
-}
-
-type Snapshot struct {
-	Tenant    TenantSnapshot
-	Keys      []KeySnapshot
-	CreatedAt time.Time
-}
+// Compatibility aliases keep existing projection callers source-compatible;
+// the snapshot contract itself is owned by the authoritative access domain.
+type Snapshot = access.Snapshot
+type TenantSnapshot = access.TenantSnapshot
+type KeySnapshot = access.KeySnapshot
 
 type Status struct {
 	GapCount                int
@@ -434,7 +412,7 @@ func digest(pepper []byte, rawKey string) []byte {
 	return mac.Sum(nil)
 }
 
-func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) error {
+func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot access.Snapshot) error {
 	if snapshot.Tenant.ID == "" || snapshot.Tenant.Revision <= 0 || snapshot.Tenant.HomeRegion == "" ||
 		snapshot.Tenant.ExecutionEpoch <= 0 || snapshot.Tenant.Policy.Revision <= 0 || snapshot.CreatedAt.IsZero() ||
 		(snapshot.Tenant.Status != access.TenantActive && snapshot.Tenant.Status != access.TenantSuspended && snapshot.Tenant.Status != access.TenantClosed) {

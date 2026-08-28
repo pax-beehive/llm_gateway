@@ -22,9 +22,9 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/secretcustody"
-	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
@@ -83,7 +83,7 @@ func run() error {
 		if !devMode {
 			return errors.New("CONTROL_PLANE_MIGRATE is development-only; production migrations require a separate deployment gate")
 		}
-		if err := store.NewPostgresResponseStore(database).Migrate(ctx); err != nil {
+		if err := migrations.Migrate(ctx, database); err != nil {
 			return fmt.Errorf("migrate shared schema: %w", err)
 		}
 		if err := tenantadmin.Migrate(ctx, database); err != nil {

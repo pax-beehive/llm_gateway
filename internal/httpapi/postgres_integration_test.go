@@ -19,6 +19,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/accessprojection"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
@@ -38,7 +39,7 @@ func TestPersistedAPIKeyRequestIsAdmittedAndRateLimited(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 

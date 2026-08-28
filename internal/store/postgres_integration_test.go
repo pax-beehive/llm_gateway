@@ -15,7 +15,9 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	gatewayruntime "github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
@@ -23,7 +25,7 @@ import (
 func TestPostgresUsageIsAttributedAndProjectedByAPIKey(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("usage-key-%d", time.Now().UnixNano())
@@ -80,7 +82,7 @@ func TestPostgresUsageIsAttributedAndProjectedByAPIKey(t *testing.T) {
 func TestPostgresCapabilityUsageIsImmutableContentFreeAndProjected(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("capability-usage-%d", time.Now().UnixNano())
@@ -191,7 +193,7 @@ func TestPostgresCapabilityUsageIsImmutableContentFreeAndProjected(t *testing.T)
 func TestPostgresStoreFalseLeavesNoResponseContentOrOutboxSecret(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("store-false-%d", time.Now().UnixNano())
@@ -230,7 +232,7 @@ func TestPostgresStoreFalseLeavesNoResponseContentOrOutboxSecret(t *testing.T) {
 func TestPostgresExecutionEpochFencesStaleWriter(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("epoch-fence-%d", time.Now().UnixNano())
@@ -263,7 +265,7 @@ func TestPostgresExecutionEpochFencesStaleWriter(t *testing.T) {
 func TestPostgresConcurrentResponseQuotaIsGlobalAndLeased(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("global-quota-%d", time.Now().UnixNano())
@@ -275,7 +277,7 @@ func TestPostgresConcurrentResponseQuotaIsGlobalAndLeased(t *testing.T) {
 	if err := responseStore.AcquireResponseSlot(ctx, tenantID, "lease-1", 1, expiresAt); err != nil {
 		t.Fatal(err)
 	}
-	if err := responseStore.AcquireResponseSlot(ctx, tenantID, "lease-2", 1, expiresAt); !errors.Is(err, store.ErrQuotaExceeded) {
+	if err := responseStore.AcquireResponseSlot(ctx, tenantID, "lease-2", 1, expiresAt); !errors.Is(err, quota.ErrExceeded) {
 		t.Fatalf("second slot error = %v, want quota exceeded", err)
 	}
 	if err := responseStore.ReleaseResponseSlot(ctx, tenantID, "lease-1"); err != nil {
@@ -289,7 +291,7 @@ func TestPostgresConcurrentResponseQuotaIsGlobalAndLeased(t *testing.T) {
 func TestPostgresPersistsExperimentallyValidatedSavingFromStableCohorts(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("experiment-%d", time.Now().UnixNano())
@@ -340,7 +342,7 @@ func TestPostgresPersistsExperimentallyValidatedSavingFromStableCohorts(t *testi
 func TestPostgresRetentionExpiryScrubsResponseAndOutboxContent(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("retention-%d", time.Now().UnixNano())
@@ -397,7 +399,7 @@ func TestPostgresConversationAndResponseCommitTogether(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("integration-%d", time.Now().UnixNano())
@@ -468,7 +470,7 @@ func TestPostgresResponseFinalizationRecordsVerifiedProtectedHitNetSaving(t *tes
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("protected-hit-%d", time.Now().UnixNano())

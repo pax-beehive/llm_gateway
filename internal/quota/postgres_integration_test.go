@@ -15,6 +15,7 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
@@ -32,7 +33,7 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
 	responseStore := store.NewPostgresResponseStore(db)
-	if err := responseStore.Migrate(ctx); err != nil {
+	if err := migrations.Migrate(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 
@@ -70,7 +71,7 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	currentTime := now
 	controller := quota.NewPostgresController(db, func() time.Time { return currentTime })
 	first, err := controller.Reserve(ctx, quota.ReservationRequest{
-		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-1",
+		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-1", ResponseAttemptID: "attempt-1",
 		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
 		TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
 		Requests: 1, ReservedSpendMicros: 40, Currency: "USD", ExpiresAt: now.Add(time.Minute),
@@ -78,8 +79,17 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	siblingAttempt, err := controller.Reserve(ctx, quota.ReservationRequest{
+		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-1", ResponseAttemptID: "attempt-1b",
+		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
+		TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
+		Requests: 1, ReservedSpendMicros: 10, Currency: "USD", ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("second Provider Attempt reservation for one Response: %v", err)
+	}
 	_, err = controller.Reserve(ctx, quota.ReservationRequest{
-		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-2",
+		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-2", ResponseAttemptID: "attempt-2",
 		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
 		TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
 		Requests: 1, ReservedSpendMicros: 30, Currency: "USD", ExpiresAt: now.Add(time.Minute),
@@ -90,8 +100,11 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	if err := controller.Release(ctx, first.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := controller.Release(ctx, siblingAttempt.ID); err != nil {
+		t.Fatal(err)
+	}
 	second, err := controller.Reserve(ctx, quota.ReservationRequest{
-		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-2",
+		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-2", ResponseAttemptID: "attempt-2",
 		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
 		TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
 		Requests: 1, ReservedSpendMicros: 30, Currency: "USD", ExpiresAt: now.Add(time.Minute),
@@ -159,7 +172,7 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	for index := 0; index < 2; index++ {
 		go func(index int) {
 			reservation, err := controller.Reserve(ctx, quota.ReservationRequest{
-				TenantID: tenantID, APIKeyID: key.ID, ResponseID: fmt.Sprintf("concurrent-%d", index),
+				TenantID: tenantID, APIKeyID: key.ID, ResponseID: fmt.Sprintf("concurrent-%d", index), ResponseAttemptID: fmt.Sprintf("attempt-%d", index),
 				TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
 				TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
 				Requests: 1, ReservedSpendMicros: 30, Currency: "USD", ExpiresAt: now.Add(time.Minute),
@@ -250,5 +263,47 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	}
 	if snapshot.RefreshMonthlySpend.Reserved != 0 || snapshot.RefreshMonthlySpend.Committed != 40 {
 		t.Fatalf("refresh monthly spend snapshot = %#v", snapshot.RefreshMonthlySpend)
+	}
+	fallbackResponseID := "fallback-response-" + tenantID
+	failedAttempt, err := controller.Reserve(ctx, quota.ReservationRequest{
+		TenantID: tenantID, APIKeyID: key.ID, ResponseID: fallbackResponseID, ResponseAttemptID: "failed-attempt",
+		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1, TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
+		Requests: 1, ReservedSpendMicros: 5, Currency: "USD", ExpiresAt: currentTime.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	successAttempt, err := controller.Reserve(ctx, quota.ReservationRequest{
+		TenantID: tenantID, APIKeyID: key.ID, ResponseID: fallbackResponseID, ResponseAttemptID: "success-attempt",
+		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1, TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
+		Requests: 1, ReservedSpendMicros: 5, Currency: "USD", ExpiresAt: currentTime.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := core.Response{ID: fallbackResponseID, Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress, Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{}}
+	if err := responseStore.Create(ctx, tenantID, response); err != nil {
+		t.Fatal(err)
+	}
+	response.Status = core.ResponseStatusCompleted
+	if err := responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, core.UsageRecord{
+		ID: "fallback-usage-" + tenantID, TenantID: tenantID, APIKeyID: key.ID, ResponseID: response.ID, AttemptID: "success-attempt", QuotaReservationID: successAttempt.ID,
+		PriceSnapshot: core.PriceSnapshot{ID: "fallback-price-" + tenantID, Provider: "provider", Model: "model", Region: "local", Currency: "USD", EffectiveAt: now.Unix(), Source: "integration-test"},
+		ProviderUsage: []byte(`{}`), Usage: core.Usage{InputTokens: 2, OutputTokens: 1, TotalTokens: 3}, AmountMicros: 4, Currency: "USD", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if reconciled, err := controller.Reconcile(ctx, 10); err != nil || reconciled != 1 {
+		t.Fatalf("fallback reconciliation = %d / %v, want one successful attempt", reconciled, err)
+	}
+	var failedStatus, successStatus string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM quota_reservations WHERE id = $1`, failedAttempt.ID).Scan(&failedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT status FROM quota_reservations WHERE id = $1`, successAttempt.ID).Scan(&successStatus); err != nil {
+		t.Fatal(err)
+	}
+	if failedStatus != "reserved" || successStatus != "committed" {
+		t.Fatalf("fallback reservation statuses = %q/%q", failedStatus, successStatus)
 	}
 }

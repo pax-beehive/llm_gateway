@@ -155,10 +155,10 @@ one regional transaction.
 
 In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative, while inference authentication reads only `gateway_access_projection`. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. The single `GATEWAY_API_KEY_PEPPER` variable is the version-1 compatibility form for development. During a bounded rotation, configure `GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}` and `GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2`; at most eight versions may be active. New issuance/import uses the current version, while configured prior versions remain verifiable. Remove an old pepper only after both the authoritative control-plane count and every regional projection count prove no active key still references that digest version.
 
-Environment key maps are only for an explicit, idempotent first development bootstrap. A raw bootstrap key must contain at least 24 characters. The Gateway atomically seeds its Access Projection; then remove the raw-key variables and disable the flag. Existing production Tenants are seeded through a control-plane snapshot before the Gateway role is restricted to projection tables:
+Environment key maps are only for an explicit, idempotent first development bootstrap. A raw bootstrap key must contain at least 24 characters. Run the dedicated one-shot `make bootstrap-access` process; the Gateway data plane rejects bootstrap flags and never writes authoritative Tenant or key state. The command atomically seeds its Access Projection when enabled; then remove the raw-key variables. Existing production Tenants are seeded through a control-plane snapshot before the Gateway role is restricted to projection tables:
 
 ```text
-GATEWAY_BOOTSTRAP_ACCESS=true
+GATEWAY_DATABASE_URL=postgres://...
 GATEWAY_API_KEYS_JSON={"long-secret-gateway-token":"tenant-id"}
 GATEWAY_TENANT_HOME_REGIONS_JSON={"tenant-id":"us-west"}
 GATEWAY_TENANT_EXECUTION_EPOCHS_JSON={"tenant-id":1}

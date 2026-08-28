@@ -14,8 +14,8 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/providerattempt"
 	"github.com/toddzheng/llm-gateway/internal/quota"
-	"github.com/toddzheng/llm-gateway/internal/store"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -30,8 +30,16 @@ type Options struct {
 	QuotaLeaseTTL   time.Duration
 }
 
+// Store is the complete persistence contract required by capability
+// execution. Writer fencing is therefore a visible constructor requirement.
+type Store interface {
+	RecordCapabilityUsage(context.Context, core.CapabilityUsageRecord) error
+	AssertCapabilityWriter(context.Context, string, string, int64) error
+	ExecuteWithCapabilityWriterFence(context.Context, string, string, int64, func(context.Context) error) error
+}
+
 type Runtime struct {
-	usageStore    store.CapabilityUsageStore
+	usageStore    Store
 	router        provider.CapabilityRouter
 	now           func() time.Time
 	quota         quota.Controller
@@ -44,7 +52,7 @@ type Runtime struct {
 	duration      metric.Float64Histogram
 }
 
-func New(usageStore store.CapabilityUsageStore, router provider.CapabilityRouter, options Options) *Runtime {
+func New(usageStore Store, router provider.CapabilityRouter, options Options) *Runtime {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
@@ -113,7 +121,7 @@ func (r *Runtime) Embed(ctx context.Context, request core.EmbeddingRequest) (str
 			return operationID, core.EmbeddingResult{}, reserveErr
 		}
 		startedAt := r.now()
-		result, executeErr := executeWithWriterFence(r, ctx, request.CapabilityPrincipal, func(executeCtx context.Context) (core.EmbeddingResult, error) {
+		result, executeErr := executeWithWriterFence(r, ctx, request.CapabilityPrincipal, reservation, func(executeCtx context.Context) (core.EmbeddingResult, error) {
 			return route.EmbeddingExecutor.Embed(executeCtx, request)
 		})
 		if executeErr != nil {
@@ -147,14 +155,15 @@ func (r *Runtime) Embed(ctx context.Context, request core.EmbeddingRequest) (str
 			Dimensions: result.Dimensions, AmountMicros: amount, Currency: route.PriceSnapshot.Currency, CreatedAt: r.now().UTC(),
 		}
 		if reservation != nil {
-			record.QuotaReservationID = reservation.ID
+			record.QuotaReservationID = reservation.ReservationID()
 		}
 		if err := r.usageStore.RecordCapabilityUsage(context.WithoutCancel(ctx), record); err != nil {
 			r.uncertain(context.WithoutCancel(ctx), reservation)
 			return operationID, core.EmbeddingResult{}, fmt.Errorf("record embedding usage: %w", err)
 		}
+		reservation.MarkUsagePersisted()
 		if reservation != nil {
-			if err := r.quota.Commit(context.WithoutCancel(ctx), reservation.ID, quota.ActualUsage{
+			if err := reservation.Commit(context.WithoutCancel(ctx), quota.ActualUsage{
 				Requests: 1, SpendMicros: amount, EmbeddingInputUnits: result.InputUnits,
 			}); err != nil {
 				return operationID, core.EmbeddingResult{}, fmt.Errorf("commit embedding quota: %w", err)
@@ -178,7 +187,7 @@ func (r *Runtime) reserve(
 	currency string,
 	embeddingInputUnits int64,
 	rerankDocuments int64,
-) (*quota.Reservation, error) {
+) (*providerattempt.Attempt, error) {
 	if r.quota == nil {
 		return nil, nil
 	}
@@ -198,15 +207,11 @@ func (r *Runtime) reserve(
 	if err != nil {
 		return nil, err
 	}
-	return &reservation, nil
+	return providerattempt.New(r.quota, &reservation), nil
 }
 
 func (r *Runtime) assertWriter(ctx context.Context, principal core.CapabilityPrincipal) error {
-	admissionStore, ok := r.usageStore.(store.CapabilityAdmissionStore)
-	if !ok {
-		return errors.New("capability usage store does not support writer fencing")
-	}
-	if err := admissionStore.AssertCapabilityWriter(ctx, principal.TenantID, principal.HomeRegion, principal.ExecutionEpoch); err != nil {
+	if err := r.usageStore.AssertCapabilityWriter(ctx, principal.TenantID, principal.HomeRegion, principal.ExecutionEpoch); err != nil {
 		return fmt.Errorf("capability writer fencing: %w", err)
 	}
 	return nil
@@ -216,15 +221,15 @@ func attemptOperationID(operationID string, attempt int) string {
 	return fmt.Sprintf("%s_attempt_%d", operationID, attempt+1)
 }
 
-func (r *Runtime) release(ctx context.Context, reservation *quota.Reservation) {
+func (r *Runtime) release(ctx context.Context, reservation *providerattempt.Attempt) {
 	if reservation != nil {
-		_ = r.quota.Release(ctx, reservation.ID)
+		_ = reservation.Release(ctx)
 	}
 }
 
-func (r *Runtime) uncertain(ctx context.Context, reservation *quota.Reservation) {
+func (r *Runtime) uncertain(ctx context.Context, reservation *providerattempt.Attempt) {
 	if reservation != nil {
-		_ = r.quota.Uncertain(ctx, reservation.ID)
+		_ = reservation.Uncertain(ctx)
 	}
 }
 
@@ -316,7 +321,7 @@ func (r *Runtime) Moderate(ctx context.Context, request core.ModerationRequest) 
 			return operationID, core.ModerationResult{}, reserveErr
 		}
 		startedAt := r.now()
-		result, executeErr := executeWithWriterFence(r, ctx, request.CapabilityPrincipal, func(executeCtx context.Context) (core.ModerationResult, error) {
+		result, executeErr := executeWithWriterFence(r, ctx, request.CapabilityPrincipal, reservation, func(executeCtx context.Context) (core.ModerationResult, error) {
 			return route.ModerationExecutor.Moderate(executeCtx, request)
 		})
 		if executeErr != nil {
@@ -348,7 +353,7 @@ func (r *Runtime) Moderate(ctx context.Context, request core.ModerationRequest) 
 		amount := perMillionCost(result.InputUnits, route.PriceSnapshot.ModerationInputPerMillionMicros)
 		if !hasEvidence && amount == 0 {
 			if reservation != nil {
-				if err := r.quota.Commit(context.WithoutCancel(ctx), reservation.ID, quota.ActualUsage{Requests: 1}); err != nil {
+				if err := reservation.Commit(context.WithoutCancel(ctx), quota.ActualUsage{Requests: 1}); err != nil {
 					return operationID, core.ModerationResult{}, fmt.Errorf("commit moderation quota: %w", err)
 				}
 			}
@@ -363,14 +368,15 @@ func (r *Runtime) Moderate(ctx context.Context, request core.ModerationRequest) 
 			AmountMicros: amount, Currency: route.PriceSnapshot.Currency, CreatedAt: r.now().UTC(),
 		}
 		if reservation != nil {
-			record.QuotaReservationID = reservation.ID
+			record.QuotaReservationID = reservation.ReservationID()
 		}
 		if err := r.usageStore.RecordCapabilityUsage(context.WithoutCancel(ctx), record); err != nil {
 			r.uncertain(context.WithoutCancel(ctx), reservation)
 			return operationID, core.ModerationResult{}, fmt.Errorf("record moderation usage: %w", err)
 		}
+		reservation.MarkUsagePersisted()
 		if reservation != nil {
-			if err := r.quota.Commit(context.WithoutCancel(ctx), reservation.ID, quota.ActualUsage{Requests: 1, SpendMicros: amount}); err != nil {
+			if err := reservation.Commit(context.WithoutCancel(ctx), quota.ActualUsage{Requests: 1, SpendMicros: amount}); err != nil {
 				return operationID, core.ModerationResult{}, fmt.Errorf("commit moderation quota: %w", err)
 			}
 		}
@@ -431,7 +437,7 @@ func (r *Runtime) Rerank(ctx context.Context, request core.RerankRequest) (strin
 			return operationID, core.RerankResult{}, reserveErr
 		}
 		startedAt := r.now()
-		result, executeErr := executeWithWriterFence(r, ctx, request.CapabilityPrincipal, func(executeCtx context.Context) (core.RerankResult, error) {
+		result, executeErr := executeWithWriterFence(r, ctx, request.CapabilityPrincipal, reservation, func(executeCtx context.Context) (core.RerankResult, error) {
 			return route.RerankExecutor.Rerank(executeCtx, request)
 		})
 		if executeErr != nil {
@@ -473,14 +479,15 @@ func (r *Runtime) Rerank(ctx context.Context, request core.RerankRequest) (strin
 			Documents: result.Documents, AmountMicros: amount, Currency: route.PriceSnapshot.Currency, CreatedAt: r.now().UTC(),
 		}
 		if reservation != nil {
-			record.QuotaReservationID = reservation.ID
+			record.QuotaReservationID = reservation.ReservationID()
 		}
 		if err := r.usageStore.RecordCapabilityUsage(context.WithoutCancel(ctx), record); err != nil {
 			r.uncertain(context.WithoutCancel(ctx), reservation)
 			return operationID, core.RerankResult{}, fmt.Errorf("record rerank usage: %w", err)
 		}
+		reservation.MarkUsagePersisted()
 		if reservation != nil {
-			if err := r.quota.Commit(context.WithoutCancel(ctx), reservation.ID, quota.ActualUsage{
+			if err := reservation.Commit(context.WithoutCancel(ctx), quota.ActualUsage{
 				Requests: 1, SpendMicros: amount, RerankDocuments: result.Documents,
 			}); err != nil {
 				return operationID, core.RerankResult{}, fmt.Errorf("commit rerank quota: %w", err)
@@ -521,17 +528,15 @@ func executeWithWriterFence[T any](
 	runtime *Runtime,
 	ctx context.Context,
 	principal core.CapabilityPrincipal,
+	attempt *providerattempt.Attempt,
 	execute func(context.Context) (T, error),
 ) (T, error) {
 	var result T
 	var executionErr error
 	started := false
-	fenceStore, ok := runtime.usageStore.(store.CapabilityAdmissionStore)
-	if !ok {
-		return result, errors.New("capability usage store does not support writer fencing")
-	}
-	err := fenceStore.ExecuteWithCapabilityWriterFence(ctx, principal.TenantID, principal.HomeRegion, principal.ExecutionEpoch, func(executeCtx context.Context) error {
+	err := runtime.usageStore.ExecuteWithCapabilityWriterFence(ctx, principal.TenantID, principal.HomeRegion, principal.ExecutionEpoch, func(executeCtx context.Context) error {
 		started = true
+		attempt.MarkSideEffectStarted()
 		result, executionErr = execute(executeCtx)
 		return executionErr
 	})

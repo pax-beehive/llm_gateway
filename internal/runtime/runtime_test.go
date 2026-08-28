@@ -3,6 +3,7 @@ package runtime_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -122,6 +123,42 @@ func TestProviderFailureBeforeVisibleOutputFallsBack(t *testing.T) {
 	}
 	if len(response.Attempts) != 2 || response.Attempts[0].Error == nil || response.Attempts[1].Error != nil {
 		t.Fatalf("attempts = %#v", response.Attempts)
+	}
+}
+
+func TestFallbackUsesOneQuotaReservationPerProviderAttempt(t *testing.T) {
+	requestsPerMinute := int64(10)
+	controller := &recordingQuotaController{}
+	first := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{{err: errors.New("first route failed before output")}}}, nil
+	})
+	usage := core.Usage{InputTokens: 2, OutputTokens: 1, TotalTokens: 3}
+	second := executorFunc(func(context.Context, core.Request) (provider.EventStream, error) {
+		return &scriptedStream{steps: []streamStep{{event: core.Event{Type: "response.completed", Usage: &usage}}}}, nil
+	})
+	firstRoute := testRoute("first", first)
+	secondRoute := testRoute("second", second)
+	firstRoute.PriceSnapshot = core.PriceSnapshot{ID: "first-price", Provider: "first", Model: "provider-model", Region: "local", Currency: "USD", EffectiveAt: 1, Source: "test"}
+	secondRoute.PriceSnapshot = core.PriceSnapshot{ID: "second-price", Provider: "second", Model: "provider-model", Region: "local", Currency: "USD", EffectiveAt: 1, Source: "test"}
+	engine := gatewayruntime.NewWithOptions(store.NewMemoryResponseStore(), provider.NewRouter(firstRoute, secondRoute), gatewayruntime.Options{QuotaController: controller})
+	response, err := engine.Execute(context.Background(), core.Request{
+		TenantID: "tenant-a", APIKeyID: "key-a", Model: "gateway-model", Store: true, RequestedFeatures: []string{"text"},
+		TenantPolicy: &core.TenantPolicy{Revision: 1, Limits: core.QuotaLimits{RequestsPerMinute: &requestsPerMinute}},
+		APIKeyPolicy: &core.APIKeyPolicy{Revision: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.requests) != 2 || len(response.Attempts) != 2 {
+		t.Fatalf("reservations/attempts = %d/%d", len(controller.requests), len(response.Attempts))
+	}
+	for index := range controller.requests {
+		if controller.requests[index].ResponseAttemptID != response.Attempts[index].ID {
+			t.Fatalf("reservation %d attempt = %q, want %q", index, controller.requests[index].ResponseAttemptID, response.Attempts[index].ID)
+		}
+	}
+	if controller.uncertainID != "reservation-1" || controller.committedID != "reservation-2" {
+		t.Fatalf("uncertain/committed = %q/%q", controller.uncertainID, controller.committedID)
 	}
 }
 
@@ -625,6 +662,30 @@ type quotaControllerStub struct {
 	uncertainID string
 	releasedID  string
 }
+
+type recordingQuotaController struct {
+	requests    []quota.ReservationRequest
+	committedID string
+	uncertainID string
+}
+
+func (c *recordingQuotaController) Reserve(_ context.Context, request quota.ReservationRequest) (quota.Reservation, error) {
+	c.requests = append(c.requests, request)
+	return quota.Reservation{ID: fmt.Sprintf("reservation-%d", len(c.requests))}, nil
+}
+func (c *recordingQuotaController) ReserveRefresh(context.Context, quota.RefreshReservationRequest) (quota.Reservation, error) {
+	return quota.Reservation{}, nil
+}
+func (c *recordingQuotaController) Commit(_ context.Context, id string, _ quota.ActualUsage) error {
+	c.committedID = id
+	return nil
+}
+func (c *recordingQuotaController) Release(context.Context, string) error { return nil }
+func (c *recordingQuotaController) Uncertain(_ context.Context, id string) error {
+	c.uncertainID = id
+	return nil
+}
+func (c *recordingQuotaController) Reconcile(context.Context, int) (int, error) { return 0, nil }
 
 func (s *quotaControllerStub) Reserve(context.Context, quota.ReservationRequest) (quota.Reservation, error) {
 	return quota.Reservation{ID: "reservation-1"}, nil
