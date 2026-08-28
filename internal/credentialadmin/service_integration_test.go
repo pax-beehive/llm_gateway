@@ -66,7 +66,7 @@ func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *te
 		t.Fatalf("invalid issuance CIDR error = %v", err)
 	}
 	if _, err := service.Issue(ctx, actor, "issue-typed-metadata-"+tenantID, credentialadmin.IssueCommand{
-		TenantID: tenantID, Name: "typed metadata", Metadata: map[string]any{"home_region": "elsewhere"},
+		TenantID: tenantID, Name: "typed metadata", Metadata: map[string]any{"allowed_operations": []string{"responses"}},
 	}); !errors.Is(err, credentialadmin.ErrInvalidArgument) {
 		t.Fatalf("typed metadata issuance error = %v", err)
 	}
@@ -127,6 +127,19 @@ func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *te
 	}
 	if event["digest_version"] != float64(2) || event["secret_digest"] == "" {
 		t.Fatalf("projection event = %#v", event)
+	}
+	countBeforeSuspension, err := service.ActiveDigestVersionCount(ctx, actor, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tenantService.TransitionTenant(ctx, actor, "suspend-"+tenantID, tenantadmin.TransitionTenantCommand{
+		TenantID: tenantID, ExpectedRevision: 1, Target: access.TenantSuspended,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	countAfterSuspension, err := service.ActiveDigestVersionCount(ctx, actor, 2)
+	if err != nil || countAfterSuspension != countBeforeSuspension {
+		t.Fatalf("suspended Tenant digest count before/after = %d/%d err=%v", countBeforeSuspension, countAfterSuspension, err)
 	}
 }
 

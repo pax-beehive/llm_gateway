@@ -253,6 +253,12 @@ func TestSnapshotAtomicallyRepairsProjectionAndGatesPepperRetirement(t *testing.
 	if err != nil || oldCount != oldBefore+1 {
 		t.Fatalf("old digest version count = %d err=%v", oldCount, err)
 	}
+	suspendedSnapshot := snapshot
+	suspendedSnapshot.Tenant.Status = access.TenantSuspended
+	suspendedSnapshot.Tenant.Revision = 8
+	if err := store.ReplaceSnapshot(ctx, suspendedSnapshot); err != nil {
+		t.Fatal(err)
+	}
 	withoutOld, err := accessprojection.New(db, accessprojection.PepperRing{
 		CurrentVersion: 2, Peppers: map[int16][]byte{2: pepper},
 	}, func() time.Time { return now })
@@ -260,7 +266,11 @@ func TestSnapshotAtomicallyRepairsProjectionAndGatesPepperRetirement(t *testing.
 		t.Fatal(err)
 	}
 	if err := withoutOld.ValidatePepperCoverage(ctx); err == nil {
-		t.Fatal("pepper coverage accepted removal of an in-use digest version")
+		t.Fatal("pepper coverage accepted removal of a digest version used by a reactivatable suspended Tenant")
+	}
+	snapshot.Tenant.Revision = 9
+	if err := store.ReplaceSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.AcquireAPIKeyResponseSlot(ctx, keyID, "snapshot-lease-1", 1, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)

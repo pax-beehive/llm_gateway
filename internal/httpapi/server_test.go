@@ -185,9 +185,81 @@ func TestGatewayAPIKeyConcurrencyLeaseCoversBackgroundExecution(t *testing.T) {
 	<-completed
 }
 
+func TestBackgroundConcurrencyLeaseRenewsAfterHTTPHandlerReturns(t *testing.T) {
+	limit := 1
+	started := make(chan struct{})
+	release := make(chan struct{})
+	completed := make(chan struct{}, 1)
+	renewed := make(chan struct{}, 1)
+	executor := blockingExecutor{
+		started: started, release: release, completed: completed, delegate: provider.NewEchoExecutor(),
+	}
+	route := provider.Route{
+		ID: "server-background-concurrency-route", Provider: "test", Model: "gateway-model", Region: "local", HomeRegion: "local",
+		CredentialScope: "test", Healthy: true, Executor: executor,
+		Profile:       provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{"text": provider.CapabilityNative}},
+		PriceSnapshot: core.PriceSnapshot{ID: "price", Provider: "test", Model: "gateway-model", Region: "local", Currency: "USD", EffectiveAt: 1, Source: "test"},
+	}
+	authenticator := &renewingPrincipalAuthenticatorStub{Principal: access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a", HomeRegion: "local", ExecutionEpoch: 1,
+		TenantPolicy: core.TenantPolicy{Revision: 1},
+		APIKeyPolicy: core.APIKeyPolicy{Revision: 1, MaxConcurrentResponses: &limit},
+	}, renewed: renewed}
+	handler := httpapi.New(httpapi.Config{
+		Runtime:       runtime.New(store.NewMemoryResponseStore(), provider.NewRouter(route)),
+		Authenticator: authenticator, LocalRegion: "local",
+		APIKeyConcurrencyLeaseTTL: 100 * time.Millisecond, APIKeyConcurrencyRenewInterval: 20 * time.Millisecond,
+	})
+	payload := strings.NewReader(`{"model":"gateway-model","input":"first","background":true}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", payload)
+	requestContext, cancelRequest := context.WithCancel(request.Context())
+	request = request.WithContext(requestContext)
+	request.Header.Set("Authorization", "Bearer key")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("background status/body = %d / %s", response.Code, response.Body.String())
+	}
+	cancelRequest() // net/http cancels the incoming context after ServeHTTP returns.
+	<-started
+	select {
+	case <-renewed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("background concurrency lease stopped renewing when ServeHTTP returned")
+	}
+	close(release)
+	<-completed
+}
+
 type principalAuthenticatorStub struct {
 	Principal access.Principal
 	Err       error
+}
+
+type renewingPrincipalAuthenticatorStub struct {
+	Principal access.Principal
+	renewed   chan<- struct{}
+}
+
+func (stub *renewingPrincipalAuthenticatorStub) Authenticate(context.Context, string) (access.Principal, error) {
+	return stub.Principal, nil
+}
+
+func (*renewingPrincipalAuthenticatorStub) AcquireAPIKeyResponseSlot(context.Context, string, string, int, time.Time) error {
+	return nil
+}
+
+func (stub *renewingPrincipalAuthenticatorStub) RenewAPIKeyResponseSlot(context.Context, string, string, time.Time) error {
+	select {
+	case stub.renewed <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (*renewingPrincipalAuthenticatorStub) ReleaseAPIKeyResponseSlot(context.Context, string, string) error {
+	return nil
 }
 
 func (s principalAuthenticatorStub) Authenticate(context.Context, string) (access.Principal, error) {

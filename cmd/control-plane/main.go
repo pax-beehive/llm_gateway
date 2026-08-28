@@ -21,6 +21,7 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
@@ -54,6 +55,11 @@ func run() error {
 	}
 	if !devMode && os.Getenv("CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
 		return errors.New("production requires CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted")
+	}
+	if !devMode {
+		if err := dbtransport.RequireAuthenticatedEncryption(databaseURL); err != nil {
+			return fmt.Errorf("control-plane database transport: %w", err)
+		}
 	}
 	database, err := sql.Open("pgx", databaseURL)
 	if err != nil {

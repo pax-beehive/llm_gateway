@@ -17,6 +17,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/accessprojection"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -33,6 +34,12 @@ func run(ctx context.Context) error {
 	gatewayURL := strings.TrimSpace(os.Getenv("GATEWAY_DATABASE_URL"))
 	if tenantID == "" || controlURL == "" || gatewayURL == "" {
 		return errors.New("ACCESS_PROJECTION_REPAIR_TENANT_ID, CONTROL_PLANE_DATABASE_URL, and GATEWAY_DATABASE_URL are required")
+	}
+	if err := dbtransport.RequireAuthenticatedEncryption(controlURL); err != nil {
+		return fmt.Errorf("authoritative control database transport: %w", err)
+	}
+	if err := dbtransport.RequireAuthenticatedEncryption(gatewayURL); err != nil {
+		return fmt.Errorf("Gateway projection database transport: %w", err)
 	}
 	ring, err := pepperRingFromEnv()
 	if err != nil {
@@ -59,7 +66,8 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("build authoritative access snapshot: %w", err)
 	}
 	for _, key := range snapshot.Keys {
-		if key.Status == access.APIKeyActive && (key.ExpiresAt == nil || key.ExpiresAt.After(time.Now().UTC())) &&
+		if snapshot.Tenant.Status != access.TenantClosed && key.Status == access.APIKeyActive &&
+			(key.ExpiresAt == nil || key.ExpiresAt.After(time.Now().UTC())) &&
 			len(ring.Peppers[key.DigestVersion]) == 0 {
 			return fmt.Errorf("snapshot requires unconfigured digest pepper version %d", key.DigestVersion)
 		}

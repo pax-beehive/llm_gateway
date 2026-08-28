@@ -53,10 +53,11 @@ type apiKeyConcurrencyLeaseContextKey struct{}
 var errAPIKeyConcurrencyDenied = errors.New("Gateway API Key concurrent Response policy denies this operation")
 
 type apiKeyConcurrencyLease struct {
-	mu       sync.Mutex
-	detached bool
-	once     sync.Once
-	release  func()
+	mu                sync.Mutex
+	detached          bool
+	once              sync.Once
+	release           func()
+	backgroundContext context.Context
 }
 
 func (lease *apiKeyConcurrencyLease) detach() {
@@ -79,35 +80,39 @@ func (lease *apiKeyConcurrencyLease) finish() {
 }
 
 type Config struct {
-	Runtime               *runtime.Runtime
-	CapabilityRuntime     *capability.Runtime
-	CapabilityCatalog     provider.CapabilityCatalog
-	ModelCatalog          provider.ModelCatalog
-	Authenticator         Authenticator
-	TenantHomeRegions     map[string]string
-	TenantExecutionEpochs map[string]int64
-	LocalRegion           string
-	HomeRegionURLs        map[string]string
-	ForwardClient         *http.Client
-	TrustedProxyCIDRs     []string
+	Runtime                        *runtime.Runtime
+	CapabilityRuntime              *capability.Runtime
+	CapabilityCatalog              provider.CapabilityCatalog
+	ModelCatalog                   provider.ModelCatalog
+	Authenticator                  Authenticator
+	TenantHomeRegions              map[string]string
+	TenantExecutionEpochs          map[string]int64
+	LocalRegion                    string
+	HomeRegionURLs                 map[string]string
+	ForwardClient                  *http.Client
+	TrustedProxyCIDRs              []string
+	APIKeyConcurrencyLeaseTTL      time.Duration
+	APIKeyConcurrencyRenewInterval time.Duration
 }
 
 type Server struct {
-	runtime           *runtime.Runtime
-	capabilityRuntime *capability.Runtime
-	capabilityCatalog provider.CapabilityCatalog
-	modelCatalog      provider.ModelCatalog
-	authenticator     Authenticator
-	homeRegions       map[string]string
-	executionEpochs   map[string]int64
-	localRegion       string
-	homeRegionURLs    map[string]string
-	forwardClient     *http.Client
-	trustedProxies    []netip.Prefix
-	policyConfigError error
-	inflightMu        sync.Mutex
-	apiKeyInflight    map[string]int
-	mux               *http.ServeMux
+	runtime             *runtime.Runtime
+	capabilityRuntime   *capability.Runtime
+	capabilityCatalog   provider.CapabilityCatalog
+	modelCatalog        provider.ModelCatalog
+	authenticator       Authenticator
+	homeRegions         map[string]string
+	executionEpochs     map[string]int64
+	localRegion         string
+	homeRegionURLs      map[string]string
+	forwardClient       *http.Client
+	trustedProxies      []netip.Prefix
+	policyConfigError   error
+	inflightMu          sync.Mutex
+	apiKeyInflight      map[string]int
+	apiKeyLeaseTTL      time.Duration
+	apiKeyRenewInterval time.Duration
+	mux                 *http.ServeMux
 }
 
 func New(config Config) http.Handler {
@@ -117,13 +122,24 @@ func New(config Config) http.Handler {
 	if config.ForwardClient == nil {
 		config.ForwardClient = http.DefaultClient
 	}
+	if config.APIKeyConcurrencyLeaseTTL == 0 {
+		config.APIKeyConcurrencyLeaseTTL = 30 * time.Second
+	}
+	if config.APIKeyConcurrencyRenewInterval == 0 {
+		config.APIKeyConcurrencyRenewInterval = 10 * time.Second
+	}
 	trustedProxies, policyConfigError := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
+	if config.APIKeyConcurrencyLeaseTTL <= 0 || config.APIKeyConcurrencyRenewInterval <= 0 ||
+		config.APIKeyConcurrencyRenewInterval >= config.APIKeyConcurrencyLeaseTTL {
+		policyConfigError = errors.New("Gateway API Key concurrency lease timing is invalid")
+	}
 	server := &Server{
 		runtime: config.Runtime, capabilityRuntime: config.CapabilityRuntime, capabilityCatalog: config.CapabilityCatalog,
 		modelCatalog: config.ModelCatalog, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
 		executionEpochs: config.TenantExecutionEpochs, localRegion: config.LocalRegion,
 		homeRegionURLs: config.HomeRegionURLs, forwardClient: config.ForwardClient,
 		trustedProxies: trustedProxies, policyConfigError: policyConfigError,
+		apiKeyLeaseTTL: config.APIKeyConcurrencyLeaseTTL, apiKeyRenewInterval: config.APIKeyConcurrencyRenewInterval,
 		apiKeyInflight: make(map[string]int), mux: http.NewServeMux(),
 	}
 	server.mux.HandleFunc("POST /v1/responses", server.createResponse)
@@ -731,7 +747,9 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 	limit := principal.APIKeyPolicy.MaxConcurrentResponses
 	if limit == nil || request.Method != http.MethodPost ||
 		(operation != "responses" && operation != "chat_completions" && operation != "embeddings" && operation != "moderation" && operation != "rerank") {
-		return request, &apiKeyConcurrencyLease{release: func() {}}, nil
+		return request, &apiKeyConcurrencyLease{
+			release: func() {}, backgroundContext: context.WithoutCancel(request.Context()),
+		}, nil
 	}
 	if principal.APIKeyID == "" || *limit <= 0 {
 		return nil, nil, errAPIKeyConcurrencyDenied
@@ -742,36 +760,40 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 			return nil, nil, fmt.Errorf("create Gateway API Key concurrency lease: %w", err)
 		}
 		leaseID := "key_quota_" + hex.EncodeToString(leaseBytes)
-		const leaseTTL = 30 * time.Second
-		const renewInterval = 10 * time.Second
-		if err := quotas.AcquireAPIKeyResponseSlot(request.Context(), principal.APIKeyID, leaseID, *limit, time.Now().UTC().Add(leaseTTL)); err != nil {
+		if err := quotas.AcquireAPIKeyResponseSlot(request.Context(), principal.APIKeyID, leaseID, *limit, time.Now().UTC().Add(s.apiKeyLeaseTTL)); err != nil {
 			return nil, nil, err
 		}
-		leaseContext, cancelLease := context.WithCancel(request.Context())
+		requestContext, cancelRequest := context.WithCancel(request.Context())
+		backgroundContext, cancelBackground := context.WithCancel(context.WithoutCancel(request.Context()))
 		go func() {
-			ticker := time.NewTicker(renewInterval)
+			ticker := time.NewTicker(s.apiKeyRenewInterval)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-leaseContext.Done():
+				case <-backgroundContext.Done():
 					return
 				case <-ticker.C:
 					renewContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					err := quotas.RenewAPIKeyResponseSlot(renewContext, principal.APIKeyID, leaseID, time.Now().UTC().Add(leaseTTL))
+					err := quotas.RenewAPIKeyResponseSlot(renewContext, principal.APIKeyID, leaseID, time.Now().UTC().Add(s.apiKeyLeaseTTL))
 					cancel()
 					if err != nil {
-						cancelLease()
+						cancelRequest()
+						cancelBackground()
 						return
 					}
 				}
 			}
 		}()
-		return request.WithContext(leaseContext), &apiKeyConcurrencyLease{release: func() {
-			cancelLease()
-			releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = quotas.ReleaseAPIKeyResponseSlot(releaseContext, principal.APIKeyID, leaseID)
-		}}, nil
+		return request.WithContext(requestContext), &apiKeyConcurrencyLease{
+			backgroundContext: backgroundContext,
+			release: func() {
+				cancelRequest()
+				cancelBackground()
+				releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = quotas.ReleaseAPIKeyResponseSlot(releaseContext, principal.APIKeyID, leaseID)
+			},
+		}, nil
 	}
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
@@ -779,15 +801,18 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 		return nil, nil, store.ErrQuotaExceeded
 	}
 	s.apiKeyInflight[principal.APIKeyID]++
-	return request, &apiKeyConcurrencyLease{release: func() {
-		s.inflightMu.Lock()
-		defer s.inflightMu.Unlock()
-		if s.apiKeyInflight[principal.APIKeyID] <= 1 {
-			delete(s.apiKeyInflight, principal.APIKeyID)
-			return
-		}
-		s.apiKeyInflight[principal.APIKeyID]--
-	}}, nil
+	return request, &apiKeyConcurrencyLease{
+		backgroundContext: context.WithoutCancel(request.Context()),
+		release: func() {
+			s.inflightMu.Lock()
+			defer s.inflightMu.Unlock()
+			if s.apiKeyInflight[principal.APIKeyID] <= 1 {
+				delete(s.apiKeyInflight, principal.APIKeyID)
+				return
+			}
+			s.apiKeyInflight[principal.APIKeyID]--
+		},
+	}, nil
 }
 
 func bearerToken(value string) (string, error) {
@@ -1002,6 +1027,9 @@ func (s *Server) startBackgroundResponse(responseWriter http.ResponseWriter, req
 	created := make(chan core.Response, 1)
 	finished := make(chan struct{})
 	backgroundContext := context.WithoutCancel(request.Context())
+	if lease != nil && lease.backgroundContext != nil {
+		backgroundContext = lease.backgroundContext
+	}
 	go func() {
 		defer close(finished)
 		if lease != nil {

@@ -27,6 +27,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
@@ -261,6 +262,11 @@ func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[
 	}
 	if os.Getenv("GATEWAY_ENV") == "production" && os.Getenv("GATEWAY_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
 		return nil, nil, func() {}, errors.New("production requires GATEWAY_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted")
+	}
+	if os.Getenv("GATEWAY_ENV") == "production" {
+		if err := dbtransport.RequireAuthenticatedEncryption(databaseURL); err != nil {
+			return nil, nil, func() {}, fmt.Errorf("Gateway database transport: %w", err)
+		}
 	}
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {

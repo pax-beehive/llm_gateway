@@ -100,7 +100,10 @@ The control-plane runtime refuses in-process production migration and verifies
 its connected role. The Gateway role reads immutable schema-version-2 control
 events and owns only its local Access Projection tables; it receives no read
 access to authoritative Tenant or Gateway API Key tables. Production refuses to
-start unless `GATEWAY_ACCESS_PROJECTION=true`.
+start unless `GATEWAY_ACCESS_PROJECTION=true`. Both production processes require
+the transport attestation and reject PostgreSQL configurations that are not
+certificate-verified TLS; the repair command enforces the same rule on both its
+source and destination connections.
 `/healthz` is liveness only. Full dependency and backlog readiness is introduced
 by ADR 0008; this process does not claim readiness before those checks exist.
 Tenant mutations atomically append `control_outbox`; that is durable enqueue,

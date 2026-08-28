@@ -294,7 +294,10 @@ func metadataJSON(metadata map[string]any) ([]byte, error) {
 	for key := range metadata {
 		switch strings.ToLower(key) {
 		case "status", "lifecycle", "policy", "permissions", "limits", "digest", "secret", "tenant_id",
-			"expires_at", "home_region", "execution_epoch":
+			"expires_at", "revoked_at", "grace_expires_at", "last_used_at", "home_region", "execution_epoch",
+			"revision", "policy_revision", "digest_version", "predecessor_id", "replacement_id",
+			"allowed_public_models", "allowed_operations", "allowed_cidrs", "allowed_regions",
+			"max_concurrent_responses", "allow_cache_protection", "allow_content_inspection":
 			return nil, fmt.Errorf("%w: %q is typed behavior and cannot be metadata", ErrInvalidArgument, key)
 		}
 	}
