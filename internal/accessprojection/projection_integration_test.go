@@ -69,9 +69,13 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 		if marshalErr != nil {
 			t.Fatal(marshalErr)
 		}
+		eventType := "GatewayAPIKeyChanged"
+		if status == access.APIKeyRevoked {
+			eventType = "GatewayAPIKeyRevoked"
+		}
 		return accessprojection.ControlEvent{
 			EventID: id, SchemaVersion: 2, AggregateType: "GatewayAPIKey", AggregateID: keyID,
-			AggregateRevision: revision, TenantID: tenantID, EventType: "GatewayAPIKeyChanged",
+			AggregateRevision: revision, TenantID: tenantID, EventType: eventType,
 			OccurredAt: now.Add(-time.Second), Payload: payload,
 		}
 	}
@@ -145,7 +149,8 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 		t.Fatal(err)
 	}
 	revocationStatus, err := store.Status(ctx)
-	if err != nil || revocationStatus.LastRevocationAppliedAt == nil || revocationStatus.MaxRevocationApplyLag < time.Second {
+	if err != nil || revocationStatus.LastRevocationAppliedAt == nil || !revocationStatus.LastRevocationAppliedAt.Equal(now) ||
+		revocationStatus.MaxRevocationApplyLag < time.Second {
 		t.Fatalf("revocation projection status = %#v err=%v", revocationStatus, err)
 	}
 	if _, err := store.Authenticate(ctx, rawKey); !errors.Is(err, access.ErrInvalidAPIKey) {
