@@ -78,8 +78,7 @@ func (service *Service) ActiveDigestVersionCount(ctx context.Context, actor tena
 	var count int64
 	err := service.database.QueryRowContext(ctx, `
 		SELECT count(*) FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
-		WHERE k.digest_version = $1 AND k.status = 'active' AND t.status <> 'closed'
-		  AND (k.expires_at IS NULL OR k.expires_at > $2)`, version, service.now().UTC()).Scan(&count)
+		WHERE k.digest_version = $1 AND k.status = 'active' AND t.status <> 'closed'`, version).Scan(&count)
 	return count, err
 }
 
@@ -91,8 +90,7 @@ func (service *Service) ValidatePepperCoverage(ctx context.Context, actor tenant
 		SELECT DISTINCT k.digest_version
 		FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
 		WHERE k.status = 'active' AND t.status <> 'closed'
-		  AND (k.expires_at IS NULL OR k.expires_at > $1)
-		ORDER BY k.digest_version`, service.now().UTC())
+		ORDER BY k.digest_version`)
 	if err != nil {
 		return err
 	}

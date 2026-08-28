@@ -143,6 +143,70 @@ func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *te
 	}
 }
 
+func TestPepperCoverageIncludesExpiredActiveKeysThatCanBeReactivated(t *testing.T) {
+	db, ctx := credentialIntegrationDatabase(t)
+	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tenantadmin.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentialadmin.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	tenantService, err := tenantadmin.NewService(db, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("credential-expired-pepper-%d", time.Now().UnixNano())
+	actor := tenantadmin.ActorEnvelope{
+		Type: "human", ID: "credential-operator", Scopes: []string{tenantadmin.ScopePlatformRead, tenantadmin.ScopePlatformWrite},
+		RequestID: "request-expired-pepper", Reason: "integration test",
+	}
+	if _, err := tenantService.CreateTenant(ctx, actor, "create-"+tenantID, tenantadmin.CreateTenantCommand{
+		ID: tenantID, Slug: tenantID, DisplayName: "Expired Pepper Tenant", HomeRegion: "us-test",
+		InitialPolicy: core.TenantPolicy{Revision: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldPepper := []byte("old-expired-pepper")
+	oldService, err := credentialadmin.NewService(db, credentialadmin.PepperRing{
+		CurrentVersion: 1, Peppers: map[int16][]byte{1: oldPepper},
+	}, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countBefore, err := oldService.ActiveDigestVersionCount(ctx, actor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := now.Add(time.Minute)
+	issued, err := oldService.Issue(ctx, actor, "issue-"+tenantID, credentialadmin.IssueCommand{
+		TenantID: tenantID, Name: "expired but reactivatable", ExpiresAt: &expiresAt,
+		Policy: core.APIKeyPolicy{Revision: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE api_keys SET expires_at = $2 WHERE id = $1`, issued.Credential.ID, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	count, err := oldService.ActiveDigestVersionCount(ctx, actor, 1)
+	if err != nil || count != countBefore+1 {
+		t.Fatalf("expired active digest version count = %d err=%v", count, err)
+	}
+	withoutOld, err := credentialadmin.NewService(db, credentialadmin.PepperRing{
+		CurrentVersion: 2, Peppers: map[int16][]byte{2: []byte("current-expired-pepper")},
+	}, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := withoutOld.ValidatePepperCoverage(ctx, actor); err == nil {
+		t.Fatal("pepper coverage accepted removal of a digest version used by an expired active key")
+	}
+}
+
 func TestGatewayAPIKeyQueriesAndProfileUpdateUseStablePaginationAndCAS(t *testing.T) {
 	db, ctx := credentialIntegrationDatabase(t)
 	if err := store.NewPostgresResponseStore(db).Migrate(ctx); err != nil {

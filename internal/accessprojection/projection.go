@@ -699,8 +699,7 @@ func (store *Store) ActiveDigestVersionCount(ctx context.Context, version int16)
 	var count int64
 	err := store.database.QueryRowContext(ctx, `
 		SELECT count(*) FROM gateway_access_projection
-		WHERE digest_version = $1 AND key_status = 'active' AND tenant_status <> 'closed'
-		  AND (expires_at IS NULL OR expires_at > $2)`, version, store.now().UTC()).Scan(&count)
+		WHERE digest_version = $1 AND key_status = 'active' AND tenant_status <> 'closed'`, version).Scan(&count)
 	return count, err
 }
 
@@ -708,8 +707,7 @@ func (store *Store) ValidatePepperCoverage(ctx context.Context) error {
 	rows, err := store.database.QueryContext(ctx, `
 		SELECT DISTINCT digest_version FROM gateway_access_projection
 		WHERE key_status = 'active' AND tenant_status <> 'closed'
-		  AND (expires_at IS NULL OR expires_at > $1)
-		ORDER BY digest_version`, store.now().UTC())
+		ORDER BY digest_version`)
 	if err != nil {
 		return err
 	}

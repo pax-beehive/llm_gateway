@@ -195,6 +195,7 @@ func TestSnapshotAtomicallyRepairsProjectionAndGatesPepperRetirement(t *testing.
 	oldRawKey := "gw_snapshot_old_" + tenantID
 	oldDigest := hmac.New(sha256.New, []byte("old-snapshot-pepper"))
 	_, _ = oldDigest.Write([]byte(oldRawKey))
+	oldExpiresAt := now.Add(-time.Minute)
 	snapshot := accessprojection.Snapshot{
 		Tenant: accessprojection.TenantSnapshot{
 			ID: tenantID, Status: access.TenantActive, Revision: 7, HomeRegion: "us-test", ExecutionEpoch: 3,
@@ -205,7 +206,7 @@ func TestSnapshotAtomicallyRepairsProjectionAndGatesPepperRetirement(t *testing.
 			Status: access.APIKeyActive, Revision: 5, Policy: core.APIKeyPolicy{Revision: 2},
 		}, {
 			ID: "gak_old_" + tenantID, Prefix: "gw_snapshot", SecretDigest: oldDigest.Sum(nil), DigestVersion: 1,
-			Status: access.APIKeyActive, Revision: 1, Policy: core.APIKeyPolicy{Revision: 1},
+			Status: access.APIKeyActive, Revision: 1, Policy: core.APIKeyPolicy{Revision: 1}, ExpiresAt: &oldExpiresAt,
 		}},
 		CreatedAt: now,
 	}
