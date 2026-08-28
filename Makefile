@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev configure-tenant-admin-roles compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev repair-access-projection configure-tenant-admin-roles compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -74,6 +74,12 @@ run-control-plane-dev:
 	CONTROL_API_KEY_PEPPERS_JSON='{"1":"local-control-api-key-pepper"}' \
 	CONTROL_PLANE_DATABASE_URL="$${CONTROL_PLANE_DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
 	go run ./cmd/control-plane
+
+repair-access-projection:
+	@test -n "$(ACCESS_PROJECTION_REPAIR_TENANT_ID)" || { echo "ACCESS_PROJECTION_REPAIR_TENANT_ID is required" >&2; exit 1; }
+	@test -n "$(CONTROL_PLANE_DATABASE_URL)" || { echo "CONTROL_PLANE_DATABASE_URL is required" >&2; exit 1; }
+	@test -n "$(GATEWAY_DATABASE_URL)" || { echo "GATEWAY_DATABASE_URL is required" >&2; exit 1; }
+	GOCACHE=$(GOCACHE) go run ./cmd/access-projection-repair
 
 configure-tenant-admin-roles:
 	@test -n "$(ADMIN_DATABASE_URL)" || { echo "ADMIN_DATABASE_URL is required" >&2; exit 1; }

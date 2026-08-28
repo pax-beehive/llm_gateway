@@ -52,6 +52,9 @@ func run() error {
 	if databaseURL == "" {
 		return errors.New("CONTROL_PLANE_DATABASE_URL is required")
 	}
+	if !devMode && os.Getenv("CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
+		return errors.New("production requires CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted")
+	}
 	database, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return err
@@ -97,6 +100,13 @@ func run() error {
 	credentials, err := credentialadmin.NewService(database, pepperRing, time.Now, nil)
 	if err != nil {
 		return fmt.Errorf("configure Gateway Credential Administration: %w", err)
+	}
+	if !devMode {
+		if err := credentials.ValidatePepperCoverage(ctx, tenantadmin.ActorEnvelope{
+			Type: "system", ID: "control-plane-startup", Scopes: []string{tenantadmin.ScopePlatformRead},
+		}); err != nil {
+			return fmt.Errorf("gate Gateway API Key digest pepper retirement: %w", err)
+		}
 	}
 	go runGatewayAPIKeyGraceReconciler(ctx, credentials)
 	api := controlapi.New(controlapi.Config{Administration: administration, Credentials: credentials, Verifier: verifier})

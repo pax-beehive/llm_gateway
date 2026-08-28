@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
@@ -74,6 +75,7 @@ type KeySnapshot struct {
 	Policy        core.APIKeyPolicy
 	ExpiresAt     *time.Time
 	RevokedAt     *time.Time
+	LastUsedAt    *time.Time
 }
 
 type Snapshot struct {
@@ -83,22 +85,32 @@ type Snapshot struct {
 }
 
 type Status struct {
-	GapCount             int
-	OldestGapAt          *time.Time
-	HeadCount            int
-	MaxAggregateRevision int64
-	PendingEventCount    int
-	OldestPendingAt      *time.Time
-	LastAppliedAt        *time.Time
-	MaxApplyLag          time.Duration
-	DeliveryLag          time.Duration
+	GapCount                int
+	OldestGapAt             *time.Time
+	HeadCount               int
+	MaxAggregateRevision    int64
+	PendingEventCount       int
+	OldestPendingAt         *time.Time
+	LastAppliedAt           *time.Time
+	MaxApplyLag             time.Duration
+	DeliveryLag             time.Duration
+	LastRevocationAppliedAt *time.Time
+	MaxRevocationApplyLag   time.Duration
 }
 
 type Store struct {
-	database *sql.DB
-	peppers  map[int16][]byte
-	current  int16
-	now      func() time.Time
+	database          *sql.DB
+	peppers           map[int16][]byte
+	current           int16
+	now               func() time.Time
+	usageMu           sync.Mutex
+	recentUsage       map[string]time.Time
+	usageObservations chan usageObservation
+}
+
+type usageObservation struct {
+	apiKeyID string
+	usedAt   time.Time
 }
 
 func Migrate(ctx context.Context, database *sql.DB) error {
@@ -131,7 +143,10 @@ func New(database *sql.DB, ring PepperRing, now func() time.Time) (*Store, error
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{database: database, peppers: peppers, current: ring.CurrentVersion, now: now}, nil
+	return &Store{
+		database: database, peppers: peppers, current: ring.CurrentVersion, now: now,
+		recentUsage: make(map[string]time.Time), usageObservations: make(chan usageObservation, 4096),
+	}, nil
 }
 
 func (store *Store) Apply(ctx context.Context, event ControlEvent) (ApplyResult, error) {
@@ -143,6 +158,9 @@ func (store *Store) Apply(ctx context.Context, event ControlEvent) (ApplyResult,
 		return ApplyResult{}, err
 	}
 	defer func() { _ = transaction.Rollback() }()
+	if err := lockTenantProjection(ctx, transaction, event.TenantID); err != nil {
+		return ApplyResult{}, err
+	}
 	var exists bool
 	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM gateway_access_inbox WHERE event_id = $1)`, event.EventID).Scan(&exists); err != nil {
 		return ApplyResult{}, err
@@ -231,12 +249,23 @@ func lockHead(ctx context.Context, transaction *sql.Tx, aggregateType, aggregate
 	return revision, err
 }
 
+func lockTenantProjection(ctx context.Context, transaction *sql.Tx, tenantID string) error {
+	_, err := transaction.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "gateway-access-projection\x1f"+tenantID)
+	return err
+}
+
 func recordInbox(ctx context.Context, transaction *sql.Tx, event ControlEvent, disposition Disposition, receivedAt time.Time) error {
+	lag := receivedAt.Sub(event.OccurredAt).Seconds()
+	if lag < 0 {
+		lag = 0
+	}
 	_, err := transaction.ExecContext(ctx, `
 		INSERT INTO gateway_access_inbox (
-			event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision, disposition, received_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		event.EventID, event.SchemaVersion, event.AggregateType, event.AggregateID, event.AggregateRevision, disposition, receivedAt)
+			event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision,
+			event_type, event_occurred_at, apply_lag_seconds, disposition, received_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		event.EventID, event.SchemaVersion, event.AggregateType, event.AggregateID, event.AggregateRevision,
+		event.EventType, event.OccurredAt, lag, disposition, receivedAt)
 	return err
 }
 
@@ -330,7 +359,7 @@ func applyEvent(ctx context.Context, transaction *sql.Tx, event ControlEvent, ap
 			UPDATE gateway_access_projection SET
 				tenant_status = $2, tenant_revision = $3, home_region = $4, execution_epoch = $5,
 				tenant_policy_revision = $6, tenant_policy = $7, event_occurred_at = $8, applied_at = $9
-			WHERE tenant_id = $1`, payload.TenantID, payload.Status, payload.TenantRevision, payload.HomeRegion,
+			WHERE tenant_id = $1 AND tenant_revision <= $3`, payload.TenantID, payload.Status, payload.TenantRevision, payload.HomeRegion,
 			payload.ExecutionEpoch, payload.PolicyRevision, policy, event.OccurredAt, appliedAt)
 		return err
 	default:
@@ -360,6 +389,7 @@ func (store *Store) Authenticate(ctx context.Context, rawKey string) (access.Pri
 			WHERE secret_digest = $1 AND digest_version = $2 AND key_status = 'active' AND tenant_status = 'active'
 			  AND (expires_at IS NULL OR expires_at > $3)`, digest(store.peppers[version], rawKey), version, store.now().UTC()))
 		if err == nil {
+			store.ObserveSuccessfulAuthentication(principal.APIKeyID)
 			return principal, nil
 		}
 		if !errors.Is(err, access.ErrInvalidAPIKey) {
@@ -406,7 +436,8 @@ func digest(pepper []byte, rawKey string) []byte {
 
 func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) error {
 	if snapshot.Tenant.ID == "" || snapshot.Tenant.Revision <= 0 || snapshot.Tenant.HomeRegion == "" ||
-		snapshot.Tenant.ExecutionEpoch <= 0 || snapshot.Tenant.Policy.Revision <= 0 || snapshot.CreatedAt.IsZero() {
+		snapshot.Tenant.ExecutionEpoch <= 0 || snapshot.Tenant.Policy.Revision <= 0 || snapshot.CreatedAt.IsZero() ||
+		(snapshot.Tenant.Status != access.TenantActive && snapshot.Tenant.Status != access.TenantSuspended && snapshot.Tenant.Status != access.TenantClosed) {
 		return errors.New("invalid Gateway Access Projection snapshot")
 	}
 	transaction, err := store.database.BeginTx(ctx, nil)
@@ -414,9 +445,51 @@ func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) erro
 		return err
 	}
 	defer func() { _ = transaction.Rollback() }()
-	if _, err := transaction.ExecContext(ctx, `
-		DELETE FROM gateway_access_response_slots
-		WHERE api_key_id IN (SELECT api_key_id FROM gateway_access_projection WHERE tenant_id = $1)`, snapshot.Tenant.ID); err != nil {
+	if err := lockTenantProjection(ctx, transaction, snapshot.Tenant.ID); err != nil {
+		return err
+	}
+	currentTenantRevision, err := lockHead(ctx, transaction, "Tenant", snapshot.Tenant.ID)
+	if err != nil {
+		return err
+	}
+	if currentTenantRevision > snapshot.Tenant.Revision {
+		return fmt.Errorf("%w: Tenant snapshot revision %d is behind projection revision %d", ErrInvalidEvent, snapshot.Tenant.Revision, currentTenantRevision)
+	}
+	snapshotKeys := make(map[string]KeySnapshot, len(snapshot.Keys))
+	for _, key := range snapshot.Keys {
+		if _, duplicate := snapshotKeys[key.ID]; duplicate {
+			return errors.New("invalid Gateway Access Projection snapshot: duplicate key")
+		}
+		snapshotKeys[key.ID] = key
+		currentKeyRevision, err := lockHead(ctx, transaction, "GatewayAPIKey", key.ID)
+		if err != nil {
+			return err
+		}
+		if currentKeyRevision > key.Revision {
+			return fmt.Errorf("%w: Gateway API Key %s snapshot revision %d is behind projection revision %d",
+				ErrInvalidEvent, key.ID, key.Revision, currentKeyRevision)
+		}
+	}
+	existingLastUsed := make(map[string]*time.Time)
+	existingRows, err := transaction.QueryContext(ctx, `
+		SELECT api_key_id, last_used_at FROM gateway_access_projection WHERE tenant_id = $1 FOR UPDATE`, snapshot.Tenant.ID)
+	if err != nil {
+		return err
+	}
+	for existingRows.Next() {
+		var apiKeyID string
+		var lastUsedAt *time.Time
+		if err := existingRows.Scan(&apiKeyID, &lastUsedAt); err != nil {
+			_ = existingRows.Close()
+			return err
+		}
+		if _, present := snapshotKeys[apiKeyID]; !present {
+			_ = existingRows.Close()
+			return fmt.Errorf("%w: snapshot omits projected Gateway API Key %s", ErrInvalidEvent, apiKeyID)
+		}
+		existingLastUsed[apiKeyID] = lastUsedAt
+	}
+	if err := existingRows.Close(); err != nil {
 		return err
 	}
 	if _, err := transaction.ExecContext(ctx, `
@@ -435,20 +508,23 @@ func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) erro
 	}
 	tenantPolicy, _ := json.Marshal(snapshot.Tenant.Policy)
 	for _, key := range snapshot.Keys {
-		if key.ID == "" || key.Revision <= 0 || key.Policy.Revision <= 0 || len(key.SecretDigest) != sha256.Size || key.DigestVersion <= 0 {
+		if key.ID == "" || key.Prefix == "" || key.Revision <= 0 || key.Policy.Revision <= 0 ||
+			len(key.SecretDigest) != sha256.Size || key.DigestVersion <= 0 ||
+			(key.Status != access.APIKeyActive && key.Status != access.APIKeyRevoked) {
 			return errors.New("invalid Gateway Access Projection key snapshot")
 		}
 		keyPolicy, _ := json.Marshal(key.Policy)
+		lastUsedAt := laterTime(key.LastUsedAt, existingLastUsed[key.ID])
 		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO gateway_access_projection (
 				tenant_id, api_key_id, key_prefix, secret_digest, digest_version, key_status, key_revision,
 				api_key_policy_revision, api_key_policy, expires_at, revoked_at, tenant_status, tenant_revision,
-				home_region, execution_epoch, tenant_policy_revision, tenant_policy, event_occurred_at, applied_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+				home_region, execution_epoch, tenant_policy_revision, tenant_policy, event_occurred_at, applied_at, last_used_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 			snapshot.Tenant.ID, key.ID, key.Prefix, key.SecretDigest, key.DigestVersion, key.Status, key.Revision,
 			key.Policy.Revision, keyPolicy, key.ExpiresAt, key.RevokedAt, snapshot.Tenant.Status, snapshot.Tenant.Revision,
 			snapshot.Tenant.HomeRegion, snapshot.Tenant.ExecutionEpoch, snapshot.Tenant.Policy.Revision, tenantPolicy,
-			snapshot.CreatedAt, store.now().UTC()); err != nil {
+			snapshot.CreatedAt, store.now().UTC(), lastUsedAt); err != nil {
 			return err
 		}
 		if _, err := transaction.ExecContext(ctx, `
@@ -456,6 +532,10 @@ func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) erro
 			VALUES ('GatewayAPIKey',$1,$2,$3)
 			ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET revision = EXCLUDED.revision, updated_at = EXCLUDED.updated_at`,
 			key.ID, key.Revision, store.now().UTC()); err != nil {
+			return err
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			DELETE FROM gateway_access_gaps WHERE aggregate_type = 'GatewayAPIKey' AND aggregate_id = $1`, key.ID); err != nil {
 			return err
 		}
 	}
@@ -467,6 +547,105 @@ func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot Snapshot) erro
 		return err
 	}
 	return transaction.Commit()
+}
+
+func laterTime(first, second *time.Time) *time.Time {
+	if first == nil {
+		return second
+	}
+	if second == nil || first.After(*second) {
+		return first
+	}
+	return second
+}
+
+func (store *Store) ObserveSuccessfulAuthentication(apiKeyID string) {
+	if apiKeyID == "" {
+		return
+	}
+	now := store.now().UTC()
+	store.usageMu.Lock()
+	defer store.usageMu.Unlock()
+	if observedAt, ok := store.recentUsage[apiKeyID]; ok && now.Sub(observedAt) < time.Minute {
+		return
+	}
+	select {
+	case store.usageObservations <- usageObservation{apiKeyID: apiKeyID, usedAt: now}:
+		store.recentUsage[apiKeyID] = now
+	default:
+	}
+}
+
+func (store *Store) FlushLastUsed(ctx context.Context, limit int) (int, error) {
+	if limit == 0 {
+		limit = 1000
+	}
+	if limit < 1 || limit > 4096 {
+		return 0, errors.New("last-used flush limit must be between 1 and 4096")
+	}
+	observations := make(map[string]time.Time, limit)
+	for len(observations) < limit {
+		select {
+		case observation := <-store.usageObservations:
+			if current, ok := observations[observation.apiKeyID]; !ok || observation.usedAt.After(current) {
+				observations[observation.apiKeyID] = observation.usedAt
+			}
+		default:
+			limit = 0
+		}
+		if limit == 0 {
+			break
+		}
+	}
+	if len(observations) == 0 {
+		store.pruneRecentUsage()
+		return 0, nil
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		store.retryUsageObservations(observations)
+		return 0, err
+	}
+	defer func() { _ = transaction.Rollback() }()
+	for apiKeyID, usedAt := range observations {
+		if _, err := transaction.ExecContext(ctx, `
+			UPDATE gateway_access_projection
+			SET last_used_at = GREATEST(COALESCE(last_used_at, $2), $2)
+			WHERE api_key_id = $1`, apiKeyID, usedAt); err != nil {
+			store.retryUsageObservations(observations)
+			return 0, err
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		store.retryUsageObservations(observations)
+		return 0, err
+	}
+	store.pruneRecentUsage()
+	return len(observations), nil
+}
+
+func (store *Store) pruneRecentUsage() {
+	threshold := store.now().UTC().Add(-time.Minute)
+	store.usageMu.Lock()
+	defer store.usageMu.Unlock()
+	for apiKeyID, observedAt := range store.recentUsage {
+		if !observedAt.After(threshold) {
+			delete(store.recentUsage, apiKeyID)
+		}
+	}
+}
+
+func (store *Store) retryUsageObservations(observations map[string]time.Time) {
+	store.usageMu.Lock()
+	defer store.usageMu.Unlock()
+	for apiKeyID, usedAt := range observations {
+		delete(store.recentUsage, apiKeyID)
+		select {
+		case store.usageObservations <- usageObservation{apiKeyID: apiKeyID, usedAt: usedAt}:
+			store.recentUsage[apiKeyID] = usedAt
+		default:
+		}
+	}
 }
 
 func (store *Store) Status(ctx context.Context) (Status, error) {
@@ -502,6 +681,17 @@ func (store *Store) Status(ctx context.Context) (Status, error) {
 			status.DeliveryLag = 0
 		}
 	}
+	var revocationLagSeconds sql.NullFloat64
+	if err := store.database.QueryRowContext(ctx, `
+		SELECT max(received_at), max(apply_lag_seconds)
+		FROM gateway_access_inbox
+		WHERE event_type = 'GatewayAPIKeyRevoked' AND disposition = 'applied'`).Scan(
+		&status.LastRevocationAppliedAt, &revocationLagSeconds); err != nil {
+		return Status{}, err
+	}
+	if revocationLagSeconds.Valid && revocationLagSeconds.Float64 > 0 {
+		status.MaxRevocationApplyLag = time.Duration(revocationLagSeconds.Float64 * float64(time.Second))
+	}
 	return status, nil
 }
 
@@ -512,4 +702,26 @@ func (store *Store) ActiveDigestVersionCount(ctx context.Context, version int16)
 		WHERE digest_version = $1 AND key_status = 'active' AND tenant_status = 'active'
 		  AND (expires_at IS NULL OR expires_at > $2)`, version, store.now().UTC()).Scan(&count)
 	return count, err
+}
+
+func (store *Store) ValidatePepperCoverage(ctx context.Context) error {
+	rows, err := store.database.QueryContext(ctx, `
+		SELECT DISTINCT digest_version FROM gateway_access_projection
+		WHERE key_status = 'active' AND tenant_status = 'active'
+		  AND (expires_at IS NULL OR expires_at > $1)
+		ORDER BY digest_version`, store.now().UTC())
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version int16
+		if err := rows.Scan(&version); err != nil {
+			return err
+		}
+		if len(store.peppers[version]) == 0 {
+			return fmt.Errorf("active Gateway Access Projection keys still require digest pepper version %d", version)
+		}
+	}
+	return rows.Err()
 }

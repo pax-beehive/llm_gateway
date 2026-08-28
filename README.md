@@ -69,6 +69,7 @@ Production requires PostgreSQL and refuses to start without an explicit synchron
 DATABASE_URL=postgres://...
 GATEWAY_ENV=production
 GATEWAY_DURABILITY_ATTESTATION=sync-multi-az
+GATEWAY_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted
 GATEWAY_ACCESS_PROJECTION=true
 GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2
 GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}
@@ -85,6 +86,7 @@ separate runtime database role plus Human IAM JWKS verification:
 ```text
 CONTROL_PLANE_DATABASE_URL=postgres://tenant_admin_runtime@...
 CONTROL_PLANE_DB_ROLE=tenant_admin_runtime
+CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted
 CONTROL_IAM_JWKS_URL=https://iam.example/.well-known/jwks.json
 CONTROL_IAM_ISSUER=https://iam.example
 CONTROL_IAM_AUDIENCE=llm-gateway-control-plane
@@ -107,6 +109,23 @@ an inbox and aggregate revisions, reports gaps and lag in structured logs, and
 supports atomic snapshot repair. External relay delivery, receipts, alerts, and
 readiness gates are implemented by ADR 0008 before physical database separation.
 
+Repair a specific Tenant after a detected revision gap with a bounded operator
+job that has read access to the authoritative control database and write access
+to the target regional projection database:
+
+```sh
+ACCESS_PROJECTION_REPAIR_TENANT_ID=tenant-id \
+CONTROL_PLANE_DATABASE_URL=postgres://control-reader@... \
+GATEWAY_DATABASE_URL=postgres://projection-writer@... \
+CONTROL_API_KEY_CURRENT_DIGEST_VERSION=2 \
+CONTROL_API_KEY_PEPPERS_JSON='{"1":"old...","2":"current..."}' \
+make repair-access-projection
+```
+
+The command never prints digests or raw keys, rejects stale or incomplete
+snapshots, preserves active concurrency leases, and applies the replacement in
+one regional transaction.
+
 In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative, while inference authentication reads only `gateway_access_projection`. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. The single `GATEWAY_API_KEY_PEPPER` variable is the version-1 compatibility form for development. During a bounded rotation, configure `GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}` and `GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2`; at most eight versions may be active. New issuance/import uses the current version, while configured prior versions remain verifiable. Remove an old pepper only after both the authoritative control-plane count and every regional projection count prove no active key still references that digest version.
 
 Environment key maps are only for an explicit, idempotent first development bootstrap. A raw bootstrap key must contain at least 24 characters. The Gateway atomically seeds its Access Projection; then remove the raw-key variables and disable the flag. Existing production Tenants are seeded through a control-plane snapshot before the Gateway role is restricted to projection tables:
@@ -128,6 +147,13 @@ regions, and concurrent billable requests. CIDR evaluation trusts forwarded
 addresses only from canonical `GATEWAY_TRUSTED_PROXY_CIDRS`. Concurrency uses
 renewable PostgreSQL leases under a per-key advisory lock, so the limit is hard
 across Gateway replicas rather than process-local.
+
+Successful authentication is coalesced in memory and flushed asynchronously to
+the regional projection's coarse `last_used_at`; it is operational activity
+metadata, not financial evidence. Projection status logs include aggregate
+revision, pending delivery lag, and revocation-specific apply time/lag. Production
+startup fails when either authoritative state or a regional projection still has
+an active key whose digest pepper version is absent from the configured ring.
 
 Each route declares its public model, provider model, execution/home region, credential scope, versioned Capability Profile, prices, and secret environment-variable reference. Credentials are read server-side and are never returned by the API. The `provider` value must be one of `openai`, `deepseek`, `anthropic`, or `gemini`; route publication fails for any other value.
 

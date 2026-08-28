@@ -259,6 +259,9 @@ func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[
 	if os.Getenv("GATEWAY_ENV") == "production" && os.Getenv("GATEWAY_DURABILITY_ATTESTATION") != "sync-multi-az" {
 		return nil, nil, func() {}, errors.New("production requires GATEWAY_DURABILITY_ATTESTATION=sync-multi-az")
 	}
+	if os.Getenv("GATEWAY_ENV") == "production" && os.Getenv("GATEWAY_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
+		return nil, nil, func() {}, errors.New("production requires GATEWAY_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted")
+	}
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, nil, func() {}, err
@@ -439,6 +442,11 @@ func configureAccessProjection(
 			break
 		}
 	}
+	if os.Getenv("GATEWAY_ENV") == "production" {
+		if err := projection.ValidatePepperCoverage(ctx); err != nil {
+			return nil, fmt.Errorf("gate Gateway Access Projection digest pepper retirement: %w", err)
+		}
+	}
 	return projection, nil
 }
 
@@ -457,6 +465,9 @@ func runAccessProjectionWorker(ctx context.Context, projection *accessprojection
 				break
 			}
 		}
+		if _, err := projection.FlushLastUsed(ctx, 1000); err != nil {
+			slog.Warn("Gateway Access Projection last-used flush degraded", "error", err)
+		}
 		status, err := projection.Status(ctx)
 		if err != nil {
 			slog.Warn("Gateway Access Projection status unavailable", "error", err)
@@ -469,6 +480,7 @@ func runAccessProjectionWorker(ctx context.Context, projection *accessprojection
 			"pending_event_count", status.PendingEventCount,
 			"delivery_lag", status.DeliveryLag,
 			"max_apply_lag", status.MaxApplyLag,
+			"max_revocation_apply_lag", status.MaxRevocationApplyLag,
 		}
 		if status.OldestGapAt != nil {
 			attributes = append(attributes, "oldest_gap_at", *status.OldestGapAt)
@@ -478,6 +490,9 @@ func runAccessProjectionWorker(ctx context.Context, projection *accessprojection
 		}
 		if status.OldestPendingAt != nil {
 			attributes = append(attributes, "oldest_pending_at", *status.OldestPendingAt)
+		}
+		if status.LastRevocationAppliedAt != nil {
+			attributes = append(attributes, "last_revocation_applied_at", *status.LastRevocationAppliedAt)
 		}
 		if status.GapCount > 0 {
 			slog.Warn("Gateway Access Projection requires snapshot repair", attributes...)

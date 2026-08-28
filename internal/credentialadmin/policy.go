@@ -84,8 +84,8 @@ func (service *Service) PublishPolicy(
 	if err := json.Unmarshal(tenantPolicyPayload, &tenantPolicy); err != nil {
 		return MutationResult{}, err
 	}
-	if policy.MaxConcurrentResponses != nil && tenantPolicy.MaxConcurrentResponses > 0 && *policy.MaxConcurrentResponses > tenantPolicy.MaxConcurrentResponses {
-		return MutationResult{}, fmt.Errorf("%w: key concurrency cannot exceed Tenant concurrency", ErrPolicyDenied)
+	if err := validatePolicyAgainstTenant(policy, tenantPolicy); err != nil {
+		return MutationResult{}, err
 	}
 	payload, err := policyJSON(policy)
 	if err != nil {
@@ -247,6 +247,14 @@ func effectiveConcurrency(tenant int, key *int) int {
 		return *key
 	}
 	return tenant
+}
+
+func validatePolicyAgainstTenant(policy core.APIKeyPolicy, tenantPolicy core.TenantPolicy) error {
+	if policy.MaxConcurrentResponses != nil && tenantPolicy.MaxConcurrentResponses > 0 &&
+		*policy.MaxConcurrentResponses > tenantPolicy.MaxConcurrentResponses {
+		return fmt.Errorf("%w: key concurrency cannot exceed Tenant concurrency", ErrPolicyDenied)
+	}
+	return nil
 }
 
 func validateAPIKeyPolicy(policy core.APIKeyPolicy) error {

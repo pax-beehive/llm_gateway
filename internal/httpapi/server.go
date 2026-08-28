@@ -48,8 +48,35 @@ func (a StaticAuthenticator) Authenticate(_ context.Context, token string) (acce
 }
 
 type principalContextKey struct{}
+type apiKeyConcurrencyLeaseContextKey struct{}
 
 var errAPIKeyConcurrencyDenied = errors.New("Gateway API Key concurrent Response policy denies this operation")
+
+type apiKeyConcurrencyLease struct {
+	mu       sync.Mutex
+	detached bool
+	once     sync.Once
+	release  func()
+}
+
+func (lease *apiKeyConcurrencyLease) detach() {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	lease.detached = true
+}
+
+func (lease *apiKeyConcurrencyLease) releaseAtRequestEnd() {
+	lease.mu.Lock()
+	detached := lease.detached
+	lease.mu.Unlock()
+	if !detached {
+		lease.finish()
+	}
+}
+
+func (lease *apiKeyConcurrencyLease) finish() {
+	lease.once.Do(lease.release)
+}
 
 type Config struct {
 	Runtime               *runtime.Runtime
@@ -571,7 +598,7 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 			return
 		}
 	}
-	request, release, err := s.acquireAPIKeyConcurrency(request, principal, operation)
+	request, lease, err := s.acquireAPIKeyConcurrency(request, principal, operation)
 	if err != nil {
 		switch {
 		case errors.Is(err, errAPIKeyConcurrencyDenied):
@@ -583,7 +610,8 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 		}
 		return
 	}
-	defer release()
+	defer lease.releaseAtRequestEnd()
+	request = request.WithContext(context.WithValue(request.Context(), apiKeyConcurrencyLeaseContextKey{}, lease))
 	s.mux.ServeHTTP(responseWriter, request)
 }
 
@@ -699,11 +727,11 @@ func addressInPrefixes(address netip.Addr, prefixes []netip.Prefix) bool {
 	return false
 }
 
-func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal access.Principal, operation string) (*http.Request, func(), error) {
+func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal access.Principal, operation string) (*http.Request, *apiKeyConcurrencyLease, error) {
 	limit := principal.APIKeyPolicy.MaxConcurrentResponses
 	if limit == nil || request.Method != http.MethodPost ||
 		(operation != "responses" && operation != "chat_completions" && operation != "embeddings" && operation != "moderation" && operation != "rerank") {
-		return request, func() {}, nil
+		return request, &apiKeyConcurrencyLease{release: func() {}}, nil
 	}
 	if principal.APIKeyID == "" || *limit <= 0 {
 		return nil, nil, errAPIKeyConcurrencyDenied
@@ -738,12 +766,12 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 				}
 			}
 		}()
-		return request.WithContext(leaseContext), func() {
+		return request.WithContext(leaseContext), &apiKeyConcurrencyLease{release: func() {
 			cancelLease()
 			releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = quotas.ReleaseAPIKeyResponseSlot(releaseContext, principal.APIKeyID, leaseID)
-		}, nil
+		}}, nil
 	}
 	s.inflightMu.Lock()
 	defer s.inflightMu.Unlock()
@@ -751,7 +779,7 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 		return nil, nil, store.ErrQuotaExceeded
 	}
 	s.apiKeyInflight[principal.APIKeyID]++
-	return request, func() {
+	return request, &apiKeyConcurrencyLease{release: func() {
 		s.inflightMu.Lock()
 		defer s.inflightMu.Unlock()
 		if s.apiKeyInflight[principal.APIKeyID] <= 1 {
@@ -759,7 +787,7 @@ func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal acces
 			return
 		}
 		s.apiKeyInflight[principal.APIKeyID]--
-	}, nil
+	}}, nil
 }
 
 func bearerToken(value string) (string, error) {
@@ -967,11 +995,18 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 }
 
 func (s *Server) startBackgroundResponse(responseWriter http.ResponseWriter, request *http.Request, canonical core.Request) {
+	lease, _ := request.Context().Value(apiKeyConcurrencyLeaseContextKey{}).(*apiKeyConcurrencyLease)
+	if lease != nil {
+		lease.detach()
+	}
 	created := make(chan core.Response, 1)
 	finished := make(chan struct{})
 	backgroundContext := context.WithoutCancel(request.Context())
 	go func() {
 		defer close(finished)
+		if lease != nil {
+			defer lease.finish()
+		}
 		_, _ = s.runtime.ExecuteStreaming(backgroundContext, canonical, func(event core.Event) error {
 			if event.Type == "response.created" && event.Response != nil {
 				select {

@@ -14,7 +14,12 @@ retirement counts. Gateways consume schema-version-2 events into a local
 PostgreSQL projection with inbox deduplication, monotonic aggregate revisions,
 gap detection, atomic snapshot replacement, structured lag/gap status, and
 cross-replica API-key concurrency leases. Production authentication is gated on
-the projection and does not read authoritative access tables.
+the projection and does not read authoritative access tables. A bounded repair
+command copies a repeatable-read authoritative Tenant snapshot into one regional
+projection without exposing key material or deleting active concurrency leases.
+Successful authentication is coalesced into an asynchronous regional
+`last_used_at` projection. Production startup gates missing active digest pepper
+versions and requires an authenticated-encrypted database transport attestation.
 
 The current transport adapter reads the shared immutable outbox. ADR 0008 owns
 the external relay, delivery receipts, alerts, and readiness gates required

@@ -19,7 +19,6 @@ import (
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
-	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -39,6 +38,9 @@ func NewService(database *sql.DB, ring PepperRing, now func() time.Time, random 
 	}
 	if ring.CurrentVersion <= 0 {
 		return nil, errors.New("current digest version must be positive")
+	}
+	if len(ring.Peppers) == 0 || len(ring.Peppers) > 8 {
+		return nil, errors.New("Gateway Credential Administration requires one to eight digest peppers")
 	}
 	peppers := make(map[int16][]byte, len(ring.Peppers))
 	for version, pepper := range ring.Peppers {
@@ -87,13 +89,22 @@ func (service *Service) Issue(
 	}
 	defer func() { _ = transaction.Rollback() }()
 	var tenantStatus access.TenantStatus
-	if err := transaction.QueryRowContext(ctx, `SELECT status FROM tenants WHERE id = $1 FOR SHARE`, command.TenantID).Scan(&tenantStatus); errors.Is(err, sql.ErrNoRows) {
+	var tenantPolicyPayload []byte
+	if err := transaction.QueryRowContext(ctx, `SELECT status, policy FROM tenants WHERE id = $1 FOR SHARE`, command.TenantID).Scan(
+		&tenantStatus, &tenantPolicyPayload); errors.Is(err, sql.ErrNoRows) {
 		return IssueResult{}, ErrNotFound
 	} else if err != nil {
 		return IssueResult{}, err
 	}
 	if tenantStatus != access.TenantActive {
 		return IssueResult{}, ErrPolicyDenied
+	}
+	var tenantPolicy core.TenantPolicy
+	if err := json.Unmarshal(tenantPolicyPayload, &tenantPolicy); err != nil {
+		return IssueResult{}, err
+	}
+	if err := validatePolicyAgainstTenant(command.Policy, tenantPolicy); err != nil {
+		return IssueResult{}, err
 	}
 	identifierBytes := make([]byte, 16)
 	secretBytes := make([]byte, 32)
@@ -257,8 +268,8 @@ func validateIssue(idempotencyKey string, command IssueCommand, now time.Time) e
 	if command.ExpiresAt != nil && !command.ExpiresAt.After(now) {
 		return fmt.Errorf("%w: expiry must be in the future", ErrInvalidArgument)
 	}
-	if _, err := quota.EffectiveLimits(core.QuotaLimits{}, command.Policy.Limits); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	if err := validateAPIKeyPolicy(command.Policy); err != nil {
+		return err
 	}
 	_, err := metadataJSON(command.Metadata)
 	return err
@@ -282,7 +293,8 @@ func metadataJSON(metadata map[string]any) ([]byte, error) {
 	}
 	for key := range metadata {
 		switch strings.ToLower(key) {
-		case "status", "policy", "permissions", "limits", "digest", "secret", "tenant_id", "expires_at":
+		case "status", "lifecycle", "policy", "permissions", "limits", "digest", "secret", "tenant_id",
+			"expires_at", "home_region", "execution_epoch":
 			return nil, fmt.Errorf("%w: %q is typed behavior and cannot be metadata", ErrInvalidArgument, key)
 		}
 	}

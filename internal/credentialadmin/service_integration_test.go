@@ -46,7 +46,7 @@ func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *te
 	}
 	if _, err := tenantService.CreateTenant(ctx, actor, "create-"+tenantID, tenantadmin.CreateTenantCommand{
 		ID: tenantID, Slug: tenantID, DisplayName: "Credential Tenant", HomeRegion: "us-test",
-		InitialPolicy: core.TenantPolicy{Revision: 1},
+		InitialPolicy: core.TenantPolicy{Revision: 1, MaxConcurrentResponses: 1},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +58,23 @@ func TestIssueGatewayAPIKeyReturnsSecretOnceAndPersistsOnlyVersionedDigest(t *te
 	}, time.Now, bytes.NewReader(secretMaterial))
 	if err != nil {
 		t.Fatal(err)
+	}
+	badCIDRs := []string{"not-a-cidr"}
+	if _, err := service.Issue(ctx, actor, "issue-invalid-cidr-"+tenantID, credentialadmin.IssueCommand{
+		TenantID: tenantID, Name: "invalid CIDR", Policy: core.APIKeyPolicy{AllowedCIDRs: &badCIDRs},
+	}); !errors.Is(err, credentialadmin.ErrInvalidArgument) {
+		t.Fatalf("invalid issuance CIDR error = %v", err)
+	}
+	if _, err := service.Issue(ctx, actor, "issue-typed-metadata-"+tenantID, credentialadmin.IssueCommand{
+		TenantID: tenantID, Name: "typed metadata", Metadata: map[string]any{"home_region": "elsewhere"},
+	}); !errors.Is(err, credentialadmin.ErrInvalidArgument) {
+		t.Fatalf("typed metadata issuance error = %v", err)
+	}
+	tooHigh := 2
+	if _, err := service.Issue(ctx, actor, "issue-expanded-concurrency-"+tenantID, credentialadmin.IssueCommand{
+		TenantID: tenantID, Name: "expanded concurrency", Policy: core.APIKeyPolicy{MaxConcurrentResponses: &tooHigh},
+	}); !errors.Is(err, credentialadmin.ErrPolicyDenied) {
+		t.Fatalf("expanded issuance concurrency error = %v", err)
 	}
 	command := credentialadmin.IssueCommand{
 		TenantID: tenantID, Name: "production workload", Metadata: map[string]any{"environment": "test"},

@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS gateway_access_projection (
     api_key_policy         jsonb NOT NULL,
     expires_at             timestamptz,
     revoked_at             timestamptz,
+    last_used_at           timestamptz,
     tenant_status          text NOT NULL CHECK (tenant_status IN ('active', 'suspended', 'closed')),
     tenant_revision        bigint NOT NULL CHECK (tenant_revision > 0),
     home_region            text NOT NULL,
@@ -26,15 +27,26 @@ CREATE INDEX IF NOT EXISTS gateway_access_projection_digest_idx
     ON gateway_access_projection (digest_version, secret_digest)
     WHERE key_status = 'active' AND tenant_status = 'active';
 
+ALTER TABLE gateway_access_projection
+    ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS gateway_access_inbox (
     event_id           text PRIMARY KEY,
     schema_version     integer NOT NULL CHECK (schema_version > 0),
     aggregate_type     text NOT NULL,
     aggregate_id       text NOT NULL,
     aggregate_revision bigint NOT NULL CHECK (aggregate_revision > 0),
+    event_type         text,
+    event_occurred_at  timestamptz,
+    apply_lag_seconds  double precision,
     disposition        text NOT NULL CHECK (disposition IN ('applied', 'stale')),
     received_at        timestamptz NOT NULL
 );
+
+ALTER TABLE gateway_access_inbox
+    ADD COLUMN IF NOT EXISTS event_type text,
+    ADD COLUMN IF NOT EXISTS event_occurred_at timestamptz,
+    ADD COLUMN IF NOT EXISTS apply_lag_seconds double precision;
 
 CREATE TABLE IF NOT EXISTS gateway_access_heads (
     aggregate_type text NOT NULL,

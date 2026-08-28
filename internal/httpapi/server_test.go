@@ -147,6 +147,44 @@ func TestGatewayAPIKeyPolicyEnforcesConcurrentResponseLimit(t *testing.T) {
 	}
 }
 
+func TestGatewayAPIKeyConcurrencyLeaseCoversBackgroundExecution(t *testing.T) {
+	limit := 1
+	started := make(chan struct{})
+	release := make(chan struct{})
+	completed := make(chan struct{}, 1)
+	executor := blockingExecutor{
+		started: started, release: release, completed: completed, delegate: provider.NewEchoExecutor(),
+	}
+	route := provider.Route{
+		ID: "background-concurrency-route", Provider: "test", Model: "gateway-model", Region: "local", HomeRegion: "local",
+		CredentialScope: "test", Healthy: true, Executor: executor,
+		Profile:       provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{"text": provider.CapabilityNative}},
+		PriceSnapshot: core.PriceSnapshot{ID: "price", Provider: "test", Model: "gateway-model", Region: "local", Currency: "USD", EffectiveAt: 1, Source: "test"},
+	}
+	principal := access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a", HomeRegion: "local", ExecutionEpoch: 1,
+		TenantPolicy: core.TenantPolicy{Revision: 1},
+		APIKeyPolicy: core.APIKeyPolicy{Revision: 1, MaxConcurrentResponses: &limit},
+	}
+	handler := httpapi.New(httpapi.Config{
+		Runtime:       runtime.New(store.NewMemoryResponseStore(), provider.NewRouter(route)),
+		Authenticator: principalAuthenticatorStub{Principal: principal}, LocalRegion: "local",
+	})
+	first := performJSON(t, handler, "key", http.MethodPost, "/v1/responses", map[string]any{
+		"model": "gateway-model", "input": "first", "background": true,
+	})
+	if first.Code != http.StatusOK {
+		t.Fatalf("background status/body = %d / %s", first.Code, first.Body.String())
+	}
+	<-started
+	second := performJSON(t, handler, "key", http.MethodPost, "/v1/responses", map[string]any{"model": "gateway-model", "input": "second"})
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status/body = %d / %s", second.Code, second.Body.String())
+	}
+	close(release)
+	<-completed
+}
+
 type principalAuthenticatorStub struct {
 	Principal access.Principal
 	Err       error
@@ -772,16 +810,21 @@ func (e captureExecutor) Execute(ctx context.Context, request core.Request) (pro
 type fixedExecutor struct{ events []core.Event }
 
 type blockingExecutor struct {
-	started  chan<- struct{}
-	release  <-chan struct{}
-	delegate provider.ResponseExecutor
+	started   chan<- struct{}
+	release   <-chan struct{}
+	completed chan<- struct{}
+	delegate  provider.ResponseExecutor
 }
 
 func (executor blockingExecutor) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {
 	executor.started <- struct{}{}
 	select {
 	case <-executor.release:
-		return executor.delegate.Execute(ctx, request)
+		stream, err := executor.delegate.Execute(ctx, request)
+		if executor.completed != nil {
+			executor.completed <- struct{}{}
+		}
+		return stream, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
