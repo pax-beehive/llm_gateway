@@ -97,13 +97,14 @@ func (store *GCP) Put(ctx context.Context, key string, material []byte) (Referen
 	}
 	if status == http.StatusConflict {
 		reference, current, accessErr := store.access(ctx, Reference{Name: secretName + "/versions/latest", Version: "latest"})
-		if accessErr == nil {
-			defer clear(current)
-			if bytes.Equal(current, material) {
-				return reference, nil
-			}
-			return Reference{}, ErrConflict
+		if accessErr != nil {
+			return Reference{}, fmt.Errorf("verify existing immutable Secret Custody version: %w", accessErr)
 		}
+		defer clear(current)
+		if bytes.Equal(current, material) {
+			return reference, nil
+		}
+		return Reference{}, ErrConflict
 	}
 	var response struct {
 		Name string `json:"name"`

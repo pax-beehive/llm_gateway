@@ -105,6 +105,33 @@ func TestGCPSecretManagerIdempotentPutReturnsExactVersion(t *testing.T) {
 	}
 }
 
+func TestGCPSecretManagerConflictFailsClosedWhenExistingVersionCannotBeRead(t *testing.T) {
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return response(request, http.StatusConflict, `{}`), nil
+		}
+		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/versions/latest:access") {
+			t.Fatalf("unexpected request = %s %s", request.Method, request.URL.String())
+		}
+		return response(request, http.StatusServiceUnavailable, `{"error":{"message":"transient"}}`), nil
+	})}
+	store, err := secretcustody.NewGCP(secretcustody.GCPConfig{
+		ProjectID: "project-a", Endpoint: "https://secretmanager.test/v1", HTTPClient: client,
+		TokenProvider: staticTokenProvider{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(context.Background(), "stable-key", []byte("provider-secret")); err == nil {
+		t.Fatal("Put succeeded after an ambiguous existing-version read")
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d; an addVersion request must not follow ambiguous access", calls)
+	}
+}
+
 type staticTokenProvider struct{}
 
 func (staticTokenProvider) Token(context.Context) (secretcustody.Token, error) {
