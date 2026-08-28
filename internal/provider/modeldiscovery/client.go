@@ -2,6 +2,9 @@ package modeldiscovery
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +28,24 @@ const (
 type Model struct {
 	ID      string
 	OwnedBy string
+}
+
+type Observation struct {
+	Models          []Model
+	RawResponseHash string
+}
+
+type RequestError struct {
+	Provider   Provider
+	StatusCode int
+	Code       string
+}
+
+func (err *RequestError) Error() string {
+	if err.StatusCode > 0 {
+		return fmt.Sprintf("%s model discovery status %d (%s)", err.Provider, err.StatusCode, err.Code)
+	}
+	return fmt.Sprintf("%s model discovery failed (%s)", err.Provider, err.Code)
 }
 
 type Config struct {
@@ -67,26 +88,38 @@ func New(config Config) (*Client, error) {
 }
 
 func (client *Client) List(ctx context.Context) ([]Model, error) {
-	switch client.provider {
-	case OpenAI, DeepSeek:
-		return client.listOpenAICompatible(ctx)
-	case Anthropic:
-		return client.listAnthropic(ctx)
-	case Gemini:
-		return client.listGemini(ctx)
-	default:
-		return nil, fmt.Errorf("unsupported model discovery provider %q", client.provider)
-	}
+	observation, err := client.ListObserved(ctx)
+	return observation.Models, err
 }
 
-func (client *Client) listOpenAICompatible(ctx context.Context) ([]Model, error) {
+func (client *Client) ListObserved(ctx context.Context) (Observation, error) {
+	hasher := sha256.New()
+	var models []Model
+	var err error
+	switch client.provider {
+	case OpenAI, DeepSeek:
+		models, err = client.listOpenAICompatible(ctx, hasher)
+	case Anthropic:
+		models, err = client.listAnthropic(ctx, hasher)
+	case Gemini:
+		models, err = client.listGemini(ctx, hasher)
+	default:
+		err = fmt.Errorf("unsupported model discovery provider %q", client.provider)
+	}
+	if err != nil {
+		return Observation{}, err
+	}
+	return Observation{Models: models, RawResponseHash: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+func (client *Client) listOpenAICompatible(ctx context.Context, observer io.Writer) ([]Model, error) {
 	var response struct {
 		Data []struct {
 			ID      string `json:"id"`
 			OwnedBy string `json:"owned_by"`
 		} `json:"data"`
 	}
-	if err := client.get(ctx, "/models", nil, &response); err != nil {
+	if err := client.get(ctx, "/models", nil, &response, observer); err != nil {
 		return nil, err
 	}
 	models := make([]Model, 0, len(response.Data))
@@ -96,7 +129,7 @@ func (client *Client) listOpenAICompatible(ctx context.Context) ([]Model, error)
 	return uniqueModels(models), nil
 }
 
-func (client *Client) listAnthropic(ctx context.Context) ([]Model, error) {
+func (client *Client) listAnthropic(ctx context.Context, observer io.Writer) ([]Model, error) {
 	models := make([]Model, 0)
 	afterID := ""
 	for page := 0; page < 100; page++ {
@@ -111,7 +144,7 @@ func (client *Client) listAnthropic(ctx context.Context) ([]Model, error) {
 			HasMore bool   `json:"has_more"`
 			LastID  string `json:"last_id"`
 		}
-		if err := client.get(ctx, "/models", query, &response); err != nil {
+		if err := client.get(ctx, "/models", query, &response, observer); err != nil {
 			return nil, err
 		}
 		for _, item := range response.Data {
@@ -128,7 +161,7 @@ func (client *Client) listAnthropic(ctx context.Context) ([]Model, error) {
 	return nil, errors.New("Anthropic model discovery exceeded 100 pages")
 }
 
-func (client *Client) listGemini(ctx context.Context) ([]Model, error) {
+func (client *Client) listGemini(ctx context.Context, observer io.Writer) ([]Model, error) {
 	models := make([]Model, 0)
 	pageToken := ""
 	for page := 0; page < 100; page++ {
@@ -143,7 +176,7 @@ func (client *Client) listGemini(ctx context.Context) ([]Model, error) {
 			} `json:"models"`
 			NextPageToken string `json:"nextPageToken"`
 		}
-		if err := client.get(ctx, "/models", query, &response); err != nil {
+		if err := client.get(ctx, "/models", query, &response, observer); err != nil {
 			return nil, err
 		}
 		for _, item := range response.Models {
@@ -162,7 +195,7 @@ func (client *Client) listGemini(ctx context.Context) ([]Model, error) {
 	return nil, errors.New("Gemini model discovery exceeded 100 pages")
 }
 
-func (client *Client) get(ctx context.Context, path string, query url.Values, destination any) error {
+func (client *Client) get(ctx context.Context, path string, query url.Values, destination any, observer io.Writer) error {
 	endpoint := *client.baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
 	endpoint.RawQuery = query.Encode()
@@ -183,16 +216,32 @@ func (client *Client) get(ctx context.Context, path string, query url.Values, de
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("%s model discovery request: %w", client.provider, err)
+		return &RequestError{Provider: client.provider, Code: "network_error"}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
-		return fmt.Errorf("%s model discovery status %d: %s", client.provider, response.StatusCode, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		code := "unexpected_status"
+		switch {
+		case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
+			code = "authentication_failed"
+		case response.StatusCode == http.StatusTooManyRequests:
+			code = "rate_limited"
+		case response.StatusCode >= 500:
+			code = "upstream_unavailable"
+		}
+		return &RequestError{Provider: client.provider, StatusCode: response.StatusCode, Code: code}
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<20))
-	if err := decoder.Decode(destination); err != nil {
-		return fmt.Errorf("decode %s model discovery response: %w", client.provider, err)
+	body, err := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
+	if err != nil || len(body) > 4<<20 {
+		return &RequestError{Provider: client.provider, Code: "response_too_large"}
+	}
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(body)))
+	_, _ = observer.Write(length[:])
+	_, _ = observer.Write(body)
+	if err := json.Unmarshal(body, destination); err != nil {
+		return &RequestError{Provider: client.provider, Code: "invalid_response"}
 	}
 	return nil
 }

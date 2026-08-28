@@ -13,6 +13,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -170,6 +171,60 @@ func TestListGatewayAPIKeysReturnsMetadataWithoutSecrets(t *testing.T) {
 	}
 }
 
+func TestProviderConnectionSensitiveMutationsNeverEchoSecrets(t *testing.T) {
+	providers := &fakeProviderConnectionAdministration{}
+	providers.register = func(_ context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.RegisterCommand) (providerconnection.MutationResult, error) {
+		if actor.ID != "user-1" || actor.Reason != "configure provider" || key != "register-provider" || string(command.Secret) != "provider-secret" {
+			t.Fatalf("actor/key/command = %#v / %q / %#v", actor, key, command)
+		}
+		return providerconnection.MutationResult{Connection: providerconnection.ProviderConnection{
+			ID: command.ID, Provider: command.Provider, DisplayName: command.DisplayName, BaseURL: command.BaseURL,
+			Region: command.Region, CredentialScope: command.CredentialScope,
+			AdministrativeStatus: providerconnection.StatusDisabled, CapabilityDeclaration: command.CapabilityDeclaration,
+			CredentialVersion: 1, Revision: 1,
+		}}, nil
+	}
+	providers.rotation = func(_ context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.RotationCommand) (providerconnection.OperationResult, error) {
+		if actor.Reason != "rotate provider" || key != "rotate-provider" || command.ExpectedRevision != 1 || string(command.Secret) != "rotated-secret" {
+			t.Fatalf("rotation actor/key/command = %#v / %q / %#v", actor, key, command)
+		}
+		return providerconnection.OperationResult{Operation: providerconnection.Operation{
+			ID: "pop_rotation", Type: providerconnection.OperationCredentialRotation,
+			ConnectionID: command.ConnectionID, ExpectedRevision: command.ExpectedRevision,
+			Status: providerconnection.OperationQueued,
+		}}, nil
+	}
+	handler := controlapi.New(controlapi.Config{
+		Administration: &fakeAdministration{}, ProviderConnections: providers,
+		Verifier: fixedVerifier(controlapi.VerifiedIdentity{ActorType: "human", ActorID: "user-1", Scopes: []string{tenantadmin.ScopePlatformWrite}}),
+	})
+	register := httptest.NewRequest(http.MethodPost, "/control/v1/provider-connections", jsonBody(t, map[string]any{
+		"id": "pc-openai", "provider": "openai", "display_name": "OpenAI", "base_url": "https://api.openai.test/v1",
+		"region": "us-west1", "credential_scope": "organization-a", "secret": "provider-secret",
+		"capability_declaration": map[string]any{"revision": 1, "features": map[string]string{"text": "native"}},
+		"reason":                 "configure provider",
+	}))
+	register.Header.Set("Authorization", "Bearer valid")
+	register.Header.Set("Idempotency-Key", "register-provider")
+	registerResponse := httptest.NewRecorder()
+	handler.ServeHTTP(registerResponse, register)
+	if registerResponse.Code != http.StatusCreated || bytes.Contains(registerResponse.Body.Bytes(), []byte("provider-secret")) ||
+		bytes.Contains(registerResponse.Body.Bytes(), []byte("secret_ref")) {
+		t.Fatalf("register status/body = %d/%s", registerResponse.Code, registerResponse.Body.String())
+	}
+	rotation := httptest.NewRequest(http.MethodPost, "/control/v1/provider-connections/pc-openai/credential-rotations", jsonBody(t, map[string]any{
+		"expected_revision": 1, "secret": "rotated-secret", "reason": "rotate provider",
+	}))
+	rotation.Header.Set("Authorization", "Bearer valid")
+	rotation.Header.Set("Idempotency-Key", "rotate-provider")
+	rotationResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rotationResponse, rotation)
+	if rotationResponse.Code != http.StatusAccepted || rotationResponse.Header().Get("Location") != "/control/v1/provider-operations/pop_rotation" ||
+		bytes.Contains(rotationResponse.Body.Bytes(), []byte("rotated-secret")) {
+		t.Fatalf("rotation status/headers/body = %d/%#v/%s", rotationResponse.Code, rotationResponse.Header(), rotationResponse.Body.String())
+	}
+}
+
 type fakeAdministration struct {
 	create func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.CreateTenantCommand) (tenantadmin.MutationResult, error)
 	update func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.UpdateTenantCommand) (tenantadmin.MutationResult, error)
@@ -179,6 +234,42 @@ type credentialAdministrationFunc func(context.Context, tenantadmin.ActorEnvelop
 
 type fakeCredentialAdministration struct {
 	list func(context.Context, tenantadmin.ActorEnvelope, credentialadmin.CredentialFilter) (credentialadmin.CredentialPage, error)
+}
+
+type fakeProviderConnectionAdministration struct {
+	register func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RegisterCommand) (providerconnection.MutationResult, error)
+	rotation func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RotationCommand) (providerconnection.OperationResult, error)
+}
+
+func (fake *fakeProviderConnectionAdministration) Register(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.RegisterCommand) (providerconnection.MutationResult, error) {
+	return fake.register(ctx, actor, key, command)
+}
+func (*fakeProviderConnectionAdministration) Get(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error) {
+	panic("unexpected Get")
+}
+func (*fakeProviderConnectionAdministration) List(context.Context, tenantadmin.ActorEnvelope, providerconnection.ConnectionFilter) (providerconnection.ConnectionPage, error) {
+	panic("unexpected List")
+}
+func (*fakeProviderConnectionAdministration) Update(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.UpdateCommand) (providerconnection.MutationResult, error) {
+	panic("unexpected Update")
+}
+func (*fakeProviderConnectionAdministration) Enable(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.StatusCommand) (providerconnection.MutationResult, error) {
+	panic("unexpected Enable")
+}
+func (*fakeProviderConnectionAdministration) Disable(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.StatusCommand) (providerconnection.MutationResult, error) {
+	panic("unexpected Disable")
+}
+func (*fakeProviderConnectionAdministration) RequestProbe(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error) {
+	panic("unexpected RequestProbe")
+}
+func (*fakeProviderConnectionAdministration) RequestDiscovery(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error) {
+	panic("unexpected RequestDiscovery")
+}
+func (fake *fakeProviderConnectionAdministration) RequestRotation(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.RotationCommand) (providerconnection.OperationResult, error) {
+	return fake.rotation(ctx, actor, key, command)
+}
+func (*fakeProviderConnectionAdministration) GetOperation(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.Operation, error) {
+	panic("unexpected GetOperation")
 }
 
 func (f *fakeCredentialAdministration) Issue(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error) {

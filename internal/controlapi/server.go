@@ -17,6 +17,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -49,9 +50,23 @@ type Administration interface {
 }
 
 type Config struct {
-	Administration Administration
-	Credentials    CredentialAdministration
-	Verifier       IdentityVerifier
+	Administration      Administration
+	Credentials         CredentialAdministration
+	ProviderConnections ProviderConnectionAdministration
+	Verifier            IdentityVerifier
+}
+
+type ProviderConnectionAdministration interface {
+	Register(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RegisterCommand) (providerconnection.MutationResult, error)
+	Get(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error)
+	List(context.Context, tenantadmin.ActorEnvelope, providerconnection.ConnectionFilter) (providerconnection.ConnectionPage, error)
+	Update(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.UpdateCommand) (providerconnection.MutationResult, error)
+	Enable(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.StatusCommand) (providerconnection.MutationResult, error)
+	Disable(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.StatusCommand) (providerconnection.MutationResult, error)
+	RequestProbe(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error)
+	RequestDiscovery(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error)
+	RequestRotation(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RotationCommand) (providerconnection.OperationResult, error)
+	GetOperation(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.Operation, error)
 }
 
 type CredentialAdministration interface {
@@ -68,13 +83,15 @@ type CredentialAdministration interface {
 }
 
 type Server struct {
-	administration Administration
-	credentials    CredentialAdministration
-	verifier       IdentityVerifier
+	administration      Administration
+	credentials         CredentialAdministration
+	providerConnections ProviderConnectionAdministration
+	verifier            IdentityVerifier
 }
 
 func New(config Config) http.Handler {
-	return &Server{administration: config.Administration, credentials: config.Credentials, verifier: config.Verifier}
+	return &Server{administration: config.Administration, credentials: config.Credentials,
+		providerConnections: config.ProviderConnections, verifier: config.Verifier}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -100,6 +117,9 @@ func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 }
 
 func (server *Server) route(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) {
+	if server.routeProviderConnections(writer, request, actor) {
+		return
+	}
 	const collection = "/control/v1/tenants"
 	if request.URL.Path == collection || request.URL.Path == collection+"/" {
 		switch request.Method {

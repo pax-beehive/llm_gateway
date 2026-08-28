@@ -22,6 +22,8 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
+	"github.com/toddzheng/llm-gateway/internal/providerconnection"
+	"github.com/toddzheng/llm-gateway/internal/secretcustody"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
@@ -90,6 +92,9 @@ func run() error {
 		if err := credentialadmin.Migrate(ctx, database); err != nil {
 			return err
 		}
+		if err := providerconnection.Migrate(ctx, database); err != nil {
+			return err
+		}
 	}
 	administration, err := tenantadmin.NewService(database, time.Now)
 	if err != nil {
@@ -114,8 +119,24 @@ func run() error {
 			return fmt.Errorf("gate Gateway API Key digest pepper retirement: %w", err)
 		}
 	}
+	secretStore, err := configureSecretCustody(devMode)
+	if err != nil {
+		return err
+	}
+	var providerOperator providerconnection.ProviderOperator = providerconnection.NewModelDiscoveryOperator(nil)
+	if devMode {
+		providerOperator = providerconnection.NewDeterministicOperator()
+	}
+	providerConnections, err := providerconnection.NewService(database, secretStore, providerOperator, time.Now, nil)
+	if err != nil {
+		return fmt.Errorf("configure Provider Connection Registry: %w", err)
+	}
 	go runGatewayAPIKeyGraceReconciler(ctx, credentials)
-	api := controlapi.New(controlapi.Config{Administration: administration, Credentials: credentials, Verifier: verifier})
+	go runProviderOperationWorker(ctx, providerConnections)
+	api := controlapi.New(controlapi.Config{
+		Administration: administration, Credentials: credentials,
+		ProviderConnections: providerConnections, Verifier: verifier,
+	})
 	mux := http.NewServeMux()
 	mux.Handle("/", api)
 	address := envOr("CONTROL_PLANE_ADDR", ":8081")
@@ -139,6 +160,54 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
+	}
+}
+
+func configureSecretCustody(devMode bool) (secretcustody.Store, error) {
+	if devMode {
+		return secretcustody.NewMemory(), nil
+	}
+	if strings.TrimSpace(os.Getenv("CONTROL_SECRET_CUSTODY_BACKEND")) != "gcp-secret-manager" {
+		return nil, errors.New("production requires CONTROL_SECRET_CUSTODY_BACKEND=gcp-secret-manager")
+	}
+	projectID := strings.TrimSpace(os.Getenv("CONTROL_GCP_SECRET_PROJECT"))
+	if projectID == "" {
+		return nil, errors.New("CONTROL_GCP_SECRET_PROJECT is required for GCP Secret Custody")
+	}
+	store, err := secretcustody.NewGCP(secretcustody.GCPConfig{
+		ProjectID: projectID, TokenProvider: secretcustody.NewMetadataTokenProvider(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure GCP Secret Custody: %w", err)
+	}
+	return store, nil
+}
+
+func runProviderOperationWorker(ctx context.Context, service *providerconnection.Service) {
+	run := func() {
+		for count := 0; count < 100; count++ {
+			worked, err := service.RunNext(ctx)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Warn("Provider operation worker degraded", "error", err)
+				}
+				return
+			}
+			if !worked {
+				return
+			}
+		}
+	}
+	run()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
 	}
 }
 

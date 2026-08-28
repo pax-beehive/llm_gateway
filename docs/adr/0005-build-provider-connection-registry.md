@@ -4,6 +4,25 @@ status: proposed
 
 # Build a Provider Connection registry with external secret custody
 
+## Implementation status
+
+Implemented in the control-plane process. PostgreSQL owns Provider Connection,
+credential-version, asynchronous operation, observed-health, and model-observation
+state. Development uses deterministic in-memory Secret Custody and Provider
+operators; production requires GCP Secret Manager through Workload Identity.
+Registration, profile changes, enable/disable, and completed rotation are
+CAS-protected, idempotent, audited, and published through the transactional
+outbox. Probe, discovery, and rotation requests return durable operation
+resources and are processed through recoverable leases.
+
+Management resources, audit, outbox, operation results, and observations never
+contain secret material or Secret Manager references. Discovery persists a hash
+of the bounded raw Provider response and cannot mutate the existing routing
+configuration. An internal resolver can retrieve the active credential for an
+enabled Provider Connection; ADR 0006 remains responsible for publishing a
+Model Route that references the connection. The ADR remains `proposed` until it
+is explicitly accepted.
+
 ## Context
 
 Provider configuration currently lives inside a process-level route JSON document. A route combines Provider identity, Base URL, API key environment-variable name, credential scope, region, capabilities, health flag, model mapping, price, and Cache Protection configuration. This is sufficient for controlled bootstrap but cannot safely support a management Console, credential rotation, multiple credentials, connection testing, upstream model discovery, or audited changes.

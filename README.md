@@ -92,6 +92,8 @@ CONTROL_IAM_ISSUER=https://iam.example
 CONTROL_IAM_AUDIENCE=llm-gateway-control-plane
 CONTROL_API_KEY_CURRENT_DIGEST_VERSION=2
 CONTROL_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}
+CONTROL_SECRET_CUSTODY_BACKEND=gcp-secret-manager
+CONTROL_GCP_SECRET_PROJECT=provider-secret-project
 ```
 
 Run schema migration as a separate owner job, then apply least-privilege grants
@@ -111,6 +113,18 @@ not delivery proof. The initial shared-PostgreSQL consumer applies events throug
 an inbox and aggregate revisions, reports gaps and lag in structured logs, and
 supports atomic snapshot repair. External relay delivery, receipts, alerts, and
 readiness gates are implemented by ADR 0008 before physical database separation.
+
+Provider Connection Administration stores upstream credentials in GCP Secret
+Manager through Workload Identity. PostgreSQL stores only the Secret Manager
+reference and non-sensitive credential-version metadata. Production does not
+permit the in-memory custody adapter. Register/update/enable/disable use CAS and
+idempotency; probe, discovery, and credential rotation return `202 Accepted`
+with `/control/v1/provider-operations/{operation_id}`. Probe and discovery
+require `live_authorized: true`; the worker applies a strict timeout and stores
+only bounded, redacted status. A failed probe updates observed health without
+changing enabled/disabled administrative intent. Discovery records Provider
+inventory observations and their raw-response hash, but never publishes Model
+Routes.
 
 Repair a specific Tenant after a detected revision gap with a bounded operator
 job that has read access to the authoritative control database and write access
@@ -158,7 +172,14 @@ revision, pending delivery lag, and revocation-specific apply time/lag. Producti
 startup fails when either authoritative state or a regional projection still has
 an active key whose digest pepper version is absent from the configured ring.
 
-Each route declares its public model, provider model, execution/home region, credential scope, versioned Capability Profile, prices, and secret environment-variable reference. Credentials are read server-side and are never returned by the API. The `provider` value must be one of `openai`, `deepseek`, `anthropic`, or `gemini`; route publication fails for any other value.
+Each route declares its public model, provider model, execution/home region,
+credential scope, versioned Capability Profile, and prices. Provider Connections
+now own managed upstream credentials; the current pre-ADR-0006 route bootstrap
+still uses `api_key_env` until Routing Catalog publication is migrated to
+connection references. Creating or discovering a Provider Connection never
+makes a model routable. Credentials are read server-side and are never returned
+by the management API. The `provider` value must be one of `openai`, `deepseek`,
+`anthropic`, or `gemini`; route publication fails for any other value.
 
 OpenAI uses its native Responses API so Codex fields, reasoning replay, namespace tools, and client-owned tool loops remain lossless. DeepSeek and Gemini use their OpenAI-compatible Chat Completions surfaces behind the shared adapter. Anthropic uses its native Messages API so Claude-specific streaming, usage, and prompt-cache evidence remain explicit.
 
@@ -278,7 +299,22 @@ complete Tenant and Gateway API Key administration lifecycle:
 make test-tenant-admin-blackbox
 ```
 
-The black-box suite covers model discovery, Responses create/retrieve/input-items/delete, `previous_response_id`, Responses streaming, Chat Completions, Chat streaming, and Conversations. Override `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_MODEL` to target another deployment. It requires the `openai` Python package and defaults to the zero-cost local `echo-v1` route.
+Exercise Provider Connection registration, listing, enable/disable, probe,
+model discovery, credential rotation, operation polling, and secret non-echo:
+
+```sh
+make test-provider-connection-blackbox
+```
+
+The control-plane development process uses deterministic Secret Custody and
+Provider adapters, so this black box performs no Provider network calls and
+incurs no Provider cost.
+
+The OpenAI SDK black-box suite covers public model listing, Responses
+create/retrieve/input-items/delete, `previous_response_id`, Responses streaming,
+Chat Completions, Chat streaming, and Conversations. Override `GATEWAY_BASE_URL`,
+`GATEWAY_API_KEY`, and `GATEWAY_MODEL` to target another deployment. It requires
+the `openai` Python package and defaults to the zero-cost local `echo-v1` route.
 
 Run the deterministic Codex CLI black box separately:
 

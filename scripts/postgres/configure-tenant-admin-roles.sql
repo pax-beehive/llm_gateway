@@ -20,6 +20,11 @@ SELECT EXISTS (
         'control_command_idempotency'::regclass,
         'control_audit_events'::regclass,
         'control_outbox'::regclass,
+		'provider_connections'::regclass,
+		'provider_connection_credential_versions'::regclass,
+		'provider_operations'::regclass,
+		'provider_connection_health'::regclass,
+		'provider_model_observations'::regclass,
         'gateway_access_projection'::regclass,
         'gateway_access_inbox'::regclass,
         'gateway_access_heads'::regclass,
@@ -40,6 +45,11 @@ REVOKE ALL PRIVILEGES ON TABLE
     control_command_idempotency,
     control_audit_events,
     control_outbox,
+	provider_connections,
+	provider_connection_credential_versions,
+	provider_operations,
+	provider_connection_health,
+	provider_model_observations,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
@@ -55,6 +65,11 @@ REVOKE ALL PRIVILEGES ON TABLE
     control_command_idempotency,
     control_audit_events,
     control_outbox,
+	provider_connections,
+	provider_connection_credential_versions,
+	provider_operations,
+	provider_connection_health,
+	provider_model_observations,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
@@ -95,6 +110,15 @@ GRANT SELECT, INSERT ON TABLE control_command_idempotency TO :"tenant_admin_role
 GRANT SELECT, INSERT ON TABLE control_audit_events TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_outbox TO :"tenant_admin_role";
 GRANT UPDATE (publish_attempts, published_at, last_error) ON control_outbox TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE provider_connections TO :"tenant_admin_role";
+GRANT UPDATE (
+	display_name, base_url, region, credential_scope, secret_ref, secret_external_version,
+	credential_version, administrative_status, capability_declaration, revision, updated_at
+) ON provider_connections TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE provider_connection_credential_versions TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE provider_operations TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE provider_connection_health TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE provider_model_observations TO :"tenant_admin_role";
 
 GRANT SELECT ON TABLE control_outbox TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
