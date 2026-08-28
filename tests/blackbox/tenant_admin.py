@@ -78,6 +78,82 @@ def main() -> None:
     require("secret" not in replayed, "idempotent replay revealed the raw Gateway API Key")
     require(replay_headers.get("Idempotency-Replayed") == "true", f"replay headers={replay_headers!r}")
 
+    key_path = f"/control/v1/tenants/{tenant_id}/gateway-api-keys/{issued['id']}"
+    status, headers, observed_key = request("GET", key_path)
+    require(status == 200 and headers.get("Etag") == '"1"', f"key GET headers={headers!r}")
+    require("secret" not in observed_key and observed_key["prefix"] == issued["prefix"], f"key GET={observed_key!r}")
+    status, _, listed = request("GET", f"/control/v1/tenants/{tenant_id}/gateway-api-keys?limit=1")
+    require(status == 200 and len(listed["data"]) == 1, f"key list={listed!r}")
+    require("secret" not in listed["data"][0], "key list revealed a raw Gateway API Key")
+
+    status, headers, updated_key = request(
+        "PATCH",
+        key_path,
+        {
+            "name": "black-box workload renamed",
+            "metadata": {"suite": "tenant-admin-blackbox", "updated": True},
+            "reason": "black-box credential metadata update",
+        },
+        {"Idempotency-Key": "update-key-" + suffix, "If-Match": '"1"'},
+    )
+    require(status == 200 and headers.get("Etag") == '"2"', f"key update headers={headers!r}")
+    require(updated_key["name"].endswith("renamed") and updated_key["revision"] == 2, f"key update={updated_key!r}")
+
+    status, headers, key_policy = request(
+        "PUT",
+        key_path + "/policy",
+        {
+            "policy": {
+                "revision": 2,
+                "allowed_public_models": ["echo"],
+                "allowed_operations": ["responses"],
+                "allowed_cidrs": ["127.0.0.0/8"],
+                "allowed_regions": ["local"],
+                "max_concurrent_responses": 1,
+            },
+            "reason": "black-box key policy publication",
+        },
+        {"Idempotency-Key": "key-policy-" + suffix, "If-Match": '"1"'},
+    )
+    require(status == 200 and headers.get("Etag") == '"2"', f"key policy headers={headers!r}")
+    require(key_policy["allowed_operations"] == ["responses"], f"key policy={key_policy!r}")
+    _, _, key_revisions = request("GET", key_path + "/policy-revisions")
+    require([item["revision"] for item in key_revisions["data"]] == [1, 2], f"key revisions={key_revisions!r}")
+    _, _, effective = request("GET", key_path + "/effective-policy")
+    require(effective["max_concurrent_responses"] == 1, f"effective policy={effective!r}")
+
+    rotate_payload = {
+        "revoke_immediately": True,
+        "reason": "black-box immediate rotation",
+    }
+    status, _, rotated = request(
+        "POST",
+        key_path + "/rotate",
+        rotate_payload,
+        {"Idempotency-Key": "rotate-key-" + suffix, "If-Match": '"3"'},
+    )
+    require(status == 201 and rotated.get("secret", "").startswith("gw_"), f"rotate={rotated!r}")
+    require(rotated["predecessor"]["status"] == "revoked", f"rotate predecessor={rotated!r}")
+    status, replay_headers, rotate_replay = request(
+        "POST",
+        key_path + "/rotate",
+        rotate_payload,
+        {"Idempotency-Key": "rotate-key-" + suffix, "If-Match": '"3"'},
+    )
+    require(status == 201 and "secret" not in rotate_replay, f"rotate replay={rotate_replay!r}")
+    require(replay_headers.get("Idempotency-Replayed") == "true", f"rotate replay headers={replay_headers!r}")
+
+    replacement = rotated["replacement"]
+    replacement_path = f"/control/v1/tenants/{tenant_id}/gateway-api-keys/{replacement['id']}"
+    status, headers, revoked = request(
+        "POST",
+        replacement_path + "/revoke",
+        {"reason": "black-box credential revocation"},
+        {"Idempotency-Key": "revoke-key-" + suffix, "If-Match": '"1"'},
+    )
+    require(status == 200 and headers.get("Etag") == '"2"', f"revoke headers={headers!r}")
+    require(revoked["status"] == "revoked" and revoked["revoked_at"], f"revoke={revoked!r}")
+
     status, headers, policy = request(
         "PUT",
         f"/control/v1/tenants/{tenant_id}/policy",
@@ -105,7 +181,10 @@ def main() -> None:
     require(observed["status"] == "suspended", f"observed={observed!r}")
     _, _, revisions = request("GET", f"/control/v1/tenants/{tenant_id}/policy-revisions")
     require([item["revision"] for item in revisions["data"]] == [1, 2], f"revisions={revisions!r}")
-    print(f"PASS tenant-admin tenant={tenant_id} row_revision=3 policy_revision=2")
+    print(
+        f"PASS tenant-admin tenant={tenant_id} row_revision=3 policy_revision=2 "
+        f"credential_lifecycle=issue,list,get,update,policy,rotate,revoke"
+    )
 
 
 if __name__ == "__main__":

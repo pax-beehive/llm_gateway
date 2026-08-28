@@ -56,6 +56,15 @@ type Config struct {
 
 type CredentialAdministration interface {
 	Issue(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error)
+	Get(context.Context, tenantadmin.ActorEnvelope, string, string) (credentialadmin.Credential, error)
+	List(context.Context, tenantadmin.ActorEnvelope, credentialadmin.CredentialFilter) (credentialadmin.CredentialPage, error)
+	Update(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.UpdateCommand) (credentialadmin.MutationResult, error)
+	Revoke(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.RevokeCommand) (credentialadmin.MutationResult, error)
+	Rotate(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.RotateCommand) (credentialadmin.RotationResult, error)
+	GetPolicy(context.Context, tenantadmin.ActorEnvelope, string, string) (core.APIKeyPolicy, error)
+	PublishPolicy(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.PublishPolicyCommand) (credentialadmin.MutationResult, error)
+	ListPolicyRevisions(context.Context, tenantadmin.ActorEnvelope, string, string, string, int) (credentialadmin.PolicyRevisionPage, error)
+	GetEffectivePolicy(context.Context, tenantadmin.ActorEnvelope, string, string) (credentialadmin.EffectivePolicy, error)
 }
 
 type Server struct {
@@ -129,17 +138,15 @@ func (server *Server) route(writer http.ResponseWriter, request *http.Request, a
 		}
 		return
 	}
+	if parts[1] == "gateway-api-keys" {
+		server.routeGatewayAPIKeys(writer, request, actor, tenantID, parts[2:])
+		return
+	}
 	if len(parts) != 2 {
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
 		return
 	}
 	switch parts[1] {
-	case "gateway-api-keys":
-		if request.Method != http.MethodPost {
-			methodNotAllowed(writer, http.MethodPost)
-			return
-		}
-		server.issueGatewayAPIKey(writer, request, actor, tenantID)
 	case "transitions":
 		if request.Method != http.MethodPost {
 			methodNotAllowed(writer, http.MethodPost)
@@ -161,6 +168,83 @@ func (server *Server) route(writer http.ResponseWriter, request *http.Request, a
 			return
 		}
 		server.listPolicyRevisions(writer, request, actor, tenantID)
+	default:
+		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
+	}
+}
+
+func (server *Server) routeGatewayAPIKeys(
+	writer http.ResponseWriter,
+	request *http.Request,
+	actor tenantadmin.ActorEnvelope,
+	tenantID string,
+	tail []string,
+) {
+	if len(tail) == 0 {
+		switch request.Method {
+		case http.MethodPost:
+			server.issueGatewayAPIKey(writer, request, actor, tenantID)
+		case http.MethodGet:
+			server.listGatewayAPIKeys(writer, request, actor, tenantID)
+		default:
+			methodNotAllowed(writer, http.MethodGet, http.MethodPost)
+		}
+		return
+	}
+	credentialID, err := url.PathUnescape(tail[0])
+	if err != nil || credentialID == "" || strings.Contains(credentialID, "/") {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "invalid Gateway API Key ID")
+		return
+	}
+	if len(tail) == 1 {
+		switch request.Method {
+		case http.MethodGet:
+			server.getGatewayAPIKey(writer, request, actor, tenantID, credentialID)
+		case http.MethodPatch:
+			server.updateGatewayAPIKey(writer, request, actor, tenantID, credentialID)
+		default:
+			methodNotAllowed(writer, http.MethodGet, http.MethodPatch)
+		}
+		return
+	}
+	if len(tail) != 2 {
+		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
+		return
+	}
+	switch tail[1] {
+	case "revoke":
+		if request.Method != http.MethodPost {
+			methodNotAllowed(writer, http.MethodPost)
+			return
+		}
+		server.revokeGatewayAPIKey(writer, request, actor, tenantID, credentialID)
+	case "rotate":
+		if request.Method != http.MethodPost {
+			methodNotAllowed(writer, http.MethodPost)
+			return
+		}
+		server.rotateGatewayAPIKey(writer, request, actor, tenantID, credentialID)
+	case "policy":
+		switch request.Method {
+		case http.MethodGet:
+			server.getGatewayAPIKeyPolicy(writer, request, actor, tenantID, credentialID)
+		case http.MethodPut:
+			server.putGatewayAPIKeyPolicy(writer, request, actor, tenantID, credentialID)
+		default:
+			methodNotAllowed(writer, http.MethodGet, http.MethodPut)
+		}
+	case "policy-revisions":
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer, http.MethodGet)
+			return
+		}
+		server.listGatewayAPIKeyPolicyRevisions(writer, request, actor, tenantID, credentialID)
+	case "effective-policy":
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer, http.MethodGet)
+			return
+		}
+		server.getGatewayAPIKeyEffectivePolicy(writer, request, actor, tenantID, credentialID)
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
 	}
@@ -212,6 +296,198 @@ func credentialResource(credential credentialadmin.Credential) map[string]any {
 		"predecessor_id": credential.PredecessorID, "replacement_id": credential.ReplacementID,
 		"grace_expires_at": credential.GraceExpiresAt,
 	}
+}
+
+func (server *Server) getGatewayAPIKey(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	credential, err := server.credentials.Get(request.Context(), actor, tenantID, credentialID)
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", etag(credential.Revision))
+	writeJSON(writer, http.StatusOK, credentialResource(credential))
+}
+
+func (server *Server) listGatewayAPIKeys(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID string) {
+	limit, err := optionalInt(request.URL.Query().Get("limit"))
+	if err != nil {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be an integer")
+		return
+	}
+	page, err := server.credentials.List(request.Context(), actor, credentialadmin.CredentialFilter{
+		TenantID: tenantID, Status: access.APIKeyStatus(request.URL.Query().Get("status")),
+		Cursor: request.URL.Query().Get("cursor"), Limit: limit,
+	})
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	data := make([]map[string]any, 0, len(page.Data))
+	for _, credential := range page.Data {
+		data = append(data, credentialResource(credential))
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"data": data, "next_cursor": page.NextCursor})
+}
+
+type updateGatewayAPIKeyRequest struct {
+	Name             *string         `json:"name"`
+	Metadata         *map[string]any `json:"metadata"`
+	ExpiresAt        *time.Time      `json:"expires_at"`
+	ClearExpiresAt   bool            `json:"clear_expires_at"`
+	ExpectedRevision int64           `json:"expected_revision"`
+	Reason           string          `json:"reason"`
+}
+
+func (server *Server) updateGatewayAPIKey(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	var input updateGatewayAPIKeyRequest
+	if !decodeBody(writer, request, &input) {
+		return
+	}
+	revision, ok := expectedRevision(writer, request, input.ExpectedRevision)
+	if !ok {
+		return
+	}
+	actor.Reason = input.Reason
+	result, err := server.credentials.Update(request.Context(), actor, request.Header.Get("Idempotency-Key"), credentialadmin.UpdateCommand{
+		TenantID: tenantID, CredentialID: credentialID, ExpectedRevision: revision,
+		Name: input.Name, Metadata: input.Metadata, ExpiresAt: input.ExpiresAt, ClearExpiresAt: input.ClearExpiresAt,
+	})
+	writeCredentialMutation(writer, result, err)
+}
+
+type revokeGatewayAPIKeyRequest struct {
+	ExpectedRevision int64  `json:"expected_revision"`
+	Reason           string `json:"reason"`
+}
+
+func (server *Server) revokeGatewayAPIKey(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	var input revokeGatewayAPIKeyRequest
+	if !decodeBody(writer, request, &input) {
+		return
+	}
+	revision, ok := expectedRevision(writer, request, input.ExpectedRevision)
+	if !ok {
+		return
+	}
+	actor.Reason = input.Reason
+	result, err := server.credentials.Revoke(request.Context(), actor, request.Header.Get("Idempotency-Key"), credentialadmin.RevokeCommand{
+		TenantID: tenantID, CredentialID: credentialID, ExpectedRevision: revision,
+	})
+	writeCredentialMutation(writer, result, err)
+}
+
+type rotateGatewayAPIKeyRequest struct {
+	ExpectedRevision  int64      `json:"expected_revision"`
+	RevokeImmediately bool       `json:"revoke_immediately"`
+	GraceExpiresAt    *time.Time `json:"grace_expires_at"`
+	Reason            string     `json:"reason"`
+}
+
+func (server *Server) rotateGatewayAPIKey(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	var input rotateGatewayAPIKeyRequest
+	if !decodeBody(writer, request, &input) {
+		return
+	}
+	revision, ok := expectedRevision(writer, request, input.ExpectedRevision)
+	if !ok {
+		return
+	}
+	actor.Reason = input.Reason
+	result, err := server.credentials.Rotate(request.Context(), actor, request.Header.Get("Idempotency-Key"), credentialadmin.RotateCommand{
+		TenantID: tenantID, CredentialID: credentialID, ExpectedRevision: revision,
+		RevokeImmediately: input.RevokeImmediately, GraceExpiresAt: input.GraceExpiresAt,
+	})
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", etag(result.Replacement.Revision))
+	writer.Header().Set("Location", "/control/v1/tenants/"+url.PathEscape(tenantID)+"/gateway-api-keys/"+url.PathEscape(result.Replacement.ID))
+	if result.Replay {
+		writer.Header().Set("Idempotency-Replayed", "true")
+	}
+	response := map[string]any{"predecessor": credentialResource(result.Predecessor), "replacement": credentialResource(result.Replacement)}
+	if result.RawSecret != "" {
+		response["secret"] = result.RawSecret
+	}
+	writeJSON(writer, http.StatusCreated, response)
+}
+
+func (server *Server) getGatewayAPIKeyPolicy(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	policy, err := server.credentials.GetPolicy(request.Context(), actor, tenantID, credentialID)
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", etag(policy.Revision))
+	writeJSON(writer, http.StatusOK, policy)
+}
+
+type putGatewayAPIKeyPolicyRequest struct {
+	Policy           *core.APIKeyPolicy `json:"policy"`
+	RestoreRevision  *int64             `json:"restore_revision"`
+	ExpectedRevision int64              `json:"expected_revision"`
+	Reason           string             `json:"reason"`
+}
+
+func (server *Server) putGatewayAPIKeyPolicy(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	var input putGatewayAPIKeyPolicyRequest
+	if !decodeBody(writer, request, &input) {
+		return
+	}
+	revision, ok := expectedRevision(writer, request, input.ExpectedRevision)
+	if !ok {
+		return
+	}
+	actor.Reason = input.Reason
+	result, err := server.credentials.PublishPolicy(request.Context(), actor, request.Header.Get("Idempotency-Key"), credentialadmin.PublishPolicyCommand{
+		TenantID: tenantID, CredentialID: credentialID, ExpectedRevision: revision,
+		Policy: input.Policy, RestoreRevision: input.RestoreRevision,
+	})
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", etag(result.Credential.Policy.Revision))
+	if result.Replay {
+		writer.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(writer, http.StatusOK, result.Credential.Policy)
+}
+
+func (server *Server) listGatewayAPIKeyPolicyRevisions(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	limit, err := optionalInt(request.URL.Query().Get("limit"))
+	if err != nil {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be an integer")
+		return
+	}
+	page, err := server.credentials.ListPolicyRevisions(request.Context(), actor, tenantID, credentialID, request.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"data": page.Data, "next_cursor": page.NextCursor})
+}
+
+func (server *Server) getGatewayAPIKeyEffectivePolicy(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	policy, err := server.credentials.GetEffectivePolicy(request.Context(), actor, tenantID, credentialID)
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, policy)
+}
+
+func writeCredentialMutation(writer http.ResponseWriter, result credentialadmin.MutationResult, err error) {
+	if err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", etag(result.Credential.Revision))
+	if result.Replay {
+		writer.Header().Set("Idempotency-Replayed", "true")
+	}
+	writeJSON(writer, http.StatusOK, credentialResource(result.Credential))
 }
 
 type createTenantRequest struct {

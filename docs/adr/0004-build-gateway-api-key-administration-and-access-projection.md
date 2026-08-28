@@ -4,6 +4,22 @@ status: proposed
 
 # Build Gateway API Key administration and a local Gateway Access Projection
 
+## Implementation status
+
+Implemented locally as of 2026-08-27 while this ADR remains proposed pending
+explicit architectural acceptance. The control plane implements the complete
+HTTP lifecycle and policy surface, transactional audit/outbox writes, one-time
+issue/rotation secrets, grace reconciliation, snapshot construction, and digest
+retirement counts. Gateways consume schema-version-2 events into a local
+PostgreSQL projection with inbox deduplication, monotonic aggregate revisions,
+gap detection, atomic snapshot replacement, structured lag/gap status, and
+cross-replica API-key concurrency leases. Production authentication is gated on
+the projection and does not read authoritative access tables.
+
+The current transport adapter reads the shared immutable outbox. ADR 0008 owns
+the external relay, delivery receipts, alerts, and readiness gates required
+before physical control/data-plane database separation.
+
 ## Context
 
 ADR 0002 persists peppered HMAC digests for Gateway API Keys and supports import, lookup, expiry, revocation, metadata CAS, and revisioned API Key Policy. The current path is an explicit environment bootstrap: it accepts caller-generated raw keys and exposes no administration interface. It has no key list, server-side issuance, rotation workflow, effective-policy query, digest-pepper migration, or distributed access projection.

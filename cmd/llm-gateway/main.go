@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
@@ -20,10 +21,12 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
+	"github.com/toddzheng/llm-gateway/internal/accessprojection"
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/capability"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
@@ -34,6 +37,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/runtime"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
+	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -141,6 +145,10 @@ func run() error {
 		return fmt.Errorf("GATEWAY_HOME_REGION_URLS_JSON: %w", err)
 	}
 	localRegion := envOr("GATEWAY_LOCAL_REGION", "local")
+	trustedProxyCIDRs, err := parseTrustedProxyCIDRsEnv("GATEWAY_TRUSTED_PROXY_CIDRS")
+	if err != nil {
+		return err
+	}
 
 	responseStore, database, cleanup, err := configureStore(apiKeys, homeRegions, executionEpochs, tenantPolicies)
 	if err != nil {
@@ -196,11 +204,15 @@ func run() error {
 	if quotaController != nil {
 		go runQuotaReconciliationWorker(ctx, quotaController)
 	}
+	if projection, ok := authenticator.(*accessprojection.Store); ok {
+		go runAccessProjectionWorker(ctx, projection)
+	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
 	handler := httpapi.New(httpapi.Config{
 		Runtime: engine, CapabilityRuntime: capabilityEngine, CapabilityCatalog: router,
 		ModelCatalog: router, Authenticator: authenticator, TenantHomeRegions: homeRegions,
 		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
 	})
 
 	address := envOr("GATEWAY_ADDR", ":8080")
@@ -289,11 +301,12 @@ func configureAuthenticator(
 	if err != nil {
 		return nil, fmt.Errorf("configure persistent API key authentication: %w", err)
 	}
-	if os.Getenv("GATEWAY_BOOTSTRAP_ACCESS") != "true" {
+	bootstrapAccess := os.Getenv("GATEWAY_BOOTSTRAP_ACCESS") == "true"
+	if !bootstrapAccess {
 		if len(apiKeys) > 0 {
 			return nil, errors.New("GATEWAY_API_KEYS_JSON is bootstrap input; set GATEWAY_BOOTSTRAP_ACCESS=true or remove it")
 		}
-		return service, nil
+		return configureAccessProjection(ctx, db, service, nil, currentDigestVersion, digestPeppers)
 	}
 	if len(apiKeys) == 0 {
 		return nil, errors.New("GATEWAY_BOOTSTRAP_ACCESS=true requires GATEWAY_API_KEYS_JSON")
@@ -366,7 +379,123 @@ func configureAuthenticator(
 			return nil, fmt.Errorf("bootstrap API key for Tenant %q: %w", apiKeys[rawKey], err)
 		}
 	}
-	return service, nil
+	return configureAccessProjection(ctx, db, service, tenantIDs, currentDigestVersion, digestPeppers)
+}
+
+func configureAccessProjection(
+	ctx context.Context,
+	database *sql.DB,
+	authoritative *access.PostgresService,
+	bootstrapTenantIDs []string,
+	currentDigestVersion int16,
+	digestPeppers map[int16][]byte,
+) (httpapi.Authenticator, error) {
+	if os.Getenv("GATEWAY_ACCESS_PROJECTION") != "true" {
+		if os.Getenv("GATEWAY_ENV") == "production" {
+			return nil, errors.New("production requires GATEWAY_ACCESS_PROJECTION=true")
+		}
+		return authoritative, nil
+	}
+	if os.Getenv("GATEWAY_MIGRATE") == "true" {
+		if err := accessprojection.Migrate(ctx, database); err != nil {
+			return nil, err
+		}
+	}
+	projection, err := accessprojection.New(database, accessprojection.PepperRing{
+		CurrentVersion: currentDigestVersion, Peppers: digestPeppers,
+	}, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf("configure Gateway Access Projection: %w", err)
+	}
+	if len(bootstrapTenantIDs) > 0 {
+		credentials, err := credentialadmin.NewService(database, credentialadmin.PepperRing{
+			CurrentVersion: currentDigestVersion, Peppers: digestPeppers,
+		}, time.Now, nil)
+		if err != nil {
+			return nil, err
+		}
+		actor := tenantadmin.ActorEnvelope{
+			Type: "system", ID: "gateway-access-projection-bootstrap", Scopes: []string{tenantadmin.ScopePlatformRead},
+		}
+		for _, tenantID := range bootstrapTenantIDs {
+			snapshot, err := credentials.BuildAccessSnapshot(ctx, actor, tenantID)
+			if err != nil {
+				return nil, fmt.Errorf("build Gateway Access Projection snapshot for Tenant %q: %w", tenantID, err)
+			}
+			if err := projection.ReplaceSnapshot(ctx, snapshot); err != nil {
+				return nil, fmt.Errorf("replace Gateway Access Projection snapshot for Tenant %q: %w", tenantID, err)
+			}
+		}
+	}
+	for {
+		result, err := projection.ConsumeControlOutboxBatch(ctx, 1000)
+		if err != nil {
+			return nil, fmt.Errorf("catch up Gateway Access Projection: %w", err)
+		}
+		if result.Scanned == 0 {
+			break
+		}
+		if result.Gaps > 0 && result.Applied == 0 && result.Stale == 0 {
+			break
+		}
+	}
+	return projection, nil
+}
+
+func runAccessProjectionWorker(ctx context.Context, projection *accessprojection.Store) {
+	run := func() {
+		for {
+			result, err := projection.ConsumeControlOutboxBatch(ctx, 256)
+			if err != nil {
+				slog.Warn("Gateway Access Projection consumer degraded", "error", err)
+				return
+			}
+			if result.Gaps > 0 {
+				slog.Warn("Gateway Access Projection revision gap detected", "gaps", result.Gaps)
+			}
+			if result.Scanned < 256 || result.Applied == 0 && result.Stale == 0 {
+				break
+			}
+		}
+		status, err := projection.Status(ctx)
+		if err != nil {
+			slog.Warn("Gateway Access Projection status unavailable", "error", err)
+			return
+		}
+		attributes := []any{
+			"gap_count", status.GapCount,
+			"head_count", status.HeadCount,
+			"max_aggregate_revision", status.MaxAggregateRevision,
+			"pending_event_count", status.PendingEventCount,
+			"delivery_lag", status.DeliveryLag,
+			"max_apply_lag", status.MaxApplyLag,
+		}
+		if status.OldestGapAt != nil {
+			attributes = append(attributes, "oldest_gap_at", *status.OldestGapAt)
+		}
+		if status.LastAppliedAt != nil {
+			attributes = append(attributes, "last_applied_at", *status.LastAppliedAt)
+		}
+		if status.OldestPendingAt != nil {
+			attributes = append(attributes, "oldest_pending_at", *status.OldestPendingAt)
+		}
+		if status.GapCount > 0 {
+			slog.Warn("Gateway Access Projection requires snapshot repair", attributes...)
+		} else {
+			slog.Debug("Gateway Access Projection healthy", attributes...)
+		}
+	}
+	run()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func gatewayAPIKeyPepperRingFromEnv() (int16, map[int16][]byte, error) {
@@ -867,6 +996,24 @@ func parseStringMapEnv(name string) (map[string]string, error) {
 	var result map[string]string
 	if err := json.Unmarshal([]byte(value), &result); err != nil {
 		return nil, err
+	}
+	return result, nil
+}
+
+func parseTrustedProxyCIDRsEnv(name string) ([]string, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		prefix, err := netip.ParsePrefix(part)
+		if err != nil || prefix.String() != part {
+			return nil, fmt.Errorf("%s must contain canonical comma-separated CIDRs", name)
+		}
+		result = append(result, part)
 	}
 	return result, nil
 }

@@ -19,7 +19,12 @@ SELECT EXISTS (
         'api_key_policy_revisions'::regclass,
         'control_command_idempotency'::regclass,
         'control_audit_events'::regclass,
-        'control_outbox'::regclass
+        'control_outbox'::regclass,
+        'gateway_access_projection'::regclass,
+        'gateway_access_inbox'::regclass,
+        'gateway_access_heads'::regclass,
+        'gateway_access_gaps'::regclass,
+        'gateway_access_response_slots'::regclass
     ) AND owner.rolname = :'gateway_role'
 ) AS gateway_owns_control_tables \gset
 \if :gateway_owns_control_tables
@@ -34,7 +39,12 @@ REVOKE ALL PRIVILEGES ON TABLE
     api_key_policy_revisions,
     control_command_idempotency,
     control_audit_events,
-    control_outbox
+    control_outbox,
+    gateway_access_projection,
+    gateway_access_inbox,
+    gateway_access_heads,
+    gateway_access_gaps,
+    gateway_access_response_slots
 FROM PUBLIC;
 
 REVOKE ALL PRIVILEGES ON TABLE
@@ -44,7 +54,12 @@ REVOKE ALL PRIVILEGES ON TABLE
     api_key_policy_revisions,
     control_command_idempotency,
     control_audit_events,
-    control_outbox
+    control_outbox,
+    gateway_access_projection,
+    gateway_access_inbox,
+    gateway_access_heads,
+    gateway_access_gaps,
+    gateway_access_response_slots
 FROM :"tenant_admin_role", :"gateway_role";
 
 GRANT SELECT, INSERT ON TABLE tenants TO :"tenant_admin_role";
@@ -81,6 +96,11 @@ GRANT SELECT, INSERT ON TABLE control_audit_events TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_outbox TO :"tenant_admin_role";
 GRANT UPDATE (publish_attempts, published_at, last_error) ON control_outbox TO :"tenant_admin_role";
 
--- The temporary Gateway adapter is read-only until ADR 0004 replaces it with
--- the local Gateway Access Projection.
-GRANT SELECT ON TABLE tenants, tenant_policy_revisions, api_keys, api_key_policy_revisions TO :"gateway_role";
+GRANT SELECT ON TABLE control_outbox TO :"gateway_role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+    gateway_access_projection,
+    gateway_access_inbox,
+    gateway_access_heads,
+    gateway_access_gaps,
+    gateway_access_response_slots
+TO :"gateway_role";

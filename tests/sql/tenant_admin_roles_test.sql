@@ -17,8 +17,13 @@ BEGIN
        OR NOT has_table_privilege('llm_gateway_tenant_admin_test', 'api_keys', 'INSERT')
        OR NOT has_column_privilege('llm_gateway_tenant_admin_test', 'api_keys', 'status', 'UPDATE')
        OR has_column_privilege('llm_gateway_tenant_admin_test', 'api_keys', 'secret_digest', 'UPDATE')
-       OR NOT has_table_privilege('llm_gateway_runtime_test', 'tenants', 'SELECT')
-       OR NOT has_table_privilege('llm_gateway_runtime_test', 'api_keys', 'SELECT')
+       OR has_table_privilege('llm_gateway_runtime_test', 'tenants', 'SELECT')
+       OR has_table_privilege('llm_gateway_runtime_test', 'api_keys', 'SELECT')
+       OR NOT has_table_privilege('llm_gateway_runtime_test', 'control_outbox', 'SELECT')
+       OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_access_projection', 'SELECT')
+       OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_access_projection', 'INSERT')
+       OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_access_response_slots', 'DELETE')
+       OR has_table_privilege('llm_gateway_runtime_test', 'gateway_access_projection', 'TRUNCATE')
        OR has_table_privilege('llm_gateway_runtime_test', 'tenants', 'INSERT')
        OR has_table_privilege('llm_gateway_runtime_test', 'tenant_policy_revisions', 'UPDATE') THEN
         RAISE EXCEPTION 'Tenant Administration role isolation assertion failed';

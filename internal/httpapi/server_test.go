@@ -48,6 +48,105 @@ func TestAPIKeyPolicyCannotExpandTenantCacheProtectionAccess(t *testing.T) {
 	}
 }
 
+func TestGatewayAPIKeyPolicyRestrictsOperationModelRegionAndTrustedClientCIDR(t *testing.T) {
+	models := []string{"gateway-model"}
+	operations := []string{"responses"}
+	regions := []string{"local"}
+	cidrs := []string{"203.0.113.0/24"}
+	principal := access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a", HomeRegion: "local", ExecutionEpoch: 1,
+		TenantPolicy: core.TenantPolicy{Revision: 1},
+		APIKeyPolicy: core.APIKeyPolicy{
+			Revision: 1, AllowedPublicModels: &models, AllowedOperations: &operations,
+			AllowedRegions: &regions, AllowedCIDRs: &cidrs,
+		},
+	}
+	route := provider.Route{
+		ID: "policy-route", Provider: "test", Model: "gateway-model", Region: "local", HomeRegion: "local",
+		CredentialScope: "test", Healthy: true, Executor: provider.NewEchoExecutor(),
+		Profile: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{
+			"text": provider.CapabilityNative,
+		}},
+		PriceSnapshot: core.PriceSnapshot{ID: "price", Provider: "test", Model: "gateway-model", Region: "local", Currency: "USD", EffectiveAt: 1, Source: "test"},
+	}
+	handler := httpapi.New(httpapi.Config{
+		Runtime:       runtime.New(store.NewMemoryResponseStore(), provider.NewRouter(route)),
+		Authenticator: principalAuthenticatorStub{Principal: principal}, LocalRegion: "local",
+		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
+	})
+	allowed := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gateway-model","input":"hello"}`))
+	allowed.Header.Set("Authorization", "Bearer key")
+	allowed.Header.Set("Content-Type", "application/json")
+	allowed.RemoteAddr = "203.0.113.7:54321"
+	allowedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(allowedResponse, allowed)
+	if allowedResponse.Code != http.StatusOK {
+		t.Fatalf("allowed status/body = %d / %s", allowedResponse.Code, allowedResponse.Body.String())
+	}
+	deniedModel := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"other-model","input":"hello"}`))
+	deniedModel.Header.Set("Authorization", "Bearer key")
+	deniedModel.Header.Set("Content-Type", "application/json")
+	deniedModel.RemoteAddr = "203.0.113.7:54321"
+	deniedModelResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deniedModelResponse, deniedModel)
+	if deniedModelResponse.Code != http.StatusForbidden {
+		t.Fatalf("denied model status/body = %d / %s", deniedModelResponse.Code, deniedModelResponse.Body.String())
+	}
+	deniedOperation := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	deniedOperation.Header.Set("Authorization", "Bearer key")
+	deniedOperation.RemoteAddr = "203.0.113.7:54321"
+	deniedOperationResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deniedOperationResponse, deniedOperation)
+	if deniedOperationResponse.Code != http.StatusForbidden {
+		t.Fatalf("denied operation status/body = %d / %s", deniedOperationResponse.Code, deniedOperationResponse.Body.String())
+	}
+	spoofed := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gateway-model","input":"hello"}`))
+	spoofed.Header.Set("Authorization", "Bearer key")
+	spoofed.Header.Set("Content-Type", "application/json")
+	spoofed.Header.Set("X-Forwarded-For", "203.0.113.7")
+	spoofed.RemoteAddr = "198.51.100.8:54321"
+	spoofedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(spoofedResponse, spoofed)
+	if spoofedResponse.Code != http.StatusForbidden {
+		t.Fatalf("spoofed CIDR status/body = %d / %s", spoofedResponse.Code, spoofedResponse.Body.String())
+	}
+}
+
+func TestGatewayAPIKeyPolicyEnforcesConcurrentResponseLimit(t *testing.T) {
+	limit := 1
+	started := make(chan struct{})
+	release := make(chan struct{})
+	executor := blockingExecutor{started: started, release: release, delegate: provider.NewEchoExecutor()}
+	route := provider.Route{
+		ID: "concurrency-route", Provider: "test", Model: "gateway-model", Region: "local", HomeRegion: "local",
+		CredentialScope: "test", Healthy: true, Executor: executor,
+		Profile:       provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{"text": provider.CapabilityNative}},
+		PriceSnapshot: core.PriceSnapshot{ID: "price", Provider: "test", Model: "gateway-model", Region: "local", Currency: "USD", EffectiveAt: 1, Source: "test"},
+	}
+	principal := access.Principal{
+		TenantID: "tenant-a", APIKeyID: "key-a", HomeRegion: "local", ExecutionEpoch: 1,
+		TenantPolicy: core.TenantPolicy{Revision: 1},
+		APIKeyPolicy: core.APIKeyPolicy{Revision: 1, MaxConcurrentResponses: &limit},
+	}
+	handler := httpapi.New(httpapi.Config{
+		Runtime:       runtime.New(store.NewMemoryResponseStore(), provider.NewRouter(route)),
+		Authenticator: principalAuthenticatorStub{Principal: principal}, LocalRegion: "local",
+	})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- performJSON(t, handler, "key", http.MethodPost, "/v1/responses", map[string]any{"model": "gateway-model", "input": "first"})
+	}()
+	<-started
+	second := performJSON(t, handler, "key", http.MethodPost, "/v1/responses", map[string]any{"model": "gateway-model", "input": "second"})
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status/body = %d / %s", second.Code, second.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first status/body = %d / %s", first.Code, first.Body.String())
+	}
+}
+
 type principalAuthenticatorStub struct {
 	Principal access.Principal
 	Err       error
@@ -671,6 +770,22 @@ func (e captureExecutor) Execute(ctx context.Context, request core.Request) (pro
 }
 
 type fixedExecutor struct{ events []core.Event }
+
+type blockingExecutor struct {
+	started  chan<- struct{}
+	release  <-chan struct{}
+	delegate provider.ResponseExecutor
+}
+
+func (executor blockingExecutor) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {
+	executor.started <- struct{}{}
+	select {
+	case <-executor.release:
+		return executor.delegate.Execute(ctx, request)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 func (e fixedExecutor) Execute(context.Context, core.Request) (provider.EventStream, error) {
 	return &fixedEventStream{events: append([]core.Event(nil), e.events...)}, nil

@@ -198,6 +198,11 @@ type APIKeyPolicy struct {
 	Revision               int64       `json:"revision,omitempty"`
 	AllowCacheProtection   bool        `json:"allow_cache_protection,omitempty"`
 	AllowContentInspection bool        `json:"allow_content_inspection,omitempty"`
+	AllowedPublicModels    *[]string   `json:"allowed_public_models"`
+	AllowedOperations      *[]string   `json:"allowed_operations"`
+	AllowedCIDRs           *[]string   `json:"allowed_cidrs"`
+	AllowedRegions         *[]string   `json:"allowed_regions"`
+	MaxConcurrentResponses *int        `json:"max_concurrent_responses"`
 	Limits                 QuotaLimits `json:"limits,omitempty"`
 }
 

@@ -18,7 +18,8 @@ test-integration:
 	fi
 	GOCACHE=$(GOCACHE) go test -count=1 -p=1 -tags=integration \
 		./internal/access ./internal/store ./internal/configuration ./internal/cacheprotection \
-		./internal/quota ./internal/httpapi ./internal/tenantadmin ./internal/credentialadmin ./cmd/llm-gateway
+		./internal/quota ./internal/httpapi ./internal/tenantadmin ./internal/credentialadmin \
+		./internal/accessprojection ./cmd/llm-gateway
 	$(MAKE) test-tenant-admin-roles TEST_DATABASE_URL="$(TEST_DATABASE_URL)"
 
 integration-up:

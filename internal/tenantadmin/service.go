@@ -189,7 +189,7 @@ func (s *Service) recordMutation(
 		INSERT INTO control_outbox (
 			event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision,
 			tenant_id, event_type, occurred_at, payload
-		) VALUES ($1,1,'Tenant',$2,$3,$2,$4,$5,$6)`,
+		) VALUES ($1,2,'Tenant',$2,$3,$2,$4,$5,$6)`,
 		eventID, tenant.ID, tenant.Revision, eventType, now, encoded,
 	); err != nil {
 		return fmt.Errorf("append control outbox: %w", err)
@@ -300,7 +300,8 @@ func tenantEventPayload(tenant access.Tenant) map[string]any {
 	return map[string]any{
 		"tenant_id": tenant.ID, "slug": tenant.Slug, "status": tenant.Status,
 		"home_region": tenant.HomeRegion, "tenant_revision": tenant.Revision,
-		"policy_revision": tenant.Policy.Revision, "policy_digest": hex.EncodeToString(digest[:]),
+		"execution_epoch": tenant.ExecutionEpoch, "policy_revision": tenant.Policy.Revision,
+		"tenant_policy": tenant.Policy, "policy_digest": hex.EncodeToString(digest[:]),
 	}
 }
 

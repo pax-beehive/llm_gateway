@@ -78,7 +78,7 @@ func (service *Service) Issue(
 	if err != nil {
 		return IssueResult{}, err
 	}
-	transaction, replay, err := service.beginCommand(ctx, actor, idempotencyKey, requestHash)
+	transaction, replay, err := service.beginCommand(ctx, actor, issueOperation, idempotencyKey, requestHash)
 	if err != nil || replay != nil {
 		if replay != nil {
 			return IssueResult{Credential: *replay, Replay: true}, nil
@@ -138,10 +138,10 @@ func (service *Service) Issue(
 	if err != nil {
 		return IssueResult{}, err
 	}
-	if err := service.recordIssue(ctx, transaction, actor, credential, digest); err != nil {
+	if err := service.recordCredentialMutation(ctx, transaction, actor, credential, issueOperation, "GatewayAPIKeyIssued", nil); err != nil {
 		return IssueResult{}, err
 	}
-	if err := recordCommandResult(ctx, transaction, actor, idempotencyKey, requestHash, credential); err != nil {
+	if err := recordCommandResult(ctx, transaction, actor, issueOperation, idempotencyKey, requestHash, credential); err != nil {
 		return IssueResult{}, err
 	}
 	if err := transaction.Commit(); err != nil {
@@ -153,6 +153,7 @@ func (service *Service) Issue(
 func (service *Service) beginCommand(
 	ctx context.Context,
 	actor tenantadmin.ActorEnvelope,
+	operation string,
 	idempotencyKey string,
 	requestHash []byte,
 ) (*sql.Tx, *Credential, error) {
@@ -160,7 +161,7 @@ func (service *Service) beginCommand(
 	if err != nil {
 		return nil, nil, err
 	}
-	lockIdentity := strings.Join([]string{actor.Type, actor.ID, issueOperation, idempotencyKey}, "\x1f")
+	lockIdentity := strings.Join([]string{actor.Type, actor.ID, operation, idempotencyKey}, "\x1f")
 	if _, err := transaction.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockIdentity); err != nil {
 		_ = transaction.Rollback()
 		return nil, nil, err
@@ -169,7 +170,7 @@ func (service *Service) beginCommand(
 	err = transaction.QueryRowContext(ctx, `
 		SELECT request_hash, result FROM control_command_idempotency
 		WHERE actor_type = $1 AND actor_id = $2 AND operation = $3 AND idempotency_key = $4`,
-		actor.Type, actor.ID, issueOperation, idempotencyKey).Scan(&storedHash, &resultPayload)
+		actor.Type, actor.ID, operation, idempotencyKey).Scan(&storedHash, &resultPayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return transaction, nil, nil
 	}
@@ -192,56 +193,11 @@ func (service *Service) beginCommand(
 	return nil, &credential, nil
 }
 
-func (service *Service) recordIssue(
-	ctx context.Context,
-	transaction *sql.Tx,
-	actor tenantadmin.ActorEnvelope,
-	credential Credential,
-	digest []byte,
-) error {
-	now := service.now().UTC()
-	auditID, err := randomID(service.random, "caud", 16)
-	if err != nil {
-		return err
-	}
-	eventID, err := randomID(service.random, "cevt", 16)
-	if err != nil {
-		return err
-	}
-	auditPayload, _ := json.Marshal(map[string]any{
-		"tenant_id": credential.TenantID, "api_key_id": credential.ID, "prefix": credential.Prefix,
-		"digest_version": credential.DigestVersion, "revision": credential.Revision,
-	})
-	if _, err := transaction.ExecContext(ctx, `
-		INSERT INTO control_audit_events (
-			event_id, tenant_id, actor_type, actor_id, acting_tenant_id, scopes,
-			request_id, reason, action, aggregate_revision, payload, occurred_at
-		) VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,$9,$10,$11,$12)`,
-		auditID, credential.TenantID, actor.Type, actor.ID, actor.ActingTenantID, actor.Scopes,
-		actor.RequestID, actor.Reason, issueOperation, credential.Revision, auditPayload, now); err != nil {
-		return fmt.Errorf("append credential audit: %w", err)
-	}
-	eventPayload, _ := json.Marshal(map[string]any{
-		"tenant_id": credential.TenantID, "api_key_id": credential.ID, "prefix": credential.Prefix,
-		"digest_version": credential.DigestVersion, "secret_digest": digest, "status": credential.Status,
-		"key_revision": credential.Revision, "policy_revision": credential.Policy.Revision,
-		"expires_at": credential.ExpiresAt,
-	})
-	if _, err := transaction.ExecContext(ctx, `
-		INSERT INTO control_outbox (
-			event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision,
-			tenant_id, event_type, occurred_at, payload
-		) VALUES ($1,1,'GatewayAPIKey',$2,$3,$4,'GatewayAPIKeyIssued',$5,$6)`,
-		eventID, credential.ID, credential.Revision, credential.TenantID, now, eventPayload); err != nil {
-		return fmt.Errorf("append credential outbox: %w", err)
-	}
-	return nil
-}
-
 func recordCommandResult(
 	ctx context.Context,
 	transaction *sql.Tx,
 	actor tenantadmin.ActorEnvelope,
+	operation string,
 	idempotencyKey string,
 	requestHash []byte,
 	credential Credential,
@@ -254,7 +210,7 @@ func recordCommandResult(
 		INSERT INTO control_command_idempotency (
 			actor_type, actor_id, operation, idempotency_key, request_hash, result
 		) VALUES ($1,$2,$3,$4,$5,$6)`,
-		actor.Type, actor.ID, issueOperation, idempotencyKey, requestHash, payload)
+		actor.Type, actor.ID, operation, idempotencyKey, requestHash, payload)
 	return err
 }
 

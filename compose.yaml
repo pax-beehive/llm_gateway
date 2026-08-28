@@ -23,6 +23,7 @@ services:
     environment:
       DATABASE_URL: postgres://gateway:gateway-dev-only@postgres:5432/llm_gateway?sslmode=disable
       GATEWAY_MIGRATE: "true"
+      GATEWAY_ACCESS_PROJECTION: "true"
       GATEWAY_DEV_ECHO: "true"
       GATEWAY_API_KEY_PEPPER: "gateway-local-pepper-change-me"
       GATEWAY_BOOTSTRAP_ACCESS: "true"

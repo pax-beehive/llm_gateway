@@ -25,3 +25,27 @@ func TestFunctionCallArgumentsUseResponsesStringWireShape(t *testing.T) {
 		t.Fatalf("decoded arguments = %s", decoded.Arguments)
 	}
 }
+
+func TestAPIKeyPolicyPreservesMissingInheritAndExplicitDeny(t *testing.T) {
+	t.Parallel()
+	var inherited core.APIKeyPolicy
+	if err := json.Unmarshal([]byte(`{}`), &inherited); err != nil {
+		t.Fatal(err)
+	}
+	if inherited.AllowedPublicModels != nil || inherited.AllowedOperations != nil || inherited.AllowedCIDRs != nil ||
+		inherited.AllowedRegions != nil || inherited.MaxConcurrentResponses != nil {
+		t.Fatalf("missing restrictions must inherit: %#v", inherited)
+	}
+
+	var denied core.APIKeyPolicy
+	if err := json.Unmarshal([]byte(`{"allowed_public_models":[],"allowed_operations":[],"allowed_cidrs":[],"allowed_regions":[],"max_concurrent_responses":0}`), &denied); err != nil {
+		t.Fatal(err)
+	}
+	if denied.AllowedPublicModels == nil || len(*denied.AllowedPublicModels) != 0 ||
+		denied.AllowedOperations == nil || len(*denied.AllowedOperations) != 0 ||
+		denied.AllowedCIDRs == nil || len(*denied.AllowedCIDRs) != 0 ||
+		denied.AllowedRegions == nil || len(*denied.AllowedRegions) != 0 ||
+		denied.MaxConcurrentResponses == nil || *denied.MaxConcurrentResponses != 0 {
+		t.Fatalf("explicit empty and zero restrictions must deny: %#v", denied)
+	}
+}

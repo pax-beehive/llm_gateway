@@ -69,9 +69,12 @@ Production requires PostgreSQL and refuses to start without an explicit synchron
 DATABASE_URL=postgres://...
 GATEWAY_ENV=production
 GATEWAY_DURABILITY_ATTESTATION=sync-multi-az
-GATEWAY_API_KEY_PEPPER=<stable-secret-at-least-16-bytes>
+GATEWAY_ACCESS_PROJECTION=true
+GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2
+GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}
 GATEWAY_LOCAL_REGION=us-west
 GATEWAY_HOME_REGION_URLS_JSON={"us-west":"https://us-west.gateway.example","eu-west":"https://eu-west.gateway.example"}
+GATEWAY_TRUSTED_PROXY_CIDRS=10.0.0.0/8,2001:db8::/32
 GATEWAY_CACHE_PROTECTION_MODE=off
 GATEWAY_ROUTES_JSON=[...]
 ```
@@ -92,17 +95,21 @@ CONTROL_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}
 Run schema migration as a separate owner job, then apply least-privilege grants
 with `make configure-tenant-admin-roles ADMIN_DATABASE_URL=... TENANT_ADMIN_DB_ROLE=... GATEWAY_DB_ROLE=...`.
 The control-plane runtime refuses in-process production migration and verifies
-its connected role. The Gateway role receives only temporary read access to
-Tenant state; ADR 0004 replaces that adapter with a local Access Projection.
+its connected role. The Gateway role reads immutable schema-version-2 control
+events and owns only its local Access Projection tables; it receives no read
+access to authoritative Tenant or Gateway API Key tables. Production refuses to
+start unless `GATEWAY_ACCESS_PROJECTION=true`.
 `/healthz` is liveness only. Full dependency and backlog readiness is introduced
 by ADR 0008; this process does not claim readiness before those checks exist.
 Tenant mutations atomically append `control_outbox`; that is durable enqueue,
-not delivery proof. Relay, consumer receipts, lag, and repair surfaces are also
-implemented by ADR 0008 before physical database separation.
+not delivery proof. The initial shared-PostgreSQL consumer applies events through
+an inbox and aggregate revisions, reports gaps and lag in structured logs, and
+supports atomic snapshot repair. External relay delivery, receipts, alerts, and
+readiness gates are implemented by ADR 0008 before physical database separation.
 
-In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. The single `GATEWAY_API_KEY_PEPPER` variable is the version-1 compatibility form. During a bounded rotation, configure `GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}` and `GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2`; at most eight versions may be active. New issuance/import uses the current version, while configured prior versions remain verifiable. Remove an old pepper only after the control plane proves no active key still references that digest version.
+In PostgreSQL mode, `tenants`, `tenant_policy_revisions`, `api_keys`, and `api_key_policy_revisions` are authoritative, while inference authentication reads only `gateway_access_projection`. Requests authenticate by a peppered HMAC digest; the raw Gateway API Key is never persisted, and a caller-supplied Tenant header cannot change the authenticated Tenant. The single `GATEWAY_API_KEY_PEPPER` variable is the version-1 compatibility form for development. During a bounded rotation, configure `GATEWAY_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}` and `GATEWAY_API_KEY_CURRENT_DIGEST_VERSION=2`; at most eight versions may be active. New issuance/import uses the current version, while configured prior versions remain verifiable. Remove an old pepper only after both the authoritative control-plane count and every regional projection count prove no active key still references that digest version.
 
-Environment key maps are only for an explicit, idempotent first bootstrap. A raw bootstrap key must contain at least 24 characters. After a successful bootstrap, remove the raw-key variables and disable the flag; subsequent replicas load access state only from PostgreSQL:
+Environment key maps are only for an explicit, idempotent first development bootstrap. A raw bootstrap key must contain at least 24 characters. The Gateway atomically seeds its Access Projection; then remove the raw-key variables and disable the flag. Existing production Tenants are seeded through a control-plane snapshot before the Gateway role is restricted to projection tables:
 
 ```text
 GATEWAY_BOOTSTRAP_ACCESS=true
@@ -114,7 +121,13 @@ GATEWAY_API_KEY_POLICIES_JSON={"long-secret-gateway-token":{"revision":1,"allow_
 GATEWAY_API_KEY_METADATA_JSON={"long-secret-gateway-token":{"environment":"production","owner":"platform"}}
 ```
 
-Tenant and key policy publication uses compare-and-swap revisions and immutable policy history. Key metadata uses a separate row revision. An active key can be revoked, a Tenant can be suspended and reactivated, and a closed Tenant cannot be reopened. Authentication and delayed refresh work read current state, so these changes do not wait for a process restart. `null`/absent limits inherit from the other scope; explicit `0` denies. A Gateway API Key can only narrow a Tenant limit or permission.
+Tenant and key policy publication uses compare-and-swap revisions and immutable policy history. Key metadata uses a separate row revision. The control API supports server-generated issuance, list/get, metadata and expiry update, terminal revoke, immediate or grace-period rotation, policy history, and effective-policy inspection. A secret is returned only for the first successful issue or rotation response; idempotent replay returns metadata without plaintext. An active key can be revoked, a Tenant can be suspended and reactivated, and a closed Tenant cannot be reopened. A one-second grace reconciler terminates expired rotation predecessors. Healthy regional projection polling propagates revocation without an inference-time control-plane call. `null`/absent limits inherit from the other scope; explicit `0` or an explicit empty restriction denies. A Gateway API Key can only narrow a Tenant limit or permission.
+
+Gateway API Key Policy can restrict public models, operations, source CIDRs,
+regions, and concurrent billable requests. CIDR evaluation trusts forwarded
+addresses only from canonical `GATEWAY_TRUSTED_PROXY_CIDRS`. Concurrency uses
+renewable PostgreSQL leases under a per-key advisory lock, so the limit is hard
+across Gateway replicas rather than process-local.
 
 Each route declares its public model, provider model, execution/home region, credential scope, versioned Capability Profile, prices, and secret environment-variable reference. Credentials are read server-side and are never returned by the API. The `provider` value must be one of `openai`, `deepseek`, `anthropic`, or `gemini`; route publication fails for any other value.
 
@@ -228,6 +241,13 @@ make test-stage-a-blackbox
 ```
 
 It covers the authenticated capability catalog, embeddings, moderations, reranking, and deterministic result shapes without Provider spend.
+
+With `make run-control-plane-dev` running in another terminal, exercise the
+complete Tenant and Gateway API Key administration lifecycle:
+
+```sh
+make test-tenant-admin-blackbox
+```
 
 The black-box suite covers model discovery, Responses create/retrieve/input-items/delete, `previous_response_id`, Responses streaming, Chat Completions, Chat streaming, and Conversations. Override `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_MODEL` to target another deployment. It requires the `openai` Python package and defaults to the zero-cost local `echo-v1` route.
 

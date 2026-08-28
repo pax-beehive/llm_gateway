@@ -143,6 +143,33 @@ func TestIssueGatewayAPIKeyReturnsOneTimeSecretFromCredentialModule(t *testing.T
 	}
 }
 
+func TestListGatewayAPIKeysReturnsMetadataWithoutSecrets(t *testing.T) {
+	credentials := &fakeCredentialAdministration{}
+	credentials.list = func(_ context.Context, actor tenantadmin.ActorEnvelope, filter credentialadmin.CredentialFilter) (credentialadmin.CredentialPage, error) {
+		if actor.ID != "user-1" || filter.TenantID != "tenant-a" || filter.Limit != 2 {
+			t.Fatalf("actor/filter = %#v / %#v", actor, filter)
+		}
+		return credentialadmin.CredentialPage{Data: []credentialadmin.Credential{{
+			ID: "gak_123", TenantID: "tenant-a", Name: "workload", Prefix: "gw_prefix",
+			DigestVersion: 2, Status: access.APIKeyActive, Revision: 1, Policy: core.APIKeyPolicy{Revision: 1},
+		}}, NextCursor: "next"}, nil
+	}
+	handler := controlapi.New(controlapi.Config{
+		Administration: &fakeAdministration{}, Credentials: credentials,
+		Verifier: fixedVerifier(controlapi.VerifiedIdentity{ActorType: "human", ActorID: "user-1", Scopes: []string{tenantadmin.ScopePlatformRead}}),
+	})
+	request := httptest.NewRequest(http.MethodGet, "/control/v1/tenants/tenant-a/gateway-api-keys?limit=2", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status/body = %d / %s", response.Code, response.Body.String())
+	}
+	if bytes.Contains(response.Body.Bytes(), []byte("secret")) || !bytes.Contains(response.Body.Bytes(), []byte(`"next_cursor":"next"`)) {
+		t.Fatalf("list body = %s", response.Body.String())
+	}
+}
+
 type fakeAdministration struct {
 	create func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.CreateTenantCommand) (tenantadmin.MutationResult, error)
 	update func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.UpdateTenantCommand) (tenantadmin.MutationResult, error)
@@ -150,8 +177,73 @@ type fakeAdministration struct {
 
 type credentialAdministrationFunc func(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error)
 
+type fakeCredentialAdministration struct {
+	list func(context.Context, tenantadmin.ActorEnvelope, credentialadmin.CredentialFilter) (credentialadmin.CredentialPage, error)
+}
+
+func (f *fakeCredentialAdministration) Issue(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error) {
+	panic("unexpected Issue")
+}
+
+func (f *fakeCredentialAdministration) List(ctx context.Context, actor tenantadmin.ActorEnvelope, filter credentialadmin.CredentialFilter) (credentialadmin.CredentialPage, error) {
+	return f.list(ctx, actor, filter)
+}
+
 func (function credentialAdministrationFunc) Issue(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command credentialadmin.IssueCommand) (credentialadmin.IssueResult, error) {
 	return function(ctx, actor, key, command)
+}
+
+func (credentialAdministrationFunc) Get(context.Context, tenantadmin.ActorEnvelope, string, string) (credentialadmin.Credential, error) {
+	panic("unexpected Get")
+}
+func (credentialAdministrationFunc) List(context.Context, tenantadmin.ActorEnvelope, credentialadmin.CredentialFilter) (credentialadmin.CredentialPage, error) {
+	panic("unexpected List")
+}
+func (credentialAdministrationFunc) Update(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.UpdateCommand) (credentialadmin.MutationResult, error) {
+	panic("unexpected Update")
+}
+func (credentialAdministrationFunc) Revoke(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.RevokeCommand) (credentialadmin.MutationResult, error) {
+	panic("unexpected Revoke")
+}
+func (credentialAdministrationFunc) Rotate(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.RotateCommand) (credentialadmin.RotationResult, error) {
+	panic("unexpected Rotate")
+}
+func (credentialAdministrationFunc) GetPolicy(context.Context, tenantadmin.ActorEnvelope, string, string) (core.APIKeyPolicy, error) {
+	panic("unexpected GetPolicy")
+}
+func (credentialAdministrationFunc) PublishPolicy(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.PublishPolicyCommand) (credentialadmin.MutationResult, error) {
+	panic("unexpected PublishPolicy")
+}
+func (credentialAdministrationFunc) ListPolicyRevisions(context.Context, tenantadmin.ActorEnvelope, string, string, string, int) (credentialadmin.PolicyRevisionPage, error) {
+	panic("unexpected ListPolicyRevisions")
+}
+func (credentialAdministrationFunc) GetEffectivePolicy(context.Context, tenantadmin.ActorEnvelope, string, string) (credentialadmin.EffectivePolicy, error) {
+	panic("unexpected GetEffectivePolicy")
+}
+
+func (*fakeCredentialAdministration) Get(context.Context, tenantadmin.ActorEnvelope, string, string) (credentialadmin.Credential, error) {
+	panic("unexpected Get")
+}
+func (*fakeCredentialAdministration) Update(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.UpdateCommand) (credentialadmin.MutationResult, error) {
+	panic("unexpected Update")
+}
+func (*fakeCredentialAdministration) Revoke(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.RevokeCommand) (credentialadmin.MutationResult, error) {
+	panic("unexpected Revoke")
+}
+func (*fakeCredentialAdministration) Rotate(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.RotateCommand) (credentialadmin.RotationResult, error) {
+	panic("unexpected Rotate")
+}
+func (*fakeCredentialAdministration) GetPolicy(context.Context, tenantadmin.ActorEnvelope, string, string) (core.APIKeyPolicy, error) {
+	panic("unexpected GetPolicy")
+}
+func (*fakeCredentialAdministration) PublishPolicy(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.PublishPolicyCommand) (credentialadmin.MutationResult, error) {
+	panic("unexpected PublishPolicy")
+}
+func (*fakeCredentialAdministration) ListPolicyRevisions(context.Context, tenantadmin.ActorEnvelope, string, string, string, int) (credentialadmin.PolicyRevisionPage, error) {
+	panic("unexpected ListPolicyRevisions")
+}
+func (*fakeCredentialAdministration) GetEffectivePolicy(context.Context, tenantadmin.ActorEnvelope, string, string) (credentialadmin.EffectivePolicy, error) {
+	panic("unexpected GetEffectivePolicy")
 }
 
 func (f *fakeAdministration) CreateTenant(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command tenantadmin.CreateTenantCommand) (tenantadmin.MutationResult, error) {

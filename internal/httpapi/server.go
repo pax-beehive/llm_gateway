@@ -3,15 +3,20 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
@@ -26,6 +31,12 @@ type Authenticator interface {
 	Authenticate(context.Context, string) (access.Principal, error)
 }
 
+type APIKeyConcurrencyStore interface {
+	AcquireAPIKeyResponseSlot(context.Context, string, string, int, time.Time) error
+	RenewAPIKeyResponseSlot(context.Context, string, string, time.Time) error
+	ReleaseAPIKeyResponseSlot(context.Context, string, string) error
+}
+
 type StaticAuthenticator map[string]string
 
 func (a StaticAuthenticator) Authenticate(_ context.Context, token string) (access.Principal, error) {
@@ -38,6 +49,8 @@ func (a StaticAuthenticator) Authenticate(_ context.Context, token string) (acce
 
 type principalContextKey struct{}
 
+var errAPIKeyConcurrencyDenied = errors.New("Gateway API Key concurrent Response policy denies this operation")
+
 type Config struct {
 	Runtime               *runtime.Runtime
 	CapabilityRuntime     *capability.Runtime
@@ -49,6 +62,7 @@ type Config struct {
 	LocalRegion           string
 	HomeRegionURLs        map[string]string
 	ForwardClient         *http.Client
+	TrustedProxyCIDRs     []string
 }
 
 type Server struct {
@@ -62,6 +76,10 @@ type Server struct {
 	localRegion       string
 	homeRegionURLs    map[string]string
 	forwardClient     *http.Client
+	trustedProxies    []netip.Prefix
+	policyConfigError error
+	inflightMu        sync.Mutex
+	apiKeyInflight    map[string]int
 	mux               *http.ServeMux
 }
 
@@ -72,11 +90,14 @@ func New(config Config) http.Handler {
 	if config.ForwardClient == nil {
 		config.ForwardClient = http.DefaultClient
 	}
+	trustedProxies, policyConfigError := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
 	server := &Server{
 		runtime: config.Runtime, capabilityRuntime: config.CapabilityRuntime, capabilityCatalog: config.CapabilityCatalog,
 		modelCatalog: config.ModelCatalog, authenticator: config.Authenticator, homeRegions: config.TenantHomeRegions,
 		executionEpochs: config.TenantExecutionEpochs, localRegion: config.LocalRegion,
-		homeRegionURLs: config.HomeRegionURLs, forwardClient: config.ForwardClient, mux: http.NewServeMux(),
+		homeRegionURLs: config.HomeRegionURLs, forwardClient: config.ForwardClient,
+		trustedProxies: trustedProxies, policyConfigError: policyConfigError,
+		apiKeyInflight: make(map[string]int), mux: http.NewServeMux(),
 	}
 	server.mux.HandleFunc("POST /v1/responses", server.createResponse)
 	server.mux.HandleFunc("GET /v1/responses/{response_id}", server.getResponse)
@@ -109,11 +130,14 @@ func (s *Server) listCapabilities(responseWriter http.ResponseWriter, request *h
 		writeError(responseWriter, http.StatusServiceUnavailable, "capability_catalog_unavailable", err.Error(), "")
 		return
 	}
-	data := make([]map[string]any, len(entries))
-	for index, entry := range entries {
-		data[index] = map[string]any{
-			"id": entry.ID, "object": "capability_profile", "created": entry.Created, "capabilities": entry.Capabilities,
+	data := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		if err := s.authorizeModel(request, entry.ID); err != nil {
+			continue
 		}
+		data = append(data, map[string]any{
+			"id": entry.ID, "object": "capability_profile", "created": entry.Created, "capabilities": entry.Capabilities,
+		})
 	}
 	writeJSON(responseWriter, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
@@ -139,6 +163,10 @@ func (s *Server) embeddings(responseWriter http.ResponseWriter, request *http.Re
 	}
 	if payload.Model == "" {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model is required", "model")
+		return
+	}
+	if err := s.authorizeModel(request, payload.Model); err != nil {
+		writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "model")
 		return
 	}
 	if payload.EncodingFormat != "" && payload.EncodingFormat != "float" && payload.EncodingFormat != "base64" {
@@ -253,6 +281,10 @@ func (s *Server) moderations(responseWriter http.ResponseWriter, request *http.R
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model is required", "model")
 		return
 	}
+	if err := s.authorizeModel(request, payload.Model); err != nil {
+		writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "model")
+		return
+	}
 	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", err.Error(), "compatibility_mode")
 		return
@@ -334,6 +366,10 @@ func (s *Server) rerank(responseWriter http.ResponseWriter, request *http.Reques
 	}
 	if payload.Model == "" || payload.Query == "" {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model and query are required", "")
+		return
+	}
+	if err := s.authorizeModel(request, payload.Model); err != nil {
+		writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "model")
 		return
 	}
 	if payload.TopN != nil && (*payload.TopN <= 0 || *payload.TopN > len(payload.Documents)) {
@@ -434,14 +470,17 @@ func (s *Server) listModels(responseWriter http.ResponseWriter, request *http.Re
 	}
 	data := make([]modelObject, 0, len(models))
 	for _, model := range models {
+		if err := s.authorizeModel(request, model.ID); err != nil {
+			continue
+		}
 		data = append(data, modelObject{ID: model.ID, Object: "model", Created: model.Created, OwnedBy: "gateway"})
 	}
 	// Codex asks the same endpoint for richer model metadata and identifies
 	// itself through a query parameter or client header. Keep the default
 	// response OpenAI SDK compatible while exposing the custom-provider shape.
 	if codexRequest {
-		codexModels := make([]map[string]any, 0, len(models))
-		for index, model := range models {
+		codexModels := make([]map[string]any, 0, len(data))
+		for index, model := range data {
 			codexModels = append(codexModels, codexModelObject(model.ID, index+1))
 		}
 		writeJSON(responseWriter, http.StatusOK, map[string]any{"models": codexModels})
@@ -516,6 +555,15 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 		return
 	}
 	request = request.WithContext(context.WithValue(request.Context(), principalContextKey{}, principal))
+	if s.policyConfigError != nil {
+		writeError(responseWriter, http.StatusServiceUnavailable, "policy_configuration_error", "trusted proxy policy is invalid", "")
+		return
+	}
+	operation := operationForRequest(request)
+	if err := s.authorizeRequestPolicy(request, principal, operation); err != nil {
+		writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "")
+		return
+	}
 	if request.Method == http.MethodPost || request.Method == http.MethodDelete {
 		homeRegion := s.homeRegion(request)
 		if homeRegion != "" && homeRegion != s.localRegion {
@@ -523,7 +571,195 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 			return
 		}
 	}
+	request, release, err := s.acquireAPIKeyConcurrency(request, principal, operation)
+	if err != nil {
+		switch {
+		case errors.Is(err, errAPIKeyConcurrencyDenied):
+			writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "")
+		case errors.Is(err, store.ErrQuotaExceeded):
+			writeError(responseWriter, http.StatusTooManyRequests, "policy_denied", "Gateway API Key concurrent Response limit exceeded", "")
+		default:
+			writeError(responseWriter, http.StatusServiceUnavailable, "policy_coordination_unavailable", "Gateway API Key concurrency coordination is unavailable", "")
+		}
+		return
+	}
+	defer release()
 	s.mux.ServeHTTP(responseWriter, request)
+}
+
+func parseTrustedProxyCIDRs(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil || prefix.String() != value {
+			return nil, fmt.Errorf("invalid canonical trusted proxy CIDR %q", value)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
+}
+
+func operationForRequest(request *http.Request) string {
+	path := request.URL.Path
+	switch {
+	case path == "/v1/responses" || strings.HasPrefix(path, "/v1/responses/"):
+		return "responses"
+	case path == "/v1/chat/completions":
+		return "chat_completions"
+	case path == "/v1/embeddings":
+		return "embeddings"
+	case path == "/v1/moderations":
+		return "moderation"
+	case path == "/v1/rerank":
+		return "rerank"
+	case path == "/v1/models":
+		return "models"
+	case path == "/v1/capabilities":
+		return "capabilities"
+	case path == "/v1/conversations" || strings.HasPrefix(path, "/v1/conversations/"):
+		return "conversations"
+	default:
+		return ""
+	}
+}
+
+func (s *Server) authorizeRequestPolicy(request *http.Request, principal access.Principal, operation string) error {
+	policy := principal.APIKeyPolicy
+	if policy.AllowedOperations != nil && !contains(*policy.AllowedOperations, operation) {
+		return fmt.Errorf("Gateway API Key does not allow operation %q", operation)
+	}
+	region := s.homeRegion(request)
+	if policy.AllowedRegions != nil && !contains(*policy.AllowedRegions, region) {
+		return fmt.Errorf("Gateway API Key does not allow region %q", region)
+	}
+	if policy.AllowedCIDRs != nil {
+		address, ok := clientAddress(request, s.trustedProxies)
+		if !ok || !addressAllowed(address, *policy.AllowedCIDRs) {
+			return errors.New("Gateway API Key does not allow the trusted client address")
+		}
+	}
+	return nil
+}
+
+func (s *Server) authorizeModel(request *http.Request, model string) error {
+	allowed := authenticatedPrincipal(request).APIKeyPolicy.AllowedPublicModels
+	if allowed != nil && !contains(*allowed, model) {
+		return fmt.Errorf("Gateway API Key does not allow public model %q", model)
+	}
+	return nil
+}
+
+func contains(values []string, wanted string) bool {
+	return slices.Contains(values, wanted)
+}
+
+func clientAddress(request *http.Request, trusted []netip.Prefix) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		host = request.RemoteAddr
+	}
+	remote, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	if !addressInPrefixes(remote, trusted) {
+		return remote.Unmap(), true
+	}
+	forwarded := strings.Split(request.Header.Get("X-Forwarded-For"), ",")
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		address, err := netip.ParseAddr(strings.TrimSpace(forwarded[index]))
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		address = address.Unmap()
+		if !addressInPrefixes(address, trusted) {
+			return address, true
+		}
+		remote = address
+	}
+	return remote.Unmap(), true
+}
+
+func addressAllowed(address netip.Addr, values []string) bool {
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(value)
+		if err == nil && prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func addressInPrefixes(address netip.Addr, prefixes []netip.Prefix) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) acquireAPIKeyConcurrency(request *http.Request, principal access.Principal, operation string) (*http.Request, func(), error) {
+	limit := principal.APIKeyPolicy.MaxConcurrentResponses
+	if limit == nil || request.Method != http.MethodPost ||
+		(operation != "responses" && operation != "chat_completions" && operation != "embeddings" && operation != "moderation" && operation != "rerank") {
+		return request, func() {}, nil
+	}
+	if principal.APIKeyID == "" || *limit <= 0 {
+		return nil, nil, errAPIKeyConcurrencyDenied
+	}
+	if quotas, ok := s.authenticator.(APIKeyConcurrencyStore); ok {
+		leaseBytes := make([]byte, 16)
+		if _, err := rand.Read(leaseBytes); err != nil {
+			return nil, nil, fmt.Errorf("create Gateway API Key concurrency lease: %w", err)
+		}
+		leaseID := "key_quota_" + hex.EncodeToString(leaseBytes)
+		const leaseTTL = 30 * time.Second
+		const renewInterval = 10 * time.Second
+		if err := quotas.AcquireAPIKeyResponseSlot(request.Context(), principal.APIKeyID, leaseID, *limit, time.Now().UTC().Add(leaseTTL)); err != nil {
+			return nil, nil, err
+		}
+		leaseContext, cancelLease := context.WithCancel(request.Context())
+		go func() {
+			ticker := time.NewTicker(renewInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-leaseContext.Done():
+					return
+				case <-ticker.C:
+					renewContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					err := quotas.RenewAPIKeyResponseSlot(renewContext, principal.APIKeyID, leaseID, time.Now().UTC().Add(leaseTTL))
+					cancel()
+					if err != nil {
+						cancelLease()
+						return
+					}
+				}
+			}
+		}()
+		return request.WithContext(leaseContext), func() {
+			cancelLease()
+			releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = quotas.ReleaseAPIKeyResponseSlot(releaseContext, principal.APIKeyID, leaseID)
+		}, nil
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	if s.apiKeyInflight[principal.APIKeyID] >= *limit {
+		return nil, nil, store.ErrQuotaExceeded
+	}
+	s.apiKeyInflight[principal.APIKeyID]++
+	return request, func() {
+		s.inflightMu.Lock()
+		defer s.inflightMu.Unlock()
+		if s.apiKeyInflight[principal.APIKeyID] <= 1 {
+			delete(s.apiKeyInflight, principal.APIKeyID)
+			return
+		}
+		s.apiKeyInflight[principal.APIKeyID]--
+	}, nil
 }
 
 func bearerToken(value string) (string, error) {
@@ -616,6 +852,10 @@ func (s *Server) createResponse(responseWriter http.ResponseWriter, request *htt
 	}
 	if payload.Model == "" {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model is required", "model")
+		return
+	}
+	if err := s.authorizeModel(request, payload.Model); err != nil {
+		writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "model")
 		return
 	}
 	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {
@@ -965,6 +1205,10 @@ func (s *Server) chatCompletions(responseWriter http.ResponseWriter, request *ht
 	}
 	if payload.Model == "" || len(payload.Messages) == 0 {
 		writeError(responseWriter, http.StatusBadRequest, "invalid_request_error", "model and messages are required", "")
+		return
+	}
+	if err := s.authorizeModel(request, payload.Model); err != nil {
+		writeError(responseWriter, http.StatusForbidden, "policy_denied", err.Error(), "model")
 		return
 	}
 	if err := validateCompatibilityMode(payload.CompatibilityMode); err != nil {

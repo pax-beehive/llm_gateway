@@ -98,6 +98,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Gateway Credential Administration: %w", err)
 	}
+	go runGatewayAPIKeyGraceReconciler(ctx, credentials)
 	api := controlapi.New(controlapi.Config{Administration: administration, Credentials: credentials, Verifier: verifier})
 	mux := http.NewServeMux()
 	mux.Handle("/", api)
@@ -122,6 +123,35 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
+	}
+}
+
+func runGatewayAPIKeyGraceReconciler(ctx context.Context, credentials *credentialadmin.Service) {
+	run := func() {
+		for {
+			count, err := credentials.ReconcileExpiredGrace(ctx, 100)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Warn("Gateway API Key grace reconciliation degraded", "error", err)
+				}
+				return
+			}
+			if count == 0 {
+				return
+			}
+			slog.Info("Gateway API Key grace predecessors revoked", "count", count)
+		}
+	}
+	run()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
 	}
 }
 
