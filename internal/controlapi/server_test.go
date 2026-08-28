@@ -223,6 +223,16 @@ func TestProviderConnectionSensitiveMutationsNeverEchoSecrets(t *testing.T) {
 		bytes.Contains(rotationResponse.Body.Bytes(), []byte("rotated-secret")) {
 		t.Fatalf("rotation status/headers/body = %d/%#v/%s", rotationResponse.Code, rotationResponse.Header(), rotationResponse.Body.String())
 	}
+	callerAuthorized := httptest.NewRequest(http.MethodPost, "/control/v1/provider-connections/pc-openai/probes", jsonBody(t, map[string]any{
+		"expected_revision": 1, "live_authorized": true, "reason": "caller assertion must not authorize live work",
+	}))
+	callerAuthorized.Header.Set("Authorization", "Bearer valid")
+	callerAuthorized.Header.Set("Idempotency-Key", "probe-provider")
+	callerAuthorizedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(callerAuthorizedResponse, callerAuthorized)
+	if callerAuthorizedResponse.Code != http.StatusBadRequest {
+		t.Fatalf("caller live authorization status/body = %d/%s", callerAuthorizedResponse.Code, callerAuthorizedResponse.Body.String())
+	}
 }
 
 type fakeAdministration struct {

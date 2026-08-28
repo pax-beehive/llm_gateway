@@ -99,7 +99,14 @@ const (
 	OperationRunning   OperationStatus = "running"
 	OperationSucceeded OperationStatus = "succeeded"
 	OperationFailed    OperationStatus = "failed"
+	OperationUncertain OperationStatus = "uncertain"
 )
+
+type OperationAuthorization struct {
+	Source              string
+	MaxProviderRequests int
+	MaxSpendMicros      int64
+}
 
 type Operation struct {
 	ID                   string          `json:"id"`
@@ -121,7 +128,10 @@ type Operation struct {
 	Scopes               []string        `json:"-"`
 	RequestID            string          `json:"-"`
 	Reason               string          `json:"-"`
-	LiveAuthorized       bool            `json:"-"`
+	AuthorizationSource  string          `json:"-"`
+	MaxProviderRequests  int             `json:"-"`
+	MaxSpendMicros       int64           `json:"-"`
+	RetrySafe            bool            `json:"-"`
 }
 
 type OperationResult struct {
@@ -132,7 +142,6 @@ type OperationResult struct {
 type OperationCommand struct {
 	ConnectionID     string
 	ExpectedRevision int64
-	LiveAuthorized   bool
 }
 
 type RotationCommand struct {
@@ -144,6 +153,7 @@ type RotationCommand struct {
 type ProbeResult struct {
 	ObservedModelCount int
 	RawResponseHash    string
+	ProviderRequests   int
 }
 
 type ObservedModel struct {
@@ -153,8 +163,9 @@ type ObservedModel struct {
 }
 
 type DiscoveryResult struct {
-	Models          []ObservedModel
-	RawResponseHash string
+	Models           []ObservedModel
+	RawResponseHash  string
+	ProviderRequests int
 }
 
 type OperationError struct {

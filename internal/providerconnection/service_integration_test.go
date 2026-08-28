@@ -50,7 +50,7 @@ func TestRegisterProviderConnectionStoresOnlySecretReferenceAndEmitsEvidence(t *
 		RequestID: "request-register-provider", Reason: "configure upstream account",
 	}
 	result, err := service.Register(ctx, actor, "register-"+id, providerconnection.RegisterCommand{
-		ID: id, Provider: "openai", DisplayName: "OpenAI production", BaseURL: "https://api.openai.test/v1",
+		ID: id, Provider: "openai", DisplayName: "OpenAI production", BaseURL: "https://api.openai.com/v1",
 		Region: "us-west1", CredentialScope: "organization-a", Secret: []byte("provider-secret-material"),
 		CapabilityDeclaration: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{"text": provider.CapabilityNative}},
 	})
@@ -62,7 +62,7 @@ func TestRegisterProviderConnectionStoresOnlySecretReferenceAndEmitsEvidence(t *
 		t.Fatalf("registered connection = %#v", result)
 	}
 	replayed, err := service.Register(ctx, actor, "register-"+id, providerconnection.RegisterCommand{
-		ID: id, Provider: "openai", DisplayName: "OpenAI production", BaseURL: "https://api.openai.test/v1",
+		ID: id, Provider: "openai", DisplayName: "OpenAI production", BaseURL: "https://api.openai.com/v1",
 		Region: "us-west1", CredentialScope: "organization-a", Secret: []byte("provider-secret-material"),
 		CapabilityDeclaration: provider.CapabilityProfile{Revision: 1, Features: map[string]provider.CapabilitySupport{"text": provider.CapabilityNative}},
 	})
@@ -112,7 +112,7 @@ func TestProviderConnectionQueriesUpdatesAndLifecycleUseStablePaginationAndCAS(t
 	for _, suffix := range []string{"a", "b", "c"} {
 		if _, err := service.Register(ctx, actor, "register-"+prefix+suffix, providerconnection.RegisterCommand{
 			ID: prefix + "-" + suffix, Provider: "anthropic", DisplayName: "Anthropic " + suffix,
-			BaseURL: "https://api.anthropic.test/v1", Region: prefix, CredentialScope: "scope-" + suffix,
+			BaseURL: "https://api.anthropic.com/v1", Region: prefix, CredentialScope: "scope-" + suffix,
 			Secret: []byte("provider-secret-" + suffix), CapabilityDeclaration: nativeTextProfile(1),
 		}); err != nil {
 			t.Fatal(err)
@@ -168,13 +168,16 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 	db, ctx := providerConnectionDatabase(t)
 	custody := secretcustody.NewMemory()
 	operator := &fakeProviderOperator{
-		probe: providerconnection.ProbeResult{ObservedModelCount: 2, RawResponseHash: strings.Repeat("a", 64)},
+		probe: providerconnection.ProbeResult{ObservedModelCount: 2, RawResponseHash: strings.Repeat("a", 64), ProviderRequests: 1},
 		discovery: providerconnection.DiscoveryResult{
-			Models:          []providerconnection.ObservedModel{{ID: "gpt-test", OwnedBy: "provider"}, {ID: "gpt-test-mini", OwnedBy: "provider"}},
-			RawResponseHash: strings.Repeat("b", 64),
+			Models:           []providerconnection.ObservedModel{{ID: "gpt-test", OwnedBy: "provider"}, {ID: "gpt-test-mini", OwnedBy: "provider"}},
+			RawResponseHash:  strings.Repeat("b", 64),
+			ProviderRequests: 1,
 		},
 	}
-	service, err := providerconnection.NewService(db, custody, operator, time.Now, nil)
+	service, err := providerconnection.NewService(db, custody, operator, time.Now, nil, providerconnection.StaticLiveOperationPolicy{
+		Source: "integration-test-authorization", ProbeMaxRequests: 1, DiscoveryMaxRequests: 10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,20 +187,24 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 		RequestID: "request-provider-operations", Reason: "verify upstream account",
 	}
 	registered, err := service.Register(ctx, actor, "register-"+id, providerconnection.RegisterCommand{
-		ID: id, Provider: "openai", DisplayName: "OpenAI operations", BaseURL: "https://api.openai.test/v1",
+		ID: id, Provider: "openai", DisplayName: "OpenAI operations", BaseURL: "https://api.openai.com/v1",
 		Region: "us-west1", CredentialScope: "operations", Secret: []byte("initial-provider-secret"),
 		CapabilityDeclaration: nativeTextProfile(1),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.RequestProbe(ctx, actor, "unauthorized-probe-"+id, providerconnection.OperationCommand{
+	deniedService, err := providerconnection.NewService(db, custody, operator, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deniedService.RequestProbe(ctx, actor, "unauthorized-probe-"+id, providerconnection.OperationCommand{
 		ConnectionID: id, ExpectedRevision: 1,
 	}); !errors.Is(err, providerconnection.ErrPolicyDenied) {
 		t.Fatalf("unauthorized live probe error = %v", err)
 	}
 	probe, err := service.RequestProbe(ctx, actor, "probe-"+id, providerconnection.OperationCommand{
-		ConnectionID: id, ExpectedRevision: registered.Connection.Revision, LiveAuthorized: true,
+		ConnectionID: id, ExpectedRevision: registered.Connection.Revision,
 	})
 	if err != nil || probe.Operation.Status != providerconnection.OperationQueued || probe.Operation.PendingSecretRef != "" {
 		t.Fatalf("queued probe = %#v err=%v", probe, err)
@@ -210,7 +217,7 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 		t.Fatalf("completed probe = %#v err=%v", completedProbe, err)
 	}
 	replayedProbe, err := service.RequestProbe(ctx, actor, "probe-"+id, providerconnection.OperationCommand{
-		ConnectionID: id, ExpectedRevision: registered.Connection.Revision, LiveAuthorized: true,
+		ConnectionID: id, ExpectedRevision: registered.Connection.Revision,
 	})
 	if err != nil || !replayedProbe.Replay || replayedProbe.Operation.Status != providerconnection.OperationSucceeded {
 		t.Fatalf("replayed completed probe = %#v err=%v", replayedProbe, err)
@@ -220,7 +227,7 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 		t.Fatalf("probe changed administrative state = %#v err=%v", unchanged, err)
 	}
 	discovery, err := service.RequestDiscovery(ctx, actor, "discover-"+id, providerconnection.OperationCommand{
-		ConnectionID: id, ExpectedRevision: unchanged.Revision, LiveAuthorized: true,
+		ConnectionID: id, ExpectedRevision: unchanged.Revision,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,13 +274,17 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := service.ResolveExecutionCredential(ctx, enabled.Connection.ID)
+	resolver, err := providerconnection.NewGatewayResolver(db, custody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolver.Resolve(ctx, enabled.Connection.ID)
 	if err != nil || string(resolved.Secret) != string(rotationSecret) || resolved.Connection.SecretRef != "" {
 		t.Fatalf("resolved execution credential = %#v err=%v", resolved, err)
 	}
 	operator.probeErr = fmt.Errorf("provider reflected secret %s", rotationSecret)
 	failingProbe, err := service.RequestProbe(ctx, actor, "failing-probe-"+id, providerconnection.OperationCommand{
-		ConnectionID: id, ExpectedRevision: enabled.Connection.Revision, LiveAuthorized: true,
+		ConnectionID: id, ExpectedRevision: enabled.Connection.Revision,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -298,14 +309,14 @@ type fakeProviderOperator struct {
 	discoverErr error
 }
 
-func (operator *fakeProviderOperator) Probe(_ context.Context, _ providerconnection.ProviderConnection, secret []byte) (providerconnection.ProbeResult, error) {
+func (operator *fakeProviderOperator) Probe(_ context.Context, _ providerconnection.ProviderConnection, secret []byte, _ int) (providerconnection.ProbeResult, error) {
 	if len(secret) == 0 {
 		return providerconnection.ProbeResult{}, errors.New("missing secret")
 	}
 	return operator.probe, operator.probeErr
 }
 
-func (operator *fakeProviderOperator) Discover(_ context.Context, _ providerconnection.ProviderConnection, secret []byte) (providerconnection.DiscoveryResult, error) {
+func (operator *fakeProviderOperator) Discover(_ context.Context, _ providerconnection.ProviderConnection, secret []byte, _ int) (providerconnection.DiscoveryResult, error) {
 	if len(secret) == 0 {
 		return providerconnection.DiscoveryResult{}, errors.New("missing secret")
 	}

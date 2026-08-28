@@ -127,7 +127,11 @@ func run() error {
 	if devMode {
 		providerOperator = providerconnection.NewDeterministicOperator()
 	}
-	providerConnections, err := providerconnection.NewService(database, secretStore, providerOperator, time.Now, nil)
+	providerPolicies, err := configureProviderLiveOperationPolicy(devMode)
+	if err != nil {
+		return err
+	}
+	providerConnections, err := providerconnection.NewService(database, secretStore, providerOperator, time.Now, nil, providerPolicies...)
 	if err != nil {
 		return fmt.Errorf("configure Provider Connection Registry: %w", err)
 	}
@@ -161,6 +165,29 @@ func run() error {
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	}
+}
+
+func configureProviderLiveOperationPolicy(devMode bool) ([]providerconnection.LiveOperationPolicy, error) {
+	if devMode {
+		return []providerconnection.LiveOperationPolicy{providerconnection.StaticLiveOperationPolicy{
+			Source: "offline-deterministic-development", ProbeMaxRequests: 1, DiscoveryMaxRequests: 100,
+		}}, nil
+	}
+	mode := strings.TrimSpace(os.Getenv("CONTROL_PROVIDER_LIVE_OPERATIONS"))
+	if mode == "" || mode == "disabled" {
+		return nil, nil
+	}
+	if mode != "explicitly-authorized" {
+		return nil, errors.New("CONTROL_PROVIDER_LIVE_OPERATIONS must be disabled or explicitly-authorized")
+	}
+	source := strings.TrimSpace(os.Getenv("CONTROL_PROVIDER_LIVE_AUTHORIZATION_ID"))
+	maxRequests, err := strconv.Atoi(os.Getenv("CONTROL_PROVIDER_DISCOVERY_MAX_REQUESTS"))
+	if source == "" || err != nil || maxRequests < 1 || maxRequests > 100 {
+		return nil, errors.New("authorized live Provider operations require CONTROL_PROVIDER_LIVE_AUTHORIZATION_ID and CONTROL_PROVIDER_DISCOVERY_MAX_REQUESTS=1..100")
+	}
+	return []providerconnection.LiveOperationPolicy{providerconnection.StaticLiveOperationPolicy{
+		Source: source, ProbeMaxRequests: 1, DiscoveryMaxRequests: maxRequests,
+	}}, nil
 }
 
 func configureSecretCustody(devMode bool) (secretcustody.Store, error) {

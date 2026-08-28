@@ -3,7 +3,6 @@ package providerconnection
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -26,17 +25,19 @@ var safeErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 var rawResponseHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 func (service *Service) RequestProbe(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command OperationCommand) (OperationResult, error) {
-	if !command.LiveAuthorized {
-		return OperationResult{}, ErrPolicyDenied
+	authorization, err := service.livePolicy.Authorize(ctx, actor, OperationProbe)
+	if err != nil {
+		return OperationResult{}, err
 	}
-	return service.enqueueOperation(ctx, actor, idempotencyKey, command, OperationProbe, probeRequestOperation, secretcustody.Reference{})
+	return service.enqueueOperation(ctx, actor, idempotencyKey, command, OperationProbe, probeRequestOperation, secretcustody.Reference{}, authorization)
 }
 
 func (service *Service) RequestDiscovery(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command OperationCommand) (OperationResult, error) {
-	if !command.LiveAuthorized {
-		return OperationResult{}, ErrPolicyDenied
+	authorization, err := service.livePolicy.Authorize(ctx, actor, OperationModelDiscovery)
+	if err != nil {
+		return OperationResult{}, err
 	}
-	return service.enqueueOperation(ctx, actor, idempotencyKey, command, OperationModelDiscovery, discoveryRequestOperation, secretcustody.Reference{})
+	return service.enqueueOperation(ctx, actor, idempotencyKey, command, OperationModelDiscovery, discoveryRequestOperation, secretcustody.Reference{}, authorization)
 }
 
 func (service *Service) RequestRotation(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command RotationCommand) (OperationResult, error) {
@@ -47,12 +48,10 @@ func (service *Service) RequestRotation(ctx context.Context, actor tenantadmin.A
 		command.ExpectedRevision <= 0 || len(command.Secret) == 0 || len(command.Secret) > 64<<10 {
 		return OperationResult{}, ErrInvalidArgument
 	}
-	secretDigest := sha256.Sum256(command.Secret)
 	hash, err := hashCommand(struct {
 		ConnectionID     string
 		ExpectedRevision int64
-		SecretDigest     []byte
-	}{command.ConnectionID, command.ExpectedRevision, secretDigest[:]}, actor.Reason)
+	}{command.ConnectionID, command.ExpectedRevision}, actor.Reason)
 	if err != nil {
 		return OperationResult{}, err
 	}
@@ -64,12 +63,17 @@ func (service *Service) RequestRotation(ctx context.Context, actor tenantadmin.A
 	if err != nil {
 		return OperationResult{}, fmt.Errorf("store rotated Provider credential: %w", err)
 	}
+	if err := validateSecretReference(reference); err != nil {
+		return OperationResult{}, err
+	}
 	return service.enqueueOperationWithHash(ctx, actor, idempotencyKey, OperationCommand{
 		ConnectionID: command.ConnectionID, ExpectedRevision: command.ExpectedRevision,
-	}, OperationCredentialRotation, rotationRequestOperation, reference, hash)
+	}, OperationCredentialRotation, rotationRequestOperation, reference, OperationAuthorization{
+		Source: "secret-custody-idempotent-write", MaxProviderRequests: 0, MaxSpendMicros: 0,
+	}, hash)
 }
 
-func (service *Service) enqueueOperation(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command OperationCommand, operationType OperationType, operationName string, reference secretcustody.Reference) (OperationResult, error) {
+func (service *Service) enqueueOperation(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command OperationCommand, operationType OperationType, operationName string, reference secretcustody.Reference, authorization OperationAuthorization) (OperationResult, error) {
 	if err := authorizeMutation(actor); err != nil {
 		return OperationResult{}, err
 	}
@@ -83,10 +87,13 @@ func (service *Service) enqueueOperation(ctx context.Context, actor tenantadmin.
 	if err != nil {
 		return OperationResult{}, err
 	}
-	return service.enqueueOperationWithHash(ctx, actor, idempotencyKey, command, operationType, operationName, reference, hash)
+	return service.enqueueOperationWithHash(ctx, actor, idempotencyKey, command, operationType, operationName, reference, authorization, hash)
 }
 
-func (service *Service) enqueueOperationWithHash(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command OperationCommand, operationType OperationType, operationName string, reference secretcustody.Reference, requestHash []byte) (OperationResult, error) {
+func (service *Service) enqueueOperationWithHash(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command OperationCommand, operationType OperationType, operationName string, reference secretcustody.Reference, authorization OperationAuthorization, requestHash []byte) (OperationResult, error) {
+	if strings.TrimSpace(authorization.Source) == "" || authorization.MaxProviderRequests < 0 || authorization.MaxProviderRequests > 100 || authorization.MaxSpendMicros != 0 {
+		return OperationResult{}, ErrPolicyDenied
+	}
 	transaction, replay, err := service.beginOperationCommand(ctx, actor, operationName, idempotencyKey, requestHash)
 	if err != nil || replay != nil {
 		if replay != nil {
@@ -110,12 +117,14 @@ func (service *Service) enqueueOperationWithHash(ctx context.Context, actor tena
 	now := service.now().UTC()
 	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO provider_operations (
-			id, operation_type, connection_id, expected_revision, status, live_authorized,
+			id, operation_type, connection_id, expected_revision, status, authorization_source,
+			max_provider_requests, max_spend_micros, retry_safe,
 			pending_secret_ref, pending_secret_version, actor_type, actor_id, acting_tenant_id,
 			scopes, request_id, reason, created_at
-		) VALUES ($1,$2,$3,$4,'queued',$5,NULLIF($6,''),NULLIF($7,''),$8,$9,NULLIF($10,''),$11,$12,$13,$14)`,
-		operationID, operationType, command.ConnectionID, command.ExpectedRevision, command.LiveAuthorized,
-		reference.Name, reference.Version, actor.Type, actor.ID, actor.ActingTenantID, actor.Scopes, actor.RequestID, actor.Reason, now); err != nil {
+		) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,true,NULLIF($8,''),NULLIF($9,''),$10,$11,NULLIF($12,''),$13,$14,$15,$16)`,
+		operationID, operationType, command.ConnectionID, command.ExpectedRevision, authorization.Source,
+		authorization.MaxProviderRequests, authorization.MaxSpendMicros, reference.Name, reference.Version,
+		actor.Type, actor.ID, actor.ActingTenantID, actor.Scopes, actor.RequestID, actor.Reason, now); err != nil {
 		return OperationResult{}, err
 	}
 	operation, err := getOperationTx(ctx, transaction, operationID)
@@ -198,6 +207,16 @@ func (service *Service) RunNext(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if operation.Status == OperationRunning && !operation.RetrySafe {
+		now := claimTime
+		payload, _ := json.Marshal(map[string]any{})
+		if _, err := transaction.ExecContext(ctx, `UPDATE provider_operations SET status='uncertain',result=$2,
+			error_code='ambiguous_completion',error_message='Provider operation completion is uncertain',
+			completed_at=$3,lease_expires_at=NULL WHERE id=$1 AND status='running'`, operation.ID, payload, now); err != nil {
+			return false, err
+		}
+		return true, transaction.Commit()
+	}
 	now := claimTime
 	if _, err := transaction.ExecContext(ctx, `UPDATE provider_operations SET status='running',
 		started_at=COALESCE(started_at,$2), attempts=attempts+1, lease_expires_at=$3 WHERE id=$1`,
@@ -233,11 +252,11 @@ func (service *Service) executeProbe(ctx context.Context, operation Operation) e
 	if service.operator == nil {
 		return service.finishFailure(ctx, operation, "adapter_unavailable", true)
 	}
-	result, err := service.operator.Probe(ctx, connection, secret)
+	result, err := service.operator.Probe(ctx, connection, secret, operation.MaxProviderRequests)
 	if err != nil {
 		return service.finishFailure(ctx, operation, classifyOperationError(err), true)
 	}
-	if result.ObservedModelCount < 0 || !rawResponseHashPattern.MatchString(result.RawResponseHash) {
+	if result.ObservedModelCount < 0 || result.ProviderRequests < 1 || result.ProviderRequests > operation.MaxProviderRequests || !rawResponseHashPattern.MatchString(result.RawResponseHash) {
 		return service.finishFailure(ctx, operation, "invalid_provider_response", true)
 	}
 	latency := service.operationLatency(operation)
@@ -255,11 +274,11 @@ func (service *Service) executeDiscovery(ctx context.Context, operation Operatio
 	if service.operator == nil {
 		return service.finishFailure(ctx, operation, "adapter_unavailable", false)
 	}
-	result, err := service.operator.Discover(ctx, connection, secret)
+	result, err := service.operator.Discover(ctx, connection, secret, operation.MaxProviderRequests)
 	if err != nil {
 		return service.finishFailure(ctx, operation, classifyOperationError(err), false)
 	}
-	if len(result.Models) > 10_000 || !rawResponseHashPattern.MatchString(result.RawResponseHash) {
+	if len(result.Models) > 10_000 || result.ProviderRequests < 1 || result.ProviderRequests > operation.MaxProviderRequests || !rawResponseHashPattern.MatchString(result.RawResponseHash) {
 		return service.finishFailure(ctx, operation, "invalid_provider_response", false)
 	}
 	seen := make(map[string]struct{}, len(result.Models))
@@ -290,6 +309,9 @@ func (service *Service) operationCredential(ctx context.Context, operation Opera
 	if connection.Revision != operation.ExpectedRevision {
 		return ProviderConnection{}, nil, ErrRevisionConflict
 	}
+	if err := validateBaseURL(connection.Provider, connection.BaseURL); err != nil {
+		return ProviderConnection{}, nil, ErrPolicyDenied
+	}
 	secret, err := service.custody.Access(ctx, secretcustody.Reference{Name: connection.SecretRef, Version: connection.SecretExternalVersion})
 	return publicConnection(connection), secret, err
 }
@@ -312,6 +334,7 @@ func (service *Service) completeProbe(ctx context.Context, operation Operation, 
 	return completeOperationTx(ctx, transaction, operation.ID, OperationSucceeded, map[string]any{
 		"observed_status": "healthy", "observed_model_count": result.ObservedModelCount,
 		"raw_response_hash": result.RawResponseHash, "latency_milliseconds": latency,
+		"provider_requests": result.ProviderRequests,
 	}, "", "", now)
 }
 
@@ -340,6 +363,7 @@ func (service *Service) completeDiscovery(ctx context.Context, operation Operati
 	}
 	return completeOperationTx(ctx, transaction, operation.ID, OperationSucceeded, map[string]any{
 		"model_count": len(result.Models), "raw_response_hash": result.RawResponseHash,
+		"provider_requests": result.ProviderRequests,
 	}, "", "", now)
 }
 
@@ -459,7 +483,11 @@ func (service *Service) recordOperationRequestAudit(ctx context.Context, transac
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(map[string]any{"operation_id": operation.ID, "connection_id": operation.ConnectionID, "operation_type": operation.Type})
+	payload, _ := json.Marshal(map[string]any{
+		"operation_id": operation.ID, "connection_id": operation.ConnectionID, "operation_type": operation.Type,
+		"authorization_source": operation.AuthorizationSource, "max_provider_requests": operation.MaxProviderRequests,
+		"max_spend_micros": operation.MaxSpendMicros, "retry_safe": operation.RetrySafe,
+	})
 	_, err = transaction.ExecContext(ctx, `INSERT INTO control_audit_events (
 		event_id,tenant_id,actor_type,actor_id,acting_tenant_id,scopes,request_id,reason,action,
 		aggregate_type,aggregate_id,aggregate_revision,payload,occurred_at
@@ -497,24 +525,6 @@ func (service *Service) recordDiscoveryEvidence(ctx context.Context, transaction
 	return err
 }
 
-func (service *Service) ResolveExecutionCredential(ctx context.Context, connectionID string) (ResolvedConnection, error) {
-	if !resourceIDPattern.MatchString(connectionID) {
-		return ResolvedConnection{}, ErrInvalidArgument
-	}
-	connection, err := scanConnection(service.database.QueryRowContext(ctx, connectionSelect+` WHERE id=$1`, connectionID))
-	if err != nil {
-		return ResolvedConnection{}, err
-	}
-	if connection.AdministrativeStatus != StatusEnabled {
-		return ResolvedConnection{}, ErrPolicyDenied
-	}
-	secret, err := service.custody.Access(ctx, secretcustody.Reference{Name: connection.SecretRef, Version: connection.SecretExternalVersion})
-	if err != nil {
-		return ResolvedConnection{}, err
-	}
-	return ResolvedConnection{Connection: publicConnection(connection), Secret: secret}, nil
-}
-
 func (service *Service) operationLatency(operation Operation) int64 {
 	started := operation.CreatedAt
 	if operation.StartedAt != nil {
@@ -548,7 +558,8 @@ func operationActor(operation Operation) tenantadmin.ActorEnvelope {
 	}
 }
 
-const operationSelect = `SELECT id,operation_type,connection_id,expected_revision,status,live_authorized,
+const operationSelect = `SELECT id,operation_type,connection_id,expected_revision,status,authorization_source,
+	max_provider_requests,max_spend_micros,retry_safe,
 	COALESCE(pending_secret_ref,''),COALESCE(pending_secret_version,''),actor_type,actor_id,
 	COALESCE(acting_tenant_id,''),to_json(scopes),request_id,reason,result,COALESCE(error_code,''),
 	COALESCE(error_message,''),created_at,started_at,completed_at FROM provider_operations`
@@ -561,7 +572,8 @@ func scanOperation(source scanner) (Operation, error) {
 	var operation Operation
 	var result, scopes []byte
 	err := source.Scan(&operation.ID, &operation.Type, &operation.ConnectionID, &operation.ExpectedRevision,
-		&operation.Status, &operation.LiveAuthorized, &operation.PendingSecretRef, &operation.PendingSecretVersion,
+		&operation.Status, &operation.AuthorizationSource, &operation.MaxProviderRequests, &operation.MaxSpendMicros,
+		&operation.RetrySafe, &operation.PendingSecretRef, &operation.PendingSecretVersion,
 		&operation.ActorType, &operation.ActorID, &operation.ActingTenantID, &scopes,
 		&operation.RequestID, &operation.Reason, &result, &operation.ErrorCode, &operation.ErrorMessage,
 		&operation.CreatedAt, &operation.StartedAt, &operation.CompletedAt)
@@ -589,6 +601,9 @@ func publicOperation(operation Operation) Operation {
 	operation.Scopes = nil
 	operation.RequestID = ""
 	operation.Reason = ""
-	operation.LiveAuthorized = false
+	operation.AuthorizationSource = ""
+	operation.MaxProviderRequests = 0
+	operation.MaxSpendMicros = 0
+	operation.RetrySafe = false
 	return operation
 }

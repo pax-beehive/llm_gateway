@@ -54,7 +54,8 @@ func TestGCPSecretManagerStoresAndAccessesVersionWithoutLeakingErrorBodies(t *te
 			if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/versions/7:access") {
 				t.Fatalf("access request = %s %s", request.Method, request.URL.String())
 			}
-			return response(request, http.StatusOK, `{"payload":{"data":"`+base64.StdEncoding.EncodeToString(material)+`"}}`), nil
+			secretName := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/v1/"), "/versions/7:access")
+			return response(request, http.StatusOK, `{"name":"`+secretName+`/versions/7","payload":{"data":"`+base64.StdEncoding.EncodeToString(material)+`"}}`), nil
 		default:
 			t.Fatalf("unexpected request %s", request.URL.String())
 			return nil, nil
@@ -74,6 +75,33 @@ func TestGCPSecretManagerStoresAndAccessesVersionWithoutLeakingErrorBodies(t *te
 	got, err := store.Access(context.Background(), reference)
 	if err != nil || string(got) != string(material) {
 		t.Fatalf("accessed material = %q err=%v", got, err)
+	}
+}
+
+func TestGCPSecretManagerIdempotentPutReturnsExactVersion(t *testing.T) {
+	material := []byte("provider-secret")
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return response(request, http.StatusConflict, `{}`), nil
+		}
+		secretName := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/v1/"), "/versions/latest:access")
+		return response(request, http.StatusOK, `{"name":"`+secretName+`/versions/11","payload":{"data":"`+base64.StdEncoding.EncodeToString(material)+`"}}`), nil
+	})}
+	store, err := secretcustody.NewGCP(secretcustody.GCPConfig{
+		ProjectID: "project-a", Endpoint: "https://secretmanager.test/v1", HTTPClient: client,
+		TokenProvider: staticTokenProvider{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := store.Put(context.Background(), "stable-key", material)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reference.Version != "11" || strings.HasSuffix(reference.Name, "/latest") {
+		t.Fatalf("reference = %#v", reference)
 	}
 }
 

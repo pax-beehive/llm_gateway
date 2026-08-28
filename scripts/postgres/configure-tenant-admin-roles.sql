@@ -25,6 +25,7 @@ SELECT EXISTS (
 		'provider_operations'::regclass,
 		'provider_connection_health'::regclass,
 		'provider_model_observations'::regclass,
+		'gateway_provider_connection_resolutions'::regclass,
         'gateway_access_projection'::regclass,
         'gateway_access_inbox'::regclass,
         'gateway_access_heads'::regclass,
@@ -50,6 +51,7 @@ REVOKE ALL PRIVILEGES ON TABLE
 	provider_operations,
 	provider_connection_health,
 	provider_model_observations,
+	gateway_provider_connection_resolutions,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
@@ -70,6 +72,7 @@ REVOKE ALL PRIVILEGES ON TABLE
 	provider_operations,
 	provider_connection_health,
 	provider_model_observations,
+	gateway_provider_connection_resolutions,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
@@ -115,12 +118,18 @@ GRANT UPDATE (
 	display_name, base_url, region, credential_scope, secret_ref, secret_external_version,
 	credential_version, administrative_status, capability_declaration, revision, updated_at
 ) ON provider_connections TO :"tenant_admin_role";
-GRANT SELECT, INSERT, UPDATE ON TABLE provider_connection_credential_versions TO :"tenant_admin_role";
-GRANT SELECT, INSERT, UPDATE ON TABLE provider_operations TO :"tenant_admin_role";
-GRANT SELECT, INSERT, UPDATE ON TABLE provider_connection_health TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE provider_connection_credential_versions TO :"tenant_admin_role";
+GRANT UPDATE (status, retired_at) ON provider_connection_credential_versions TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE provider_operations TO :"tenant_admin_role";
+GRANT UPDATE (status, result, error_code, error_message, started_at, completed_at, attempts, lease_expires_at)
+ON provider_operations TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE provider_connection_health TO :"tenant_admin_role";
+GRANT UPDATE (observed_status, error_code, operation_id, latency_milliseconds, observed_at)
+ON provider_connection_health TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE provider_model_observations TO :"tenant_admin_role";
 
 GRANT SELECT ON TABLE control_outbox TO :"gateway_role";
+GRANT SELECT ON TABLE gateway_provider_connection_resolutions TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
     gateway_access_projection,
     gateway_access_inbox,

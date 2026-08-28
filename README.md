@@ -119,12 +119,22 @@ Manager through Workload Identity. PostgreSQL stores only the Secret Manager
 reference and non-sensitive credential-version metadata. Production does not
 permit the in-memory custody adapter. Register/update/enable/disable use CAS and
 idempotency; probe, discovery, and credential rotation return `202 Accepted`
-with `/control/v1/provider-operations/{operation_id}`. Probe and discovery
-require `live_authorized: true`; the worker applies a strict timeout and stores
+with `/control/v1/provider-operations/{operation_id}`. Probe and discovery are
+authorized by deployment configuration, never a caller-supplied boolean.
+Production keeps them disabled unless `CONTROL_PROVIDER_LIVE_OPERATIONS=explicitly-authorized`,
+`CONTROL_PROVIDER_LIVE_AUTHORIZATION_ID`, and a bounded
+`CONTROL_PROVIDER_DISCOVERY_MAX_REQUESTS` are configured. The persisted budget
+has a zero-spend ceiling; the worker applies a strict timeout and stores
 only bounded, redacted status. A failed probe updates observed health without
 changing enabled/disabled administrative intent. Discovery records Provider
 inventory observations and their raw-response hash, but never publishes Model
-Routes.
+Routes. Credentials can only be delivered to the exact built-in endpoint for
+the declared Provider identity.
+
+The execution-plane `GatewayResolver` reads only enabled connections through
+`gateway_provider_connection_resolutions` and resolves immutable secret versions
+using Secret Custody workload identity. The Gateway database role has no access
+to Provider Connection management tables.
 
 Repair a specific Tenant after a detected revision gap with a bounded operator
 job that has read access to the authoritative control database and write access

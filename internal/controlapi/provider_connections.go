@@ -185,15 +185,13 @@ func (server *Server) updateProviderConnection(writer http.ResponseWriter, reque
 	writeProviderConnectionMutation(writer, result, err)
 }
 
-type providerConnectionCommandRequest struct {
+type providerConnectionStatusRequest struct {
 	ExpectedRevision int64  `json:"expected_revision"`
-	LiveAuthorized   bool   `json:"live_authorized"`
-	Secret           string `json:"secret"`
 	Reason           string `json:"reason"`
 }
 
 func (server *Server) changeProviderConnectionStatus(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, connectionID string, enable bool) {
-	var input providerConnectionCommandRequest
+	var input providerConnectionStatusRequest
 	if !decodeBody(writer, request, &input) {
 		return
 	}
@@ -222,7 +220,7 @@ func (server *Server) requestProviderDiscovery(writer http.ResponseWriter, reque
 }
 
 func (server *Server) requestProviderOperation(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, connectionID string, operationType providerconnection.OperationType) {
-	var input providerConnectionCommandRequest
+	var input providerConnectionStatusRequest
 	if !decodeBody(writer, request, &input) {
 		return
 	}
@@ -231,7 +229,7 @@ func (server *Server) requestProviderOperation(writer http.ResponseWriter, reque
 		return
 	}
 	actor.Reason = input.Reason
-	command := providerconnection.OperationCommand{ConnectionID: connectionID, ExpectedRevision: revision, LiveAuthorized: input.LiveAuthorized}
+	command := providerconnection.OperationCommand{ConnectionID: connectionID, ExpectedRevision: revision}
 	var result providerconnection.OperationResult
 	var err error
 	if operationType == providerconnection.OperationProbe {
@@ -243,7 +241,11 @@ func (server *Server) requestProviderOperation(writer http.ResponseWriter, reque
 }
 
 func (server *Server) requestProviderRotation(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, connectionID string) {
-	var input providerConnectionCommandRequest
+	var input struct {
+		ExpectedRevision int64  `json:"expected_revision"`
+		Secret           string `json:"secret"`
+		Reason           string `json:"reason"`
+	}
 	if !decodeBody(writer, request, &input) {
 		return
 	}

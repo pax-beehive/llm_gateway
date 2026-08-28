@@ -85,6 +85,27 @@ func TestAnthropicModelDiscoveryPaginates(t *testing.T) {
 	}
 }
 
+func TestAnthropicProbeUsesExactlyOneRequest(t *testing.T) {
+	calls := 0
+	client, err := modeldiscovery.New(modeldiscovery.Config{
+		Provider: modeldiscovery.Anthropic, BaseURL: "https://api.anthropic.test/v1", APIKey: "secret", MaxRequests: 1,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if request.URL.Query().Get("limit") != "1" {
+				t.Fatalf("probe URL = %s", request.URL.String())
+			}
+			return jsonResponse(request, `{"data":[{"id":"claude-haiku"}],"has_more":true,"last_id":"cursor-1"}`), nil
+		})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := client.ProbeObserved(context.Background())
+	if err != nil || calls != 1 || observation.RequestCount != 1 || len(observation.Models) != 1 {
+		t.Fatalf("probe = %#v calls=%d err=%v", observation, calls, err)
+	}
+}
+
 func TestGeminiModelDiscoveryPaginatesAndFiltersGenerationModels(t *testing.T) {
 	t.Parallel()
 

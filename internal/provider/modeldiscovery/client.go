@@ -33,6 +33,7 @@ type Model struct {
 type Observation struct {
 	Models          []Model
 	RawResponseHash string
+	RequestCount    int
 }
 
 type RequestError struct {
@@ -49,17 +50,20 @@ func (err *RequestError) Error() string {
 }
 
 type Config struct {
-	Provider   Provider
-	BaseURL    string
-	APIKey     string
-	HTTPClient *http.Client
+	Provider    Provider
+	BaseURL     string
+	APIKey      string
+	HTTPClient  *http.Client
+	MaxRequests int
 }
 
 type Client struct {
-	provider   Provider
-	baseURL    *url.URL
-	apiKey     string
-	httpClient *http.Client
+	provider     Provider
+	baseURL      *url.URL
+	apiKey       string
+	httpClient   *http.Client
+	maxRequests  int
+	requestCount int
 }
 
 func New(config Config) (*Client, error) {
@@ -84,7 +88,13 @@ func New(config Config) (*Client, error) {
 		client = &clientCopy
 	}
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{provider: config.Provider, baseURL: baseURL, apiKey: config.APIKey, httpClient: client}, nil
+	if config.MaxRequests == 0 {
+		config.MaxRequests = 100
+	}
+	if config.MaxRequests < 0 || config.MaxRequests > 100 {
+		return nil, errors.New("model discovery request budget must be between 1 and 100")
+	}
+	return &Client{provider: config.Provider, baseURL: baseURL, apiKey: config.APIKey, httpClient: client, maxRequests: config.MaxRequests}, nil
 }
 
 func (client *Client) List(ctx context.Context) ([]Model, error) {
@@ -109,7 +119,44 @@ func (client *Client) ListObserved(ctx context.Context) (Observation, error) {
 	if err != nil {
 		return Observation{}, err
 	}
-	return Observation{Models: models, RawResponseHash: hex.EncodeToString(hasher.Sum(nil))}, nil
+	return Observation{Models: models, RawResponseHash: hex.EncodeToString(hasher.Sum(nil)), RequestCount: client.requestCount}, nil
+}
+
+// ProbeObserved performs exactly one authenticated, read-only Provider request.
+// It establishes credential validity and connectivity without walking inventory
+// pagination; full inventory remains ListObserved's responsibility.
+func (client *Client) ProbeObserved(ctx context.Context) (Observation, error) {
+	hasher := sha256.New()
+	var models []Model
+	var err error
+	switch client.provider {
+	case OpenAI, DeepSeek:
+		models, err = client.listOpenAICompatible(ctx, hasher)
+	case Anthropic:
+		var response struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		err = client.get(ctx, "/models", url.Values{"limit": []string{"1"}}, &response, hasher)
+		for _, item := range response.Data {
+			models = append(models, Model{ID: item.ID, OwnedBy: "anthropic"})
+		}
+	case Gemini:
+		var response struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		err = client.get(ctx, "/models", url.Values{"pageSize": []string{"1"}}, &response, hasher)
+		for _, item := range response.Models {
+			models = append(models, Model{ID: strings.TrimPrefix(item.Name, "models/"), OwnedBy: "google"})
+		}
+	}
+	if err != nil {
+		return Observation{}, err
+	}
+	return Observation{Models: uniqueModels(models), RawResponseHash: hex.EncodeToString(hasher.Sum(nil)), RequestCount: client.requestCount}, nil
 }
 
 func (client *Client) listOpenAICompatible(ctx context.Context, observer io.Writer) ([]Model, error) {
@@ -196,6 +243,10 @@ func (client *Client) listGemini(ctx context.Context, observer io.Writer) ([]Mod
 }
 
 func (client *Client) get(ctx context.Context, path string, query url.Values, destination any, observer io.Writer) error {
+	if client.requestCount >= client.maxRequests {
+		return &RequestError{Provider: client.provider, Code: "request_budget_exhausted"}
+	}
+	client.requestCount++
 	endpoint := *client.baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + path
 	endpoint.RawQuery = query.Encode()

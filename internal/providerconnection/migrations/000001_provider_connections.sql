@@ -44,8 +44,11 @@ CREATE TABLE IF NOT EXISTS provider_operations (
     operation_type           text NOT NULL CHECK (operation_type IN ('probe','model_discovery','credential_rotation')),
     connection_id            text NOT NULL REFERENCES provider_connections(id) ON DELETE RESTRICT,
     expected_revision        bigint NOT NULL CHECK (expected_revision > 0),
-    status                   text NOT NULL CHECK (status IN ('queued','running','succeeded','failed')),
-    live_authorized          boolean NOT NULL DEFAULT false,
+    status                   text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','uncertain')),
+    authorization_source     text NOT NULL,
+    max_provider_requests    integer NOT NULL CHECK (max_provider_requests BETWEEN 0 AND 100),
+    max_spend_micros         bigint NOT NULL DEFAULT 0 CHECK (max_spend_micros = 0),
+    retry_safe               boolean NOT NULL DEFAULT false,
     pending_secret_ref       text,
     pending_secret_version   text,
     actor_type               text NOT NULL,
@@ -64,7 +67,22 @@ CREATE TABLE IF NOT EXISTS provider_operations (
 
 ALTER TABLE provider_operations
     ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-    ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+    ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz,
+    ADD COLUMN IF NOT EXISTS authorization_source text NOT NULL DEFAULT 'legacy-denied',
+    ADD COLUMN IF NOT EXISTS max_provider_requests integer NOT NULL DEFAULT 0 CHECK (max_provider_requests BETWEEN 0 AND 100),
+    ADD COLUMN IF NOT EXISTS max_spend_micros bigint NOT NULL DEFAULT 0 CHECK (max_spend_micros = 0),
+    ADD COLUMN IF NOT EXISTS retry_safe boolean NOT NULL DEFAULT false;
+
+ALTER TABLE provider_operations DROP CONSTRAINT IF EXISTS provider_operations_status_check;
+ALTER TABLE provider_operations ADD CONSTRAINT provider_operations_status_check
+    CHECK (status IN ('queued','running','succeeded','failed','uncertain'));
+
+ALTER TABLE provider_connections DROP CONSTRAINT IF EXISTS provider_connections_immutable_secret_ref;
+ALTER TABLE provider_connections ADD CONSTRAINT provider_connections_immutable_secret_ref
+    CHECK (secret_external_version <> 'latest' AND secret_ref !~ '/versions/latest$');
+ALTER TABLE provider_connection_credential_versions DROP CONSTRAINT IF EXISTS provider_connection_versions_immutable_secret_ref;
+ALTER TABLE provider_connection_credential_versions ADD CONSTRAINT provider_connection_versions_immutable_secret_ref
+    CHECK (secret_external_version <> 'latest' AND secret_ref !~ '/versions/latest$');
 
 DROP INDEX IF EXISTS provider_operations_queue_idx;
 CREATE INDEX provider_operations_queue_idx
@@ -92,3 +110,10 @@ CREATE TABLE IF NOT EXISTS provider_model_observations (
 
 CREATE INDEX IF NOT EXISTS provider_model_observations_connection_time_idx
     ON provider_model_observations (connection_id, observed_at, provider_model_id);
+
+CREATE OR REPLACE VIEW gateway_provider_connection_resolutions
+WITH (security_barrier = true) AS
+SELECT id, provider, base_url, region, credential_scope, capability_declaration,
+       revision, credential_version, secret_ref, secret_external_version
+FROM provider_connections
+WHERE administrative_status = 'enabled';

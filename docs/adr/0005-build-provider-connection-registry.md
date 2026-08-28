@@ -13,13 +13,23 @@ operators; production requires GCP Secret Manager through Workload Identity.
 Registration, profile changes, enable/disable, and completed rotation are
 CAS-protected, idempotent, audited, and published through the transactional
 outbox. Probe, discovery, and rotation requests return durable operation
-resources and are processed through recoverable leases.
+resources and are processed through recoverable leases. Live work is denied by
+default; production deployment configuration supplies an auditable authorization
+identifier, a Provider-request ceiling, and a hard zero-spend ceiling. The only
+implemented live calls are bounded authenticated `GET /models` reads, so lease
+recovery is retry-safe. The operation state machine includes terminal
+`uncertain` handling for any future non-retry-safe operation.
 
 Management resources, audit, outbox, operation results, and observations never
-contain secret material or Secret Manager references. Discovery persists a hash
+contain secret material or Secret Manager references. Idempotency records do not
+contain secret-derived verifiers; custody-key replay performs secret equality
+inside Secret Custody. Discovery persists a hash
 of the bounded raw Provider response and cannot mutate the existing routing
-configuration. An internal resolver can retrieve the active credential for an
-enabled Provider Connection; ADR 0006 remains responsible for publishing a
+configuration. Provider endpoints are restricted to the exact built-in host for
+the declared Provider and are revalidated immediately before credential access.
+The execution-plane `GatewayResolver` uses a Gateway-only view of enabled
+connections plus workload-authenticated Secret Custody access to retrieve the
+immutable credential version; ADR 0006 remains responsible for publishing a
 Model Route that references the connection. The ADR remains `proposed` until it
 is explicitly accepted.
 

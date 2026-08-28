@@ -28,19 +28,52 @@ const registerOperation = "provider_connection.register"
 var resourceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
 
 type ProviderOperator interface {
-	Probe(context.Context, ProviderConnection, []byte) (ProbeResult, error)
-	Discover(context.Context, ProviderConnection, []byte) (DiscoveryResult, error)
+	Probe(context.Context, ProviderConnection, []byte, int) (ProbeResult, error)
+	Discover(context.Context, ProviderConnection, []byte, int) (DiscoveryResult, error)
+}
+
+type LiveOperationPolicy interface {
+	Authorize(context.Context, tenantadmin.ActorEnvelope, OperationType) (OperationAuthorization, error)
+}
+
+type StaticLiveOperationPolicy struct {
+	Source               string
+	ProbeMaxRequests     int
+	DiscoveryMaxRequests int
+}
+
+func (policy StaticLiveOperationPolicy) Authorize(_ context.Context, _ tenantadmin.ActorEnvelope, operation OperationType) (OperationAuthorization, error) {
+	requests := 0
+	switch operation {
+	case OperationProbe:
+		requests = policy.ProbeMaxRequests
+	case OperationModelDiscovery:
+		requests = policy.DiscoveryMaxRequests
+	default:
+		return OperationAuthorization{}, ErrPolicyDenied
+	}
+	if strings.TrimSpace(policy.Source) == "" || requests <= 0 || requests > 100 {
+		return OperationAuthorization{}, ErrPolicyDenied
+	}
+	return OperationAuthorization{Source: policy.Source, MaxProviderRequests: requests, MaxSpendMicros: 0}, nil
+}
+
+type denyLiveOperationPolicy struct{}
+
+func (denyLiveOperationPolicy) Authorize(context.Context, tenantadmin.ActorEnvelope, OperationType) (OperationAuthorization, error) {
+	return OperationAuthorization{}, ErrPolicyDenied
 }
 
 type Service struct {
-	database *sql.DB
-	custody  secretcustody.Store
-	operator ProviderOperator
-	now      func() time.Time
-	random   io.Reader
+	database   *sql.DB
+	custody    secretcustody.Store
+	operator   ProviderOperator
+	livePolicy LiveOperationPolicy
+	now        func() time.Time
+	random     io.Reader
 }
 
-func NewService(database *sql.DB, custody secretcustody.Store, operator ProviderOperator, now func() time.Time, random io.Reader) (*Service, error) {
+func NewService(database *sql.DB, custody secretcustody.Store, operator ProviderOperator, now func() time.Time, random io.Reader, policies ...LiveOperationPolicy) (*Service, error) {
 	if database == nil || custody == nil {
 		return nil, errors.New("Provider Connection Registry requires PostgreSQL and Secret Custody")
 	}
@@ -50,7 +83,14 @@ func NewService(database *sql.DB, custody secretcustody.Store, operator Provider
 	if random == nil {
 		random = rand.Reader
 	}
-	return &Service{database: database, custody: custody, operator: operator, now: now, random: random}, nil
+	livePolicy := LiveOperationPolicy(denyLiveOperationPolicy{})
+	if len(policies) > 1 || len(policies) == 1 && policies[0] == nil {
+		return nil, errors.New("Provider Connection Registry accepts at most one live-operation policy")
+	}
+	if len(policies) == 1 {
+		livePolicy = policies[0]
+	}
+	return &Service{database: database, custody: custody, operator: operator, livePolicy: livePolicy, now: now, random: random}, nil
 }
 
 func (service *Service) Register(ctx context.Context, actor tenantadmin.ActorEnvelope, idempotencyKey string, command RegisterCommand) (MutationResult, error) {
@@ -74,6 +114,9 @@ func (service *Service) Register(ctx context.Context, actor tenantadmin.ActorEnv
 	}
 	if err != nil {
 		return MutationResult{}, fmt.Errorf("store Provider credential: %w", err)
+	}
+	if err := validateSecretReference(reference); err != nil {
+		return MutationResult{}, err
 	}
 	transaction, replay, err := service.beginCommand(ctx, actor, registerOperation, idempotencyKey, requestHash)
 	if err != nil || replay != nil {
@@ -277,17 +320,32 @@ func validateRegister(command RegisterCommand) error {
 	default:
 		return fmt.Errorf("%w: unsupported Provider identity", ErrInvalidArgument)
 	}
-	if err := validateBaseURL(command.BaseURL); err != nil {
+	if err := validateBaseURL(command.Provider, command.BaseURL); err != nil {
 		return err
 	}
 	return validateCapabilityProfile(command.CapabilityDeclaration, 1)
 }
 
-func validateBaseURL(value string) error {
+func validateBaseURL(providerName, value string) error {
 	baseURL, err := url.Parse(value)
 	if err != nil || len(value) > 2048 || baseURL.Scheme != "https" || baseURL.Host == "" || baseURL.User != nil ||
 		baseURL.Fragment != "" || baseURL.RawQuery != "" {
 		return fmt.Errorf("%w: Base URL must be an absolute HTTPS URL without credentials, query, or fragments", ErrInvalidArgument)
+	}
+	allowedHosts := map[string]string{
+		"openai": "api.openai.com", "deepseek": "api.deepseek.com",
+		"anthropic": "api.anthropic.com", "gemini": "generativelanguage.googleapis.com",
+	}
+	if baseURL.Hostname() != allowedHosts[providerName] || baseURL.Port() != "" {
+		return fmt.Errorf("%w: Base URL host is not registered for Provider identity", ErrPolicyDenied)
+	}
+	return nil
+}
+
+func validateSecretReference(reference secretcustody.Reference) error {
+	if strings.TrimSpace(reference.Name) == "" || strings.TrimSpace(reference.Version) == "" ||
+		strings.EqualFold(reference.Version, "latest") || strings.HasSuffix(strings.ToLower(reference.Name), "/versions/latest") {
+		return fmt.Errorf("%w: Secret Custody must return an immutable version reference", ErrPolicyDenied)
 	}
 	return nil
 }
@@ -321,12 +379,10 @@ func validStatus(value AdministrativeStatus) bool {
 }
 
 func registerHash(command RegisterCommand, reason string) ([]byte, error) {
-	secretDigest := sha256.Sum256(command.Secret)
 	payload, err := json.Marshal(struct {
 		ID, Provider, DisplayName, BaseURL, Region, CredentialScope, Reason string
-		SecretDigest                                                        []byte
 		Capability                                                          provider.CapabilityProfile
-	}{command.ID, command.Provider, command.DisplayName, command.BaseURL, command.Region, command.CredentialScope, reason, secretDigest[:], command.CapabilityDeclaration})
+	}{command.ID, command.Provider, command.DisplayName, command.BaseURL, command.Region, command.CredentialScope, reason, command.CapabilityDeclaration})
 	if err != nil {
 		return nil, err
 	}

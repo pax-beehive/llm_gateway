@@ -33,11 +33,6 @@ func (service *Service) Update(ctx context.Context, actor tenantadmin.ActorEnvel
 		command.CredentialScope != nil && (strings.TrimSpace(*command.CredentialScope) == "" || len(*command.CredentialScope) > 256) {
 		return MutationResult{}, ErrInvalidArgument
 	}
-	if command.BaseURL != nil {
-		if err := validateBaseURL(*command.BaseURL); err != nil {
-			return MutationResult{}, err
-		}
-	}
 	requestHash, err := hashCommand(command, actor.Reason)
 	if err != nil {
 		return MutationResult{}, err
@@ -56,6 +51,11 @@ func (service *Service) Update(ctx context.Context, actor tenantadmin.ActorEnvel
 	}
 	if current.Revision != command.ExpectedRevision {
 		return MutationResult{}, ErrRevisionConflict
+	}
+	if command.BaseURL != nil {
+		if err := validateBaseURL(current.Provider, *command.BaseURL); err != nil {
+			return MutationResult{}, err
+		}
 	}
 	displayName, baseURL, region, credentialScope := current.DisplayName, current.BaseURL, current.Region, current.CredentialScope
 	capability := current.CapabilityDeclaration

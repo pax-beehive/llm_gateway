@@ -39,7 +39,7 @@ status, headers, registered = call("POST", "/control/v1/provider-connections", {
     "id": connection_id,
     "provider": "openai",
     "display_name": "Black-box OpenAI",
-    "base_url": "https://api.openai.test/v1",
+    "base_url": "https://api.openai.com/v1",
     "region": "us-test",
     "credential_scope": "blackbox",
     "secret": secret,
@@ -64,7 +64,7 @@ def run_operation(path, body, key):
     assert secret not in json.dumps(operation) and "pending_secret_ref" not in operation
     for _ in range(80):
         _, _, current = call("GET", headers["Location"])
-        if current["status"] in ("succeeded", "failed"):
+        if current["status"] in ("succeeded", "failed", "uncertain"):
             assert current["status"] == "succeeded", current
             return current
         time.sleep(0.05)
@@ -72,12 +72,12 @@ def run_operation(path, body, key):
 
 
 probe = run_operation(f"/control/v1/provider-connections/{connection_id}/probes", {
-    "expected_revision": 2, "live_authorized": True, "reason": "deterministic probe",
+    "expected_revision": 2, "reason": "deterministic probe",
 }, "probe-" + connection_id)
 assert probe["result"]["observed_status"] == "healthy"
 
 discovery = run_operation(f"/control/v1/provider-connections/{connection_id}/model-discoveries", {
-    "expected_revision": 2, "live_authorized": True, "reason": "deterministic discovery",
+    "expected_revision": 2, "reason": "deterministic discovery",
 }, "discovery-" + connection_id)
 assert discovery["result"]["model_count"] == 2
 

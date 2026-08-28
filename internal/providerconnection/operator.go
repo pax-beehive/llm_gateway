@@ -15,23 +15,24 @@ type DeterministicOperator struct{}
 
 func NewDeterministicOperator() DeterministicOperator { return DeterministicOperator{} }
 
-func (DeterministicOperator) Probe(_ context.Context, connection ProviderConnection, secret []byte) (ProbeResult, error) {
-	if len(secret) == 0 {
+func (DeterministicOperator) Probe(_ context.Context, connection ProviderConnection, secret []byte, maxRequests int) (ProbeResult, error) {
+	if len(secret) == 0 || maxRequests < 1 {
 		return ProbeResult{}, &OperationError{Code: "authentication_failed"}
 	}
 	digest := sha256.Sum256([]byte(connection.Provider + "\x1f" + connection.BaseURL + "\x1fprobe"))
-	return ProbeResult{ObservedModelCount: 2, RawResponseHash: hex.EncodeToString(digest[:])}, nil
+	return ProbeResult{ObservedModelCount: 2, RawResponseHash: hex.EncodeToString(digest[:]), ProviderRequests: 1}, nil
 }
 
-func (DeterministicOperator) Discover(_ context.Context, connection ProviderConnection, secret []byte) (DiscoveryResult, error) {
-	if len(secret) == 0 {
+func (DeterministicOperator) Discover(_ context.Context, connection ProviderConnection, secret []byte, maxRequests int) (DiscoveryResult, error) {
+	if len(secret) == 0 || maxRequests < 1 {
 		return DiscoveryResult{}, &OperationError{Code: "authentication_failed"}
 	}
 	digest := sha256.Sum256([]byte(connection.Provider + "\x1f" + connection.BaseURL + "\x1fdiscovery"))
 	return DiscoveryResult{
 		Models: []ObservedModel{{ID: connection.Provider + "-deterministic-small", OwnedBy: connection.Provider},
 			{ID: connection.Provider + "-deterministic-large", OwnedBy: connection.Provider}},
-		RawResponseHash: hex.EncodeToString(digest[:]),
+		RawResponseHash:  hex.EncodeToString(digest[:]),
+		ProviderRequests: 1,
 	}, nil
 }
 
@@ -52,16 +53,20 @@ func NewModelDiscoveryOperator(httpClient *http.Client) *ModelDiscoveryOperator 
 	return &ModelDiscoveryOperator{httpClient: httpClient}
 }
 
-func (operator *ModelDiscoveryOperator) Probe(ctx context.Context, connection ProviderConnection, secret []byte) (ProbeResult, error) {
-	observation, err := operator.observe(ctx, connection, secret)
+func (operator *ModelDiscoveryOperator) Probe(ctx context.Context, connection ProviderConnection, secret []byte, maxRequests int) (ProbeResult, error) {
+	client, err := operator.client(connection, secret, maxRequests)
 	if err != nil {
 		return ProbeResult{}, err
 	}
-	return ProbeResult{ObservedModelCount: len(observation.Models), RawResponseHash: observation.RawResponseHash}, nil
+	observation, err := client.ProbeObserved(ctx)
+	if err != nil {
+		return ProbeResult{}, classifyDiscoveryError(err)
+	}
+	return ProbeResult{ObservedModelCount: len(observation.Models), RawResponseHash: observation.RawResponseHash, ProviderRequests: observation.RequestCount}, nil
 }
 
-func (operator *ModelDiscoveryOperator) Discover(ctx context.Context, connection ProviderConnection, secret []byte) (DiscoveryResult, error) {
-	observation, err := operator.observe(ctx, connection, secret)
+func (operator *ModelDiscoveryOperator) Discover(ctx context.Context, connection ProviderConnection, secret []byte, maxRequests int) (DiscoveryResult, error) {
+	observation, err := operator.observe(ctx, connection, secret, maxRequests)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -69,24 +74,39 @@ func (operator *ModelDiscoveryOperator) Discover(ctx context.Context, connection
 	for _, model := range observation.Models {
 		models = append(models, ObservedModel{ID: model.ID, OwnedBy: model.OwnedBy})
 	}
-	return DiscoveryResult{Models: models, RawResponseHash: observation.RawResponseHash}, nil
+	return DiscoveryResult{Models: models, RawResponseHash: observation.RawResponseHash, ProviderRequests: observation.RequestCount}, nil
 }
 
-func (operator *ModelDiscoveryOperator) observe(ctx context.Context, connection ProviderConnection, secret []byte) (modeldiscovery.Observation, error) {
-	client, err := modeldiscovery.New(modeldiscovery.Config{
-		Provider: modeldiscovery.Provider(connection.Provider), BaseURL: connection.BaseURL,
-		APIKey: string(secret), HTTPClient: operator.httpClient,
-	})
+func (operator *ModelDiscoveryOperator) observe(ctx context.Context, connection ProviderConnection, secret []byte, maxRequests int) (modeldiscovery.Observation, error) {
+	client, err := operator.client(connection, secret, maxRequests)
 	if err != nil {
-		return modeldiscovery.Observation{}, &OperationError{Code: "invalid_connection"}
+		return modeldiscovery.Observation{}, err
 	}
 	observation, err := client.ListObserved(ctx)
 	if err == nil {
 		return observation, nil
 	}
+	return modeldiscovery.Observation{}, classifyDiscoveryError(err)
+}
+
+func (operator *ModelDiscoveryOperator) client(connection ProviderConnection, secret []byte, maxRequests int) (*modeldiscovery.Client, error) {
+	if err := validateBaseURL(connection.Provider, connection.BaseURL); err != nil {
+		return nil, &OperationError{Code: "endpoint_not_authorized"}
+	}
+	client, err := modeldiscovery.New(modeldiscovery.Config{
+		Provider: modeldiscovery.Provider(connection.Provider), BaseURL: connection.BaseURL,
+		APIKey: string(secret), HTTPClient: operator.httpClient, MaxRequests: maxRequests,
+	})
+	if err != nil {
+		return nil, &OperationError{Code: "invalid_connection"}
+	}
+	return client, nil
+}
+
+func classifyDiscoveryError(err error) error {
 	var requestError *modeldiscovery.RequestError
 	if errors.As(err, &requestError) {
-		return modeldiscovery.Observation{}, &OperationError{Code: requestError.Code}
+		return &OperationError{Code: requestError.Code}
 	}
-	return modeldiscovery.Observation{}, &OperationError{Code: "provider_operation_failed"}
+	return &OperationError{Code: "provider_operation_failed"}
 }

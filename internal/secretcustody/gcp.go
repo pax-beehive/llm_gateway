@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -95,8 +96,7 @@ func (store *GCP) Put(ctx context.Context, key string, material []byte) (Referen
 		return Reference{}, err
 	}
 	if status == http.StatusConflict {
-		reference := Reference{Name: secretName + "/versions/latest", Version: "latest"}
-		current, accessErr := store.Access(ctx, reference)
+		reference, current, accessErr := store.access(ctx, Reference{Name: secretName + "/versions/latest", Version: "latest"})
 		if accessErr == nil {
 			defer clear(current)
 			if bytes.Equal(current, material) {
@@ -114,34 +114,59 @@ func (store *GCP) Put(ctx context.Context, key string, material []byte) (Referen
 	if err != nil {
 		return Reference{}, err
 	}
-	if !strings.HasPrefix(response.Name, secretName+"/versions/") {
+	reference, err := immutableReference(secretName, response.Name)
+	if err != nil {
 		return Reference{}, errors.New("GCP Secret Manager returned an invalid version reference")
 	}
-	parts := strings.Split(response.Name, "/")
-	return Reference{Name: response.Name, Version: parts[len(parts)-1]}, nil
+	return reference, nil
 }
 
 func (store *GCP) Access(ctx context.Context, reference Reference) ([]byte, error) {
+	_, material, err := store.access(ctx, reference)
+	return material, err
+}
+
+func (store *GCP) access(ctx context.Context, reference Reference) (Reference, []byte, error) {
 	if !strings.HasPrefix(reference.Name, "projects/"+store.projectID+"/secrets/") || !strings.Contains(reference.Name, "/versions/") {
-		return nil, ErrNotFound
+		return Reference{}, nil, ErrNotFound
 	}
 	var response struct {
+		Name    string `json:"name"`
 		Payload struct {
 			Data string `json:"data"`
 		} `json:"payload"`
 	}
 	status, err := store.request(ctx, http.MethodGet, reference.Name+":access", nil, &response)
 	if status == http.StatusNotFound {
-		return nil, ErrNotFound
+		return Reference{}, nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, err
+		return Reference{}, nil, err
 	}
 	material, err := base64.StdEncoding.DecodeString(response.Payload.Data)
 	if err != nil || len(material) == 0 || len(material) > 64<<10 {
-		return nil, errors.New("GCP Secret Manager returned invalid secret material")
+		return Reference{}, nil, errors.New("GCP Secret Manager returned invalid secret material")
 	}
-	return material, nil
+	secretName := reference.Name[:strings.Index(reference.Name, "/versions/")]
+	exact, err := immutableReference(secretName, response.Name)
+	if err != nil {
+		clear(material)
+		return Reference{}, nil, errors.New("GCP Secret Manager returned an invalid accessed version reference")
+	}
+	return exact, material, nil
+}
+
+func immutableReference(secretName, versionName string) (Reference, error) {
+	prefix := secretName + "/versions/"
+	if !strings.HasPrefix(versionName, prefix) {
+		return Reference{}, ErrNotFound
+	}
+	version := strings.TrimPrefix(versionName, prefix)
+	value, err := strconv.ParseUint(version, 10, 64)
+	if err != nil || value == 0 || strconv.FormatUint(value, 10) != version {
+		return Reference{}, ErrNotFound
+	}
+	return Reference{Name: versionName, Version: version}, nil
 }
 
 func (store *GCP) request(ctx context.Context, method, resource string, body any, destination any) (int, error) {
