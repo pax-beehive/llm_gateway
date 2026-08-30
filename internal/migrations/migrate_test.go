@@ -3,6 +3,7 @@ package migrations
 import (
 	"fmt"
 	"io/fs"
+	"strings"
 	"testing"
 )
 
@@ -23,5 +24,21 @@ func TestEmbeddedGatewayMigrationsRemainContiguous(t *testing.T) {
 		if err != nil || len(payload) == 0 {
 			t.Fatalf("read %s: %v", entry.Name(), err)
 		}
+	}
+}
+
+func TestFinalGatewayMigrationPublishesCurrentSchemaVersion(t *testing.T) {
+	entries, err := fs.ReadDir(files, "sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := entries[len(entries)-1]
+	payload, err := files.ReadFile("sql/" + final.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("current_version=%d", len(entries))
+	if !strings.Contains(string(payload), want) {
+		t.Fatalf("final migration %q does not publish %q", final.Name(), want)
 	}
 }
