@@ -1,6 +1,6 @@
 # Universal LLM Gateway
 
-A Responses-first, multi-tenant Go gateway implementing [ADR 0001](docs/adr/0001-build-universal-llm-gateway-core.md). It exposes OpenAI-compatible Responses and Chat Completions APIs plus the Stage A capability interfaces from [ADR 0009](docs/adr/0009-expand-capability-specific-inference-interfaces.md): embeddings, moderations, and reranking. Provider behavior stays behind capability-aware Model Routes, and lifecycle state uses tenant-scoped CAS revisions. The first release is intentionally limited to OpenAI, DeepSeek, Anthropic (Claude), and Gemini.
+A Responses-first, multi-tenant Go gateway implementing [ADR 0001](docs/adr/0001-build-universal-llm-gateway-core.md). It exposes OpenAI-compatible Responses and Chat Completions APIs plus the Stage A capability interfaces from [ADR 0009](docs/adr/0009-expand-capability-specific-inference-interfaces.md): embeddings, moderations, and reranking. Provider behavior stays behind capability-aware Model Routes, and lifecycle state uses tenant-scoped CAS revisions. The first release is intentionally limited to OpenAI, DeepSeek, Anthropic (Claude), and Gemini. The accepted Cloudflare-edge/GCP-core deployment target and staged rollout gates are documented in [ADR 0010](docs/adr/0010-deploy-cloudflare-edge-gcp-core.md); that target is not itself deployment evidence.
 
 ## Run locally
 

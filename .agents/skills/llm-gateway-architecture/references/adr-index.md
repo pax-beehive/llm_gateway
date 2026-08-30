@@ -13,5 +13,6 @@ Read only the decisions relevant to the current task.
 | `docs/adr/0007-build-usage-quota-and-metering-interfaces.md` | proposed | Content-free usage events, outbox/inbox, Metering projections, quota queries, and corrections | Building reporting, exports, Metering, quota status, or future Billing inputs |
 | `docs/adr/0008-build-control-plane-operations-and-rollout-observability.md` | accepted | Liveness/readiness, heartbeats, rollout receipts, lag, jobs, and deployment gates | Building or diagnosing operations and release proof |
 | `docs/adr/0009-expand-capability-specific-inference-interfaces.md` | proposed | Staged embeddings, moderation, rerank, files, batches, media, Realtime, and video interfaces | Adding a non-Responses inference capability |
+| `docs/adr/0010-deploy-cloudflare-edge-gcp-core.md` | accepted | Cloudflare public edge, GCP application/data core, flat hostnames, and gated single-Home-Region rollout | Designing, implementing, costing, or verifying cloud deployment |
 
 When two ADRs overlap, preserve the stronger correctness invariant. Propose an explicit superseding ADR instead of quietly weakening an accepted decision.
