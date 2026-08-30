@@ -32,11 +32,24 @@ BUILD_POLL_SECONDS=${BUILD_POLL_SECONDS:-15}
 MIGRATION_JOB=${MIGRATION_JOB:-llm-gateway-prod-schema-migrate}
 ROLE_CONFIG_JOB=${ROLE_CONFIG_JOB:-llm-gateway-prod-role-config}
 
+case "$GCP_BUILD_SERVICE_ACCOUNT" in
+  projects/*/serviceAccounts/*)
+    build_service_account_resource=$GCP_BUILD_SERVICE_ACCOUNT
+    ;;
+  *@*.iam.gserviceaccount.com)
+    build_service_account_resource="projects/$GCP_PROJECT_ID/serviceAccounts/$GCP_BUILD_SERVICE_ACCOUNT"
+    ;;
+  *)
+    echo "GCP_BUILD_SERVICE_ACCOUNT must be a service-account email or full resource name" >&2
+    exit 2
+    ;;
+esac
+
 build_id=$(gcloud builds submit . \
   --project="$GCP_PROJECT_ID" \
   --region="$GCP_REGION" \
   --config=deploy/gcp/cloudbuild.yaml \
-  --service-account="$GCP_BUILD_SERVICE_ACCOUNT" \
+  --service-account="$build_service_account_resource" \
   --gcs-source-staging-dir="gs://$GCP_BUILD_SOURCE_BUCKET/source" \
   --substitutions="_SOURCE_REVISION=$SOURCE_REVISION,_REPOSITORY=$GCP_ARTIFACT_REPOSITORY" \
   --async \
