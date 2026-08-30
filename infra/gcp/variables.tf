@@ -63,3 +63,23 @@ variable "pitr_log_days" {
     error_message = "pitr_log_days must be between 1 and 7 for Cloud SQL Enterprise."
   }
 }
+
+variable "schema_migrate_image" {
+  description = "Immutable schema-migrate image reference, including an Artifact Registry sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^[:space:]]+@sha256:[0-9a-f]{64}$", var.schema_migrate_image))
+    error_message = "schema_migrate_image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "role_config_image" {
+  description = "Immutable role-config image reference, including an Artifact Registry sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^[:space:]]+@sha256:[0-9a-f]{64}$", var.role_config_image))
+    error_message = "role_config_image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
