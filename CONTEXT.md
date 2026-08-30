@@ -46,6 +46,18 @@ control-plane facts into one Gateway region without granting the Gateway access
 to control-plane tables.
 _Avoid_: Shared outbox reader, Operations heartbeat bus
 
+**Control Projection Bootstrap**:
+A bounded, authenticated point-in-time bundle of one region's Access and
+Provider Connection execution projections plus the current global Routing
+Catalog and its Control Event source cursor.
+_Avoid_: Database replica, raw-key export, best-effort repair dump
+
+**Control Event History Floor**:
+The greatest Control Event cursor through which retained relay history has been
+pruned; a Gateway behind it must install a Control Projection Bootstrap before
+resuming incremental delivery.
+_Avoid_: Earliest row ID, Gateway acknowledgement
+
 **Provider Connection Execution Projection**:
 The Gateway-local, secret-free metadata needed to compile Model Routes for one
 Provider Connection revision and credential version.

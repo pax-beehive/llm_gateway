@@ -7,6 +7,12 @@ CREATE ROLE llm_gateway_runtime_test NOLOGIN;
 \set gateway_role llm_gateway_runtime_test
 \ir ../../scripts/postgres/configure-tenant-admin-roles.sql
 
+SET LOCAL ROLE llm_gateway_tenant_admin_test;
+INSERT INTO control_outbox (
+    event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+) VALUES ('role-test-region-head',2,'Tenant','role-test-tenant',1,NULL,'TenantCreated',now(),'{"home_region":"role-test-region"}');
+RESET ROLE;
+
 DO $$
 BEGIN
     IF NOT has_table_privilege('llm_gateway_tenant_admin_test', 'tenants', 'INSERT')
@@ -42,6 +48,13 @@ BEGIN
        OR has_table_privilege('llm_gateway_runtime_test', 'tenants', 'SELECT')
        OR has_table_privilege('llm_gateway_runtime_test', 'api_keys', 'SELECT')
 	   OR has_table_privilege('llm_gateway_runtime_test', 'control_outbox', 'SELECT')
+	   OR has_table_privilege('llm_gateway_runtime_test', 'control_event_history', 'SELECT')
+	   OR NOT has_table_privilege('llm_gateway_tenant_admin_test', 'control_event_history', 'SELECT')
+	   OR has_table_privilege('llm_gateway_tenant_admin_test', 'control_event_history', 'UPDATE')
+	   OR has_table_privilege('llm_gateway_runtime_test', 'control_event_region_heads', 'SELECT')
+	   OR NOT has_table_privilege('llm_gateway_tenant_admin_test', 'control_event_region_heads', 'SELECT')
+	   OR has_table_privilege('llm_gateway_tenant_admin_test', 'control_event_region_heads', 'UPDATE')
+	   OR COALESCE((SELECT access_cursor<=0 FROM control_event_region_heads WHERE region='role-test-region'),true)
 	   OR has_sequence_privilege('llm_gateway_runtime_test', 'control_outbox_delivery_sequence_seq', 'USAGE')
 	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_control_event_offsets', 'UPDATE')
 	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_provider_connection_projection', 'SELECT')

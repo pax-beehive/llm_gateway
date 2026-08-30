@@ -188,6 +188,43 @@ func (consumer *Consumer) Cursor(ctx context.Context) (int64, error) {
 	return status.Cursor, err
 }
 
+// BootstrapCursor acknowledges an authoritative multi-projection snapshot.
+// Callers must invoke it only after every local projection has accepted the
+// bundle identified by cursor.
+func (consumer *Consumer) BootstrapCursor(ctx context.Context, cursor int64) error {
+	if cursor < 0 {
+		return errors.New("Control Event bootstrap cursor must be non-negative")
+	}
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	status, err := consumer.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if cursor < status.Cursor {
+		return errors.New("Control Event bootstrap cursor regressed")
+	}
+	now := consumer.now().UTC()
+	result, err := consumer.database.ExecContext(ctx, `INSERT INTO gateway_control_event_offsets (
+		stream_name,cursor,source_head,last_fetched_at,last_succeeded_at,last_attempt_at,failure_started_at,last_error_code,updated_at
+	) VALUES ($1,$2,$2,$3,$3,$3,NULL,NULL,$3) ON CONFLICT (stream_name) DO UPDATE SET
+		cursor=EXCLUDED.cursor,source_head=GREATEST(gateway_control_event_offsets.source_head,EXCLUDED.source_head),
+		last_succeeded_at=EXCLUDED.last_succeeded_at,last_attempt_at=EXCLUDED.last_attempt_at,
+		failure_started_at=NULL,last_error_code=NULL,updated_at=EXCLUDED.updated_at
+		WHERE gateway_control_event_offsets.cursor<=$2`, consumer.streamName, cursor, now)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return errors.New("Control Event relay cursor changed concurrently")
+	}
+	return nil
+}
+
 func (consumer *Consumer) Status(ctx context.Context) (Status, error) {
 	var status Status
 	err := consumer.database.QueryRowContext(ctx, `SELECT cursor,source_head,last_fetched_at,last_succeeded_at,last_attempt_at,failure_started_at,COALESCE(last_error_code,'')

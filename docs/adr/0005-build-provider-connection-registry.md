@@ -31,7 +31,9 @@ The production execution-plane resolver uses a Gateway-local, schema-3
 secret-free Provider Connection projection. During Routing Catalog compilation
 it retrieves the exact immutable credential through ADR 0008's authenticated
 HTTPS execution-secret endpoint using both connection revision and credential
-version. The legacy Gateway-only database view and direct Secret Custody adapter
+version. A retained-history bootstrap replaces the complete regional
+secret-free execution projection before incremental delivery resumes. The
+legacy Gateway-only database view and direct Secret Custody adapter
 remain development compatibility paths. ADR 0006 remains responsible for
 publishing a Model Route that references the connection. The ADR remains
 `proposed` until it is explicitly accepted.

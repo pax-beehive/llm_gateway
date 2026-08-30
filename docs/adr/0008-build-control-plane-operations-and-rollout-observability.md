@@ -190,7 +190,10 @@ to the exact method, path, and query. The control-plane publisher advances a
 global delivery cursor across unrelated events while returning only the
 Gateway's region-scoped Access and Provider Connection events plus global
 Routing Catalog publications. Gateway cursor persistence happens only after
-all local consumers accept the batch; inboxes and aggregate revisions make
+all local consumers accept the batch. Outbox inserts are serialized across
+control transactions so delivery sequence is commit order; publication reads
+the history floor, source head, and bounded window from one repeatable-read
+snapshot. Inboxes and aggregate revisions make
 retry idempotent and revision gaps fail closed. Transient execution-secret
 delivery failures are retryable and therefore hold the cursor rather than
 creating a permanent rejection receipt. Fetch observation is persisted before
@@ -217,6 +220,16 @@ Connection execution projection before compiling and installing the persisted
 Routing Catalog. A two-schema integration test
 proves relay, projection, and secret resolution while the Gateway schema has no
 `control_outbox` at all. The relay and execution-projection implementation gates
-now pass. A retained-history floor and multi-projection bootstrap protocol remain
-required before introducing bounded control-outbox retention. This ADR remains
-`proposed` until the decision is explicitly accepted.
+now pass. A durable history floor rejects cursors that can no longer be served.
+The authenticated, bounded, `no-store` bootstrap captures one repeatable-read
+source cursor with the regional Access Projection, regional secret-free Provider
+Connection execution projection, and global Routing Catalog. Gateway startup
+installs all three before acknowledging that cursor. An explicit retention
+operator command deletes bounded batches without crossing the lowest recently
+reported Gateway relay cursor; a stale returning Gateway bootstraps before
+resuming incremental delivery. A live Gateway that discovers it is behind the
+floor withdraws readiness until the same bootstrap succeeds. Durable regional
+Access heads keep desired-versus-applied Operations evidence monotonic after
+outbox deletion. Retention is deliberately not granted to the
+control-plane runtime role. This ADR remains `proposed` until the decision is
+explicitly accepted.

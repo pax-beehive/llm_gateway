@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-control-relay-blackbox test-operations-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev bootstrap-access repair-access-projection configure-tenant-admin-roles compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-control-relay-blackbox test-operations-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev bootstrap-access repair-access-projection prune-control-events configure-tenant-admin-roles compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -97,6 +97,11 @@ repair-access-projection:
 	@test -n "$(CONTROL_PLANE_DATABASE_URL)" || { echo "CONTROL_PLANE_DATABASE_URL is required" >&2; exit 1; }
 	@test -n "$(GATEWAY_DATABASE_URL)" || { echo "GATEWAY_DATABASE_URL is required" >&2; exit 1; }
 	GOCACHE=$(GOCACHE) go run ./cmd/access-projection-repair
+
+prune-control-events:
+	@test -n "$(CONTROL_EVENT_RETENTION_DATABASE_URL)" || { echo "CONTROL_EVENT_RETENTION_DATABASE_URL is required" >&2; exit 1; }
+	@test -n "$(CONTROL_EVENT_RETENTION_THROUGH)" || { echo "CONTROL_EVENT_RETENTION_THROUGH is required" >&2; exit 1; }
+	GOCACHE=$(GOCACHE) CONTROL_EVENT_RETENTION_CONFIRM=prune-control-events go run ./cmd/control-event-retention
 
 configure-tenant-admin-roles:
 	@test -n "$(ADMIN_DATABASE_URL)" || { echo "ADMIN_DATABASE_URL is required" >&2; exit 1; }

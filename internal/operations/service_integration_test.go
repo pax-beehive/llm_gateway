@@ -178,6 +178,13 @@ func TestGatewayObservationsAreIdempotentAndCannotMoveRevisionsBackward(t *testi
 	if got.DesiredAccessRevision != desiredAccess || otherRegionAccess <= desiredAccess {
 		t.Fatalf("regional desired Access revision = %d, want %d (other region %d)", got.DesiredAccessRevision, desiredAccess, otherRegionAccess)
 	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM control_outbox WHERE event_id=$1`, "operations-access-"+gatewayID); err != nil {
+		t.Fatal(err)
+	}
+	afterPrune, err := service.GetGateway(ctx, actor, gatewayID)
+	if err != nil || afterPrune.DesiredAccessRevision != desiredAccess {
+		t.Fatalf("retained desired Access revision = %d/%v, want %d", afterPrune.DesiredAccessRevision, err, desiredAccess)
+	}
 	var accessReceipts int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM operations_access_rollout_receipts WHERE gateway_id=$1 AND event_id='access-event-1'`, gatewayID).Scan(&accessReceipts); err != nil || accessReceipts != 1 {
 		t.Fatalf("access receipts/error = %d/%v", accessReceipts, err)

@@ -82,7 +82,7 @@ func TestRelayProjectsAndResolvesProviderConnectionAcrossIsolatedSchemas(t *test
 	}
 	controlDB := openSchema(controlSchema)
 	gatewayDB := openSchema(gatewaySchema)
-	for _, migrate := range []func(context.Context, *sql.DB) error{migrations.Migrate, tenantadmin.Migrate, providerconnection.Migrate} {
+	for _, migrate := range []func(context.Context, *sql.DB) error{migrations.Migrate, tenantadmin.Migrate, providerconnection.Migrate, routingcatalog.Migrate, operations.Migrate} {
 		if err := migrate(ctx, controlDB); err != nil {
 			t.Fatal(err)
 		}
@@ -91,6 +91,38 @@ func TestRelayProjectsAndResolvesProviderConnectionAcrossIsolatedSchemas(t *test
 		if err := migrate(ctx, gatewayDB); err != nil {
 			t.Fatal(err)
 		}
+	}
+	firstTransaction, err := controlDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstTransaction.ExecContext(ctx, `INSERT INTO control_outbox (
+		event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+	) VALUES ('cevt-serialized-first',1,'Other','serialized-first',1,NULL,'OtherChanged',now(),'{}')`); err != nil {
+		t.Fatal(err)
+	}
+	secondCommitted := make(chan error, 1)
+	go func() {
+		_, insertErr := controlDB.ExecContext(ctx, `INSERT INTO control_outbox (
+			event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+		) VALUES ('cevt-serialized-second',1,'Other','serialized-second',1,NULL,'OtherChanged',now(),'{}')`)
+		secondCommitted <- insertErr
+	}()
+	select {
+	case err := <-secondCommitted:
+		t.Fatalf("later Control Event committed before the earlier transaction: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := firstTransaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-secondCommitted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 
 	custody := secretcustody.NewMemory()
@@ -117,6 +149,32 @@ func TestRelayProjectsAndResolvesProviderConnectionAcrossIsolatedSchemas(t *test
 	) VALUES ('cevt-provider',3,'ProviderConnection','pc-openai',1,NULL,'ProviderConnectionEnabled',now(),$1)`, eventPayload); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := controlDB.ExecContext(ctx, `INSERT INTO control_outbox (
+		event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+	) VALUES ('cevt-unsupported',1,'Other','other',1,NULL,'OtherChanged',now(),'{}')`); err != nil {
+		t.Fatal(err)
+	}
+	routingDocument := routingcatalog.Document{Routes: []routingcatalog.ManagedRoute{}}
+	bootstrapCompiler := routingcatalog.RuntimeCompilerFunc(func(context.Context, routingcatalog.Document) ([]provider.Route, error) {
+		return []provider.Route{}, nil
+	})
+	compiledRouting, err := bootstrapCompiler.CompileSnapshot(ctx, routingDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routingJSON, _ := json.Marshal(routingDocument)
+	routingValidationJSON, _ := json.Marshal(routingcatalog.ValidationReport{
+		Valid: true, Hash: compiledRouting.ValidationHash,
+		Errors: []routingcatalog.ValidationIssue{}, Warnings: []routingcatalog.ValidationIssue{},
+	})
+	if _, err := controlDB.ExecContext(ctx, `INSERT INTO routing_catalog_revisions (
+		revision,document,validation_report,validation_hash,source_revision,created_by,created_at
+	) VALUES (2,$1,$2,$3,NULL,'integration',now())`, routingJSON, routingValidationJSON, compiledRouting.ValidationHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlDB.ExecContext(ctx, `INSERT INTO routing_catalog_head (singleton,revision,updated_at) VALUES (true,2,now())`); err != nil {
+		t.Fatal(err)
+	}
 
 	key := []byte("cross-database-relay-hmac-key-00000001")
 	verifier, err := operations.NewHMACVerifier(map[string]string{"gateway-a": string(key)}, map[string]string{"gateway-a": "us-west1"}, time.Now)
@@ -124,11 +182,14 @@ func TestRelayProjectsAndResolvesProviderConnectionAcrossIsolatedSchemas(t *test
 		t.Fatal(err)
 	}
 	eventPublisher, _ := controlrelay.NewPostgresPublisher(controlDB)
+	bootstrapPublisher, _ := controlrelay.NewPostgresBootstrapPublisher(controlDB, time.Now)
 	secretPublisher, _ := controlrelay.NewPostgresSecretPublisher(controlDB, custody)
 	eventHandler, _ := controlrelay.NewHandler(eventPublisher, verifier)
+	bootstrapHandler, _ := controlrelay.NewBootstrapHandler(bootstrapPublisher, verifier)
 	secretHandler, _ := controlrelay.NewSecretHandler(secretPublisher, verifier)
 	mux := http.NewServeMux()
 	mux.Handle(controlrelay.EventPath, eventHandler)
+	mux.Handle(controlrelay.BootstrapPath, bootstrapHandler)
 	mux.Handle(controlrelay.SecretPathPrefix, secretHandler)
 	httpClient := &http.Client{Transport: handlerTransport{handler: mux}}
 	client, err := controlrelay.NewClient("https://control.example.test", "gateway-a", key, httpClient, time.Now)
@@ -213,6 +274,81 @@ func TestRelayProjectsAndResolvesProviderConnectionAcrossIsolatedSchemas(t *test
 	}
 	if strings.Contains(storedColumns, "secret") {
 		t.Fatalf("projection columns leak secret metadata: %s", storedColumns)
+	}
+
+	bootstrap, err := client.FetchBootstrap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedBootstrap, _ := json.Marshal(bootstrap)
+	if bootstrap.SourceCursor != status.SourceHead || len(bootstrap.ProviderConnections) != 1 || bootstrap.RoutingCatalog == nil ||
+		bootstrap.ProviderConnections[0].ConnectionID != "pc-openai" || strings.Contains(string(encodedBootstrap), reference.Name) ||
+		strings.Contains(string(encodedBootstrap), "provider-secret-material") {
+		t.Fatalf("bootstrap = %#v", bootstrap)
+	}
+	if err := projection.ReplaceSnapshots(ctx, bootstrap.ProviderConnections); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapRouter := provider.NewVersionedRouter(1, nil)
+	bootstrapRoutingConsumer, err := routingcatalog.NewConsumer(gatewayDB, bootstrapCompiler, bootstrapRouter, "gateway-bootstrap", "us-west1", time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bootstrapRoutingConsumer.ReplaceSnapshot(ctx, routingcatalog.Revision{
+		Revision: bootstrap.RoutingCatalog.Revision, Document: bootstrap.RoutingCatalog.Document,
+		Validation:     bootstrap.RoutingCatalog.Validation,
+		ValidationHash: bootstrap.RoutingCatalog.ValidationHash, CreatedAt: bootstrap.RoutingCatalog.CreatedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	projectedRouting, err := routingcatalog.LoadProjected(ctx, gatewayDB)
+	if err != nil || projectedRouting.Revision != 2 || bootstrapRouter.Revision() != 2 {
+		t.Fatalf("bootstrapped Routing Catalog = %#v router=%d err=%v", projectedRouting, bootstrapRouter.Revision(), err)
+	}
+	retention, err := controlrelay.NewRetention(controlDB, time.Now, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlDB.ExecContext(ctx, `INSERT INTO operations_gateway_heartbeats (
+		gateway_id,region,build_sha,database_schema_version,routing_catalog_revision,access_projection_revision,
+		execution_epoch_floor,last_usage_outbox_id,started_at,observed_at,received_at,consumers,backlogs
+	) VALUES ('gateway-a','us-west1','integration',23,0,0,0,0,now(),now(),now(),$1,'{}')`,
+		fmt.Sprintf(`[{"name":"control_event_relay","last_event_id":"%d","lag_seconds":0,"pending_count":1}]`, bootstrap.SourceCursor-1)); err != nil {
+		t.Fatal(err)
+	}
+	retained, err := retention.PruneThrough(ctx, bootstrap.SourceCursor, 256)
+	if err != nil || retained.SafeThrough != bootstrap.SourceCursor-1 || retained.MinimumCursor != bootstrap.SourceCursor-1 || retained.Deleted == 0 {
+		t.Fatalf("retention = %#v/%v", retained, err)
+	}
+	if _, err := client.Fetch(ctx, 0, 256); err == nil {
+		t.Fatal("pruned Control Event history did not require bootstrap")
+	} else {
+		var historyErr *controlrelay.HistoryUnavailableError
+		if !errors.As(err, &historyErr) || historyErr.MinimumCursor != bootstrap.SourceCursor-1 {
+			t.Fatalf("history error = %v", err)
+		}
+	}
+	if batch, err := client.Fetch(ctx, bootstrap.SourceCursor-1, 256); err != nil || batch.NextCursor != bootstrap.SourceCursor || batch.SourceHead != bootstrap.SourceCursor {
+		t.Fatalf("retained tail = %#v/%v", batch, err)
+	}
+	if _, err := controlDB.ExecContext(ctx, `UPDATE operations_gateway_heartbeats SET
+		consumers=$1,observed_at=now(),received_at=now() WHERE gateway_id='gateway-a'`,
+		fmt.Sprintf(`[{"name":"control_event_relay","last_event_id":"%d","lag_seconds":0,"pending_count":0}]`, bootstrap.SourceCursor)); err != nil {
+		t.Fatal(err)
+	}
+	retained, err = retention.PruneThrough(ctx, bootstrap.SourceCursor, 256)
+	if err != nil || retained.MinimumCursor != bootstrap.SourceCursor || retained.Deleted == 0 {
+		t.Fatalf("final retention = %#v/%v", retained, err)
+	}
+	postRetentionBootstrap, err := client.FetchBootstrap(ctx)
+	if err != nil || postRetentionBootstrap.SourceCursor != bootstrap.SourceCursor {
+		t.Fatalf("post-retention bootstrap = %#v/%v", postRetentionBootstrap, err)
+	}
+	if err := relay.BootstrapCursor(ctx, bootstrap.SourceCursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor, err := relay.Cursor(ctx); err != nil || cursor != bootstrap.SourceCursor {
+		t.Fatalf("bootstrapped cursor = %d/%v", cursor, err)
 	}
 
 	retryNow := time.Now().UTC()

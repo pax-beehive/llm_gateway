@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS operations_schema_metadata (
 );
 
 INSERT INTO operations_schema_metadata (component,current_version,updated_at)
-VALUES ('control-plane',21,now())
+VALUES ('control-plane',23,now())
 ON CONFLICT (component) DO UPDATE SET
     current_version=GREATEST(operations_schema_metadata.current_version,EXCLUDED.current_version),
     updated_at=EXCLUDED.updated_at;

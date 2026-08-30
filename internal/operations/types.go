@@ -11,8 +11,8 @@ import (
 const (
 	CurrentObservationVersion = 3
 	MinimumObservationVersion = 2
-	CurrentDatabaseSchema     = 22
-	MinimumDatabaseSchema     = 21
+	CurrentDatabaseSchema     = 23
+	MinimumDatabaseSchema     = 23
 )
 
 type CheckResult struct {

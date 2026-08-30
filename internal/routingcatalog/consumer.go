@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -246,6 +247,59 @@ func (consumer *Consumer) Consume(ctx context.Context, envelope controlevent.Eve
 	default:
 		return nil
 	}
+}
+
+// ReplaceSnapshot installs an authoritative Routing Catalog bootstrap without
+// manufacturing a rollout receipt. The startup caller advances the shared
+// relay cursor only after all bootstrap projections succeed.
+func (consumer *Consumer) ReplaceSnapshot(ctx context.Context, revision Revision) error {
+	if revision.Revision <= 0 || revision.ValidationHash == "" || revision.CreatedAt.IsZero() {
+		return ErrInvalidArgument
+	}
+	validationErrors := revision.Validation.Errors
+	if validationErrors == nil {
+		validationErrors = []ValidationIssue{}
+	}
+	validationWarnings := revision.Validation.Warnings
+	if validationWarnings == nil {
+		validationWarnings = []ValidationIssue{}
+	}
+	if !revision.Validation.Valid || len(validationErrors) != 0 ||
+		validationHash(revision.Document, validationErrors, validationWarnings) != revision.ValidationHash ||
+		revision.Validation.Hash != revision.ValidationHash {
+		return errors.New("Routing Catalog bootstrap validation evidence mismatch")
+	}
+	compiled, err := consumer.compiler.CompileSnapshot(ctx, revision.Document)
+	if err != nil {
+		return err
+	}
+	if revision.Revision < consumer.router.Revision() {
+		return errors.New("Routing Catalog bootstrap revision is stale")
+	}
+	if err := consumer.router.ReplaceAt(revision.Revision, revision.CreatedAt, compiled.Routes); err != nil {
+		return err
+	}
+	document, err := json.Marshal(revision.Document)
+	if err != nil {
+		return err
+	}
+	transaction, err := consumer.database.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = transaction.Rollback() }()
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO gateway_routing_catalog_history (
+		revision,publication_id,document,validation_hash,applied_at
+	) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (revision) DO NOTHING`, revision.Revision,
+		fmt.Sprintf("bootstrap-%d", revision.Revision), document, revision.ValidationHash, consumer.now().UTC()); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO gateway_routing_catalog_head (singleton,revision,updated_at)
+		VALUES (true,$1,$2) ON CONFLICT (singleton) DO UPDATE SET revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at
+		WHERE gateway_routing_catalog_head.revision<=EXCLUDED.revision`, revision.Revision, consumer.now().UTC()); err != nil {
+		return err
+	}
+	return transaction.Commit()
 }
 
 func (consumer *Consumer) recordConnectionInbox(ctx context.Context, event providerConnectionEvent, status, errorCode string) error {

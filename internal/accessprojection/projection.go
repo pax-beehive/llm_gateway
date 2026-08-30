@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -563,6 +564,60 @@ func (store *Store) ReplaceSnapshot(ctx context.Context, snapshot access.Snapsho
 		VALUES ('Tenant',$1,$2,$3)
 		ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET revision = EXCLUDED.revision, updated_at = EXCLUDED.updated_at`,
 		snapshot.Tenant.ID, snapshot.Tenant.Revision, store.now().UTC()); err != nil {
+		return err
+	}
+	return transaction.Commit()
+}
+
+// ReplaceSnapshots installs the complete set of authoritative Tenant snapshots
+// for one region. Each Tenant replacement is atomic; the relay cursor is moved
+// only after every replacement and the other bootstrap projections succeed, so
+// an interrupted bootstrap safely retries the same revisioned snapshots.
+func (store *Store) ReplaceSnapshots(ctx context.Context, region string, snapshots []access.Snapshot) error {
+	if strings.TrimSpace(region) == "" {
+		return errors.New("Gateway Access Projection bootstrap requires a region")
+	}
+	seen := make(map[string]struct{}, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.Tenant.HomeRegion != region {
+			return errors.New("Gateway Access Projection bootstrap contains another region")
+		}
+		if _, duplicate := seen[snapshot.Tenant.ID]; duplicate {
+			return errors.New("Gateway Access Projection bootstrap contains a duplicate Tenant")
+		}
+		seen[snapshot.Tenant.ID] = struct{}{}
+		if err := store.ReplaceSnapshot(ctx, snapshot); err != nil {
+			return err
+		}
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = transaction.Rollback() }()
+	if _, err := transaction.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "gateway-access-bootstrap\x1f"+region); err != nil {
+		return err
+	}
+	tenantIDs := make([]string, 0, len(seen))
+	for tenantID := range seen {
+		tenantIDs = append(tenantIDs, tenantID)
+	}
+	if _, err := transaction.ExecContext(ctx, `DELETE FROM gateway_access_gaps WHERE (aggregate_type='GatewayAPIKey' AND aggregate_id IN (
+		SELECT api_key_id FROM gateway_access_projection WHERE home_region=$1 AND NOT (tenant_id=ANY($2))
+	)) OR (aggregate_type='Tenant' AND aggregate_id IN (
+		SELECT tenant_id FROM gateway_access_projection WHERE home_region=$1 AND NOT (tenant_id=ANY($2))
+	))`, region, tenantIDs); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, `DELETE FROM gateway_access_heads WHERE (aggregate_type='GatewayAPIKey' AND aggregate_id IN (
+		SELECT api_key_id FROM gateway_access_projection WHERE home_region=$1 AND NOT (tenant_id=ANY($2))
+	)) OR (aggregate_type='Tenant' AND aggregate_id IN (
+		SELECT tenant_id FROM gateway_access_projection WHERE home_region=$1 AND NOT (tenant_id=ANY($2))
+	))`, region, tenantIDs); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, `DELETE FROM gateway_access_projection
+		WHERE home_region=$1 AND NOT (tenant_id=ANY($2))`, region, tenantIDs); err != nil {
 		return err
 	}
 	return transaction.Commit()

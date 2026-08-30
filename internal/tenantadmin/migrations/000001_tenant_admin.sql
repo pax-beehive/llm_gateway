@@ -63,6 +63,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS control_outbox_delivery_sequence_idx
 CREATE INDEX IF NOT EXISTS control_outbox_unpublished_idx
     ON control_outbox (occurred_at, event_id) WHERE published_at IS NULL;
 
+-- Fresh databases install domain migrations after the ordered Gateway schema.
+-- Attach the schema-23 cursor triggers once the outbox exists; upgrades with an
+-- existing outbox attach them directly from migration 23.
+DO $$
+BEGIN
+    IF to_regprocedure('serialize_control_outbox_delivery()') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS control_outbox_serialize_delivery_trigger ON control_outbox;
+        CREATE TRIGGER control_outbox_serialize_delivery_trigger
+            BEFORE INSERT ON control_outbox
+            FOR EACH ROW EXECUTE FUNCTION serialize_control_outbox_delivery();
+    END IF;
+    IF to_regclass('control_event_region_heads') IS NOT NULL
+       AND to_regprocedure('record_control_event_region_head()') IS NOT NULL THEN
+        INSERT INTO control_event_region_heads (region,access_cursor,updated_at)
+        SELECT payload->>'home_region',max(delivery_sequence),now()
+        FROM control_outbox
+        WHERE aggregate_type IN ('Tenant','GatewayAPIKey') AND schema_version=2
+          AND COALESCE(payload->>'home_region','')<>''
+        GROUP BY payload->>'home_region'
+        ON CONFLICT (region) DO UPDATE SET
+            access_cursor=GREATEST(control_event_region_heads.access_cursor,EXCLUDED.access_cursor),
+            updated_at=EXCLUDED.updated_at;
+
+        DROP TRIGGER IF EXISTS control_outbox_region_head_trigger ON control_outbox;
+        CREATE TRIGGER control_outbox_region_head_trigger
+            AFTER INSERT ON control_outbox
+            FOR EACH ROW EXECUTE FUNCTION record_control_event_region_head();
+    END IF;
+END $$;
+
 -- Control-plane creates attribute revision 1 directly through transaction-local
 -- actor settings. Legacy inserts keep the compatibility attribution.
 CREATE OR REPLACE FUNCTION tenants_record_initial_policy()

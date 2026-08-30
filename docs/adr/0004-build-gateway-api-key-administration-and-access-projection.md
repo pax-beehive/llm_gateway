@@ -23,8 +23,10 @@ versions and requires an authenticated-encrypted database transport attestation.
 
 Production delivery now uses ADR 0008's authenticated HTTPS Control Event relay
 and a durable Gateway-local cursor; the shared immutable-outbox reader remains a
-development compatibility adapter. Durable apply/reject receipts, alerts, and
-readiness are owned by ADR 0008.
+development compatibility adapter. A Gateway behind retained history replaces
+the complete regional Access Projection from ADR 0008's authenticated bootstrap
+before acknowledging its source cursor. Durable apply/reject receipts, alerts,
+and readiness are owned by ADR 0008.
 
 ## Context
 

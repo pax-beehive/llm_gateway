@@ -176,6 +176,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	bootstrapPublisher, err := controlrelay.NewPostgresBootstrapPublisher(database, time.Now)
+	if err != nil {
+		return err
+	}
+	bootstrapRelay, err := controlrelay.NewBootstrapHandler(bootstrapPublisher, gatewayVerifier)
+	if err != nil {
+		return err
+	}
 	go runGatewayAPIKeyGraceReconciler(ctx, credentials)
 	go runProviderOperationWorker(ctx, providerConnections)
 	if devMode {
@@ -209,6 +217,7 @@ func run() error {
 	})
 	mux := http.NewServeMux()
 	mux.Handle(controlrelay.EventPath, eventRelay)
+	mux.Handle(controlrelay.BootstrapPath, bootstrapRelay)
 	mux.Handle(controlrelay.SecretPathPrefix, secretRelay)
 	mux.Handle("/", operations.Handler(api, readiness))
 	address := envOr("CONTROL_PLANE_ADDR", ":8081")

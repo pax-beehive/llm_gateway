@@ -160,5 +160,7 @@ administrative state, and observed health are enforced at runtime. Unit,
 PostgreSQL integration, and control-plane black-box coverage exercise these
 boundaries. Production distribution now consumes ADR 0008's authenticated
 Control Event relay and compiles from the local Provider Connection execution
-projection; the shared PostgreSQL consumer remains development compatibility.
+projection. A retained-history bootstrap installs the current authoritative
+Routing Catalog without manufacturing a rollout receipt; the shared PostgreSQL
+consumer remains development compatibility.
 The ADR remains proposed until the decision is explicitly accepted.

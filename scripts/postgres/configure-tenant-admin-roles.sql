@@ -20,6 +20,8 @@ SELECT EXISTS (
         'control_command_idempotency'::regclass,
         'control_audit_events'::regclass,
         'control_outbox'::regclass,
+		'control_event_history'::regclass,
+		'control_event_region_heads'::regclass,
 		'provider_connections'::regclass,
 		'provider_connection_credential_versions'::regclass,
 		'provider_operations'::regclass,
@@ -64,6 +66,8 @@ REVOKE ALL PRIVILEGES ON TABLE
     control_command_idempotency,
     control_audit_events,
     control_outbox,
+	control_event_history,
+	control_event_region_heads,
 	provider_connections,
 	provider_connection_credential_versions,
 	provider_operations,
@@ -103,6 +107,8 @@ REVOKE ALL PRIVILEGES ON TABLE
     control_command_idempotency,
     control_audit_events,
     control_outbox,
+	control_event_history,
+	control_event_region_heads,
 	provider_connections,
 	provider_connection_credential_versions,
 	provider_operations,
@@ -169,6 +175,8 @@ GRANT SELECT, INSERT ON TABLE api_key_policy_revisions TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_command_idempotency TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_audit_events TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_outbox TO :"tenant_admin_role";
+GRANT SELECT ON TABLE control_event_history TO :"tenant_admin_role";
+GRANT SELECT ON TABLE control_event_region_heads TO :"tenant_admin_role";
 GRANT USAGE, SELECT ON SEQUENCE control_outbox_delivery_sequence_seq TO :"tenant_admin_role";
 GRANT UPDATE (publish_attempts, published_at, last_error) ON control_outbox TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE provider_connections TO :"tenant_admin_role";

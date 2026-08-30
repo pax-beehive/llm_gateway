@@ -330,9 +330,8 @@ func (service *Service) desiredRevisionsByRegion(ctx context.Context, gateways [
 			continue
 		}
 		var access int64
-		if err := service.database.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM control_outbox
-			WHERE aggregate_type IN ('Tenant','GatewayAPIKey') AND schema_version=2
-			AND COALESCE(payload->>'home_region'=$1,false)`, gateway.Region).Scan(&access); err != nil {
+		if err := service.database.QueryRowContext(ctx, `SELECT COALESCE(
+			(SELECT access_cursor FROM control_event_region_heads WHERE region=$1),0)`, gateway.Region).Scan(&access); err != nil {
 			return 0, nil, err
 		}
 		desired[gateway.Region] = access

@@ -30,6 +30,7 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		http.NotFound(response, request)
 		return
 	}
+	response.Header().Set("Cache-Control", "no-store")
 	after, err := parseBoundedInt(request.URL.Query().Get("after"), 0, 0, 1<<62)
 	if err != nil {
 		http.Error(response, "invalid cursor", http.StatusBadRequest)
@@ -48,6 +49,15 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	batch, err := handler.publisher.Publish(request.Context(), controlevent.Audience{
 		GatewayID: identity.GatewayID, Region: identity.Region,
 	}, after, int(limit))
+	var historyErr *HistoryUnavailableError
+	if errors.As(err, &historyErr) {
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(response).Encode(map[string]any{
+			"error": "control_event_history_unavailable", "minimum_cursor": historyErr.MinimumCursor,
+		})
+		return
+	}
 	if err != nil {
 		slog.Warn("Control Event relay publication failed", "error_code", "control_event_publication_failed", "error", err)
 		http.Error(response, "control event relay unavailable", http.StatusServiceUnavailable)
@@ -56,7 +66,6 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	if batch.Events == nil {
 		batch.Events = []controlevent.Event{}
 	}
-	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(response).Encode(batch)
 }

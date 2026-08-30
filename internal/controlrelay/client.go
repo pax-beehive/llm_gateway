@@ -70,6 +70,17 @@ func (client *Client) Fetch(ctx context.Context, after int64, limit int) (contro
 		return controlevent.Batch{}, fmt.Errorf("fetch Control Events: %w", err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusConflict {
+		var payload struct {
+			Error         string `json:"error"`
+			MinimumCursor int64  `json:"minimum_cursor"`
+		}
+		if json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&payload) == nil &&
+			payload.Error == "control_event_history_unavailable" && payload.MinimumCursor > after {
+			return controlevent.Batch{}, &HistoryUnavailableError{MinimumCursor: payload.MinimumCursor}
+		}
+		return controlevent.Batch{}, errors.New("invalid Control Event history response")
+	}
 	if response.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		return controlevent.Batch{}, fmt.Errorf("Control Event relay status %d", response.StatusCode)

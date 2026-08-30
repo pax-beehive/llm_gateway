@@ -123,16 +123,46 @@ atomically append `control_outbox`; that is durable enqueue, not delivery proof.
 Production Gateways pull a bounded, globally ordered, region-scoped stream from
 `/internal/v1/control-events`. The persisted cursor advances only after every
 local projection accepts the batch, so retry is idempotent and revision gaps
-fail closed. Each fetch also records the control-plane source head and last
+fail closed. Control-plane outbox inserts are serialized at the transaction
+boundary so a later delivery sequence cannot commit before an earlier one, and
+each batch reads its floor, source head, and rows from one repeatable-read
+snapshot. Each fetch also records the control-plane source head and last
 successful fetch time; Operations exposes their difference as relay backlog.
 Fetch and projection failures durably record a stable error code; transient
 execution-secret delivery failures leave the batch cursor unchanged even though
 the newly observed source head remains visible. Startup fails unless the bounded
-catch-up reaches `cursor == source_head`; only then does the Gateway compile and
-install the persisted Routing Catalog. HTTPS supplies transport encryption and
+catch-up reaches `cursor == source_head`. A Gateway behind the retained-history
+floor fetches the authenticated, `no-store` `/internal/v1/control-bootstrap`
+bundle, replaces its regional Access and secret-free Provider Connection
+projections plus the global Routing Catalog, and advances the relay cursor only
+after all three succeed. The bundle contains Gateway API Key digests needed for
+local verification, but never raw Gateway API Keys, Provider secrets, or Secret
+Manager references. Only then does the Gateway compile and install the persisted
+Routing Catalog. HTTPS supplies transport encryption and
 the Gateway HMAC binds its
 identity to the timestamp, method, exact path, and query. The original shared
 PostgreSQL consumers remain development compatibility adapters only.
+The same recovery runs if a live Gateway falls behind the floor: readiness is
+withdrawn until an authoritative bootstrap succeeds, then incremental delivery
+resumes. Durable per-region Access heads preserve desired-versus-applied
+Operations evidence after retained outbox rows are deleted.
+
+Control Event deletion is an explicit operator action, not a control-plane
+runtime worker. `make prune-control-events` requires a target cursor, a typed
+confirmation, authenticated database transport, and a dedicated retention role
+with `SELECT`/`DELETE` on `control_outbox`, `SELECT`/`UPDATE` on
+`control_event_history`, and `SELECT` on `operations_gateway_heartbeats`. Each
+bounded batch stops at the lowest recently reported Gateway relay cursor;
+Gateways whose heartbeat is older than the configured window must bootstrap if
+they later return:
+
+```sh
+CONTROL_EVENT_RETENTION_DATABASE_URL='postgres://...' \
+CONTROL_EVENT_RETENTION_THROUGH=123456 \
+CONTROL_EVENT_RETENTION_LIMIT=1000 \
+CONTROL_EVENT_RETENTION_GATEWAY_STALE_AFTER=15m \
+make prune-control-events
+```
 
 Gateways send signed soft-state heartbeats plus durable Routing Catalog and
 Access Projection rollout observations to

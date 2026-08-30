@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,6 +45,33 @@ import (
 type routeConfig = routingcatalog.RouteConfig
 
 type cacheRefreshConfig = routingcatalog.CacheRefreshConfig
+
+type controlEventRelayRuntime struct {
+	consumer  *controlrelay.Consumer
+	bootstrap func(context.Context, int64) error
+	blocked   atomic.Bool
+}
+
+func (runtime *controlEventRelayRuntime) runNext(ctx context.Context) (bool, error) {
+	worked, err := runtime.consumer.RunNext(ctx, 256)
+	var historyErr *controlrelay.HistoryUnavailableError
+	if !errors.As(err, &historyErr) {
+		return worked, err
+	}
+	runtime.blocked.Store(true)
+	if err := runtime.bootstrap(ctx, historyErr.MinimumCursor); err != nil {
+		return false, err
+	}
+	runtime.blocked.Store(false)
+	return true, nil
+}
+
+func (runtime *controlEventRelayRuntime) ready() error {
+	if runtime != nil && runtime.blocked.Load() {
+		return errors.New("Control Event relay requires authoritative bootstrap")
+	}
+	return nil
+}
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
@@ -220,6 +248,9 @@ func run() error {
 			}
 			return gatewayOutboxReady(pending, int64(gatewayEnvInt("GATEWAY_OUTBOX_READINESS_MAX_PENDING", 100000)))
 		}
+	}
+	if relayConsumer != nil {
+		readinessChecks["control_event_relay"] = func(context.Context) error { return relayConsumer.ready() }
 	}
 	if projection, ok := authenticator.(*accessprojection.Store); ok {
 		readinessChecks["access_projection"] = func(checkCtx context.Context) error {
@@ -752,7 +783,7 @@ func configureGatewayControlRelayClient() (*controlrelay.Client, error) {
 	return controlrelay.NewClient(endpoint, envOr("GATEWAY_ID", "gateway-local"), []byte(key), nil, time.Now)
 }
 
-func configureControlEventRelay(ctx context.Context, database *sql.DB, authenticator httpapi.Authenticator, router *provider.StaticRouter, region string) (*controlrelay.Consumer, error) {
+func configureControlEventRelay(ctx context.Context, database *sql.DB, authenticator httpapi.Authenticator, router *provider.StaticRouter, region string) (*controlEventRelayRuntime, error) {
 	endpoint := strings.TrimSpace(os.Getenv("GATEWAY_CONTROL_RELAY_URL"))
 	if endpoint == "" {
 		if os.Getenv("GATEWAY_ENV") == "production" {
@@ -804,9 +835,41 @@ func configureControlEventRelay(ctx context.Context, database *sql.DB, authentic
 	if err != nil {
 		return nil, err
 	}
+	runtime := &controlEventRelayRuntime{consumer: consumer}
+	runtime.bootstrap = func(bootstrapCtx context.Context, minimumCursor int64) error {
+		bootstrap, bootstrapErr := client.FetchBootstrap(bootstrapCtx)
+		if bootstrapErr != nil {
+			return fmt.Errorf("fetch Control Event bootstrap: %w", bootstrapErr)
+		}
+		if bootstrap.SourceCursor < minimumCursor || bootstrap.RoutingCatalog == nil {
+			return errors.New("Control Event bootstrap is incomplete")
+		}
+		if bootstrapErr := accessConsumer.ReplaceSnapshots(bootstrapCtx, region, bootstrap.Access); bootstrapErr != nil {
+			return fmt.Errorf("apply Access Projection bootstrap: %w", bootstrapErr)
+		}
+		if bootstrapErr := connectionProjection.ReplaceSnapshots(bootstrapCtx, bootstrap.ProviderConnections); bootstrapErr != nil {
+			return fmt.Errorf("apply Provider Connection bootstrap: %w", bootstrapErr)
+		}
+		if bootstrapErr := routingConsumer.ReplaceSnapshot(bootstrapCtx, routingcatalog.Revision{
+			Revision: bootstrap.RoutingCatalog.Revision, Document: bootstrap.RoutingCatalog.Document,
+			Validation:     bootstrap.RoutingCatalog.Validation,
+			ValidationHash: bootstrap.RoutingCatalog.ValidationHash, CreatedAt: bootstrap.RoutingCatalog.CreatedAt,
+		}); bootstrapErr != nil {
+			return fmt.Errorf("apply Routing Catalog bootstrap: %w", bootstrapErr)
+		}
+		if os.Getenv("GATEWAY_ENV") == "production" {
+			if bootstrapErr := accessConsumer.ValidatePepperCoverage(bootstrapCtx); bootstrapErr != nil {
+				return fmt.Errorf("gate bootstrapped Access Projection digest pepper coverage: %w", bootstrapErr)
+			}
+		}
+		if bootstrapErr := consumer.BootstrapCursor(bootstrapCtx, bootstrap.SourceCursor); bootstrapErr != nil {
+			return fmt.Errorf("acknowledge Control Event bootstrap: %w", bootstrapErr)
+		}
+		return nil
+	}
 	caughtUp := false
 	for count := 0; count < 10_000; count++ {
-		worked, err := consumer.RunNext(ctx, 256)
+		worked, err := runtime.runNext(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("catch up Control Event relay: %w", err)
 		}
@@ -836,13 +899,13 @@ func configureControlEventRelay(ctx context.Context, database *sql.DB, authentic
 	if err := router.ReplaceAt(projected.Revision, projected.CreatedAt, compiled.Routes); err != nil {
 		return nil, fmt.Errorf("install caught-up Routing Catalog revision %d: %w", projected.Revision, err)
 	}
-	return consumer, nil
+	return runtime, nil
 }
 
-func runControlEventRelay(ctx context.Context, consumer *controlrelay.Consumer) {
+func runControlEventRelay(ctx context.Context, runtime *controlEventRelayRuntime) {
 	run := func() {
 		for count := 0; count < 256; count++ {
-			worked, err := consumer.RunNext(ctx, 256)
+			worked, err := runtime.runNext(ctx)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
 					slog.Warn("Control Event relay consumer degraded", "error", err)

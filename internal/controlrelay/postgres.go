@@ -14,6 +14,14 @@ type PostgresPublisher struct {
 	database *sql.DB
 }
 
+type HistoryUnavailableError struct {
+	MinimumCursor int64
+}
+
+func (err *HistoryUnavailableError) Error() string {
+	return fmt.Sprintf("Control Event history requires cursor at least %d", err.MinimumCursor)
+}
+
 func NewPostgresPublisher(database *sql.DB) (*PostgresPublisher, error) {
 	if database == nil {
 		return nil, errors.New("PostgreSQL Control Event publisher requires a database")
@@ -25,11 +33,26 @@ func (publisher *PostgresPublisher) Publish(ctx context.Context, audience contro
 	if strings.TrimSpace(audience.GatewayID) == "" || strings.TrimSpace(audience.Region) == "" || after < 0 || limit < 1 || limit > 256 {
 		return controlevent.Batch{}, errors.New("invalid Control Event publication request")
 	}
+	transaction, err := publisher.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return controlevent.Batch{}, err
+	}
+	defer func() { _ = transaction.Rollback() }()
+	var minimumCursor int64
+	if err := transaction.QueryRowContext(ctx, `SELECT minimum_cursor FROM control_event_history WHERE singleton=true`).Scan(&minimumCursor); err != nil {
+		return controlevent.Batch{}, fmt.Errorf("read Control Event history floor: %w", err)
+	}
+	if after < minimumCursor {
+		return controlevent.Batch{}, &HistoryUnavailableError{MinimumCursor: minimumCursor}
+	}
 	var sourceHead int64
-	if err := publisher.database.QueryRowContext(ctx, `SELECT GREATEST(COALESCE(max(delivery_sequence),0),$1) FROM control_outbox`, after).Scan(&sourceHead); err != nil {
+	if err := transaction.QueryRowContext(ctx, `SELECT GREATEST(COALESCE(max(delivery_sequence),0),$1) FROM control_outbox`, minimumCursor).Scan(&sourceHead); err != nil {
 		return controlevent.Batch{}, fmt.Errorf("read Control Event source head: %w", err)
 	}
-	rows, err := publisher.database.QueryContext(ctx, `WITH event_window AS (
+	if after > sourceHead {
+		return controlevent.Batch{}, errors.New("Control Event cursor is ahead of source head")
+	}
+	rows, err := transaction.QueryContext(ctx, `WITH event_window AS (
 		SELECT event_id,delivery_sequence,schema_version,aggregate_type,aggregate_id,aggregate_revision,
 		       COALESCE(tenant_id,'') AS tenant_id,event_type,occurred_at,payload
 		FROM control_outbox WHERE delivery_sequence>$1 AND delivery_sequence<=$4 ORDER BY delivery_sequence LIMIT $2
@@ -53,7 +76,6 @@ func (publisher *PostgresPublisher) Publish(ctx context.Context, audience contro
 	if err != nil {
 		return controlevent.Batch{}, fmt.Errorf("read Control Event publication window: %w", err)
 	}
-	defer rows.Close()
 	batch := controlevent.Batch{Events: []controlevent.Event{}, NextCursor: after, SourceHead: sourceHead}
 	for rows.Next() {
 		var event controlevent.Event
@@ -69,6 +91,13 @@ func (publisher *PostgresPublisher) Publish(ctx context.Context, audience contro
 		}
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return controlevent.Batch{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return controlevent.Batch{}, err
+	}
+	if err := transaction.Commit(); err != nil {
 		return controlevent.Batch{}, err
 	}
 	return batch, nil

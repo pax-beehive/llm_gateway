@@ -103,6 +103,16 @@ assert projected["schema_version"] == 3, projected
 encoded = json.dumps(projected)
 assert secret not in encoded and "secret_ref" not in encoded, projected
 
+bootstrap, headers = gateway_get("/internal/v1/control-bootstrap")
+assert headers.get("Cache-Control") == "no-store", headers
+assert bootstrap["schema_version"] == 1 and bootstrap["source_cursor"] >= cursor, bootstrap
+bootstrap_connection = next(
+    item for item in bootstrap["provider_connections"] if item["connection_id"] == connection_id
+)
+assert bootstrap_connection["revision"] == enabled["revision"], bootstrap_connection
+encoded_bootstrap = json.dumps(bootstrap)
+assert secret not in encoded_bootstrap and "secret_ref" not in encoded_bootstrap, bootstrap
+
 secret_path = f"/internal/v1/provider-connection-secrets/{connection_id}?" + urllib.parse.urlencode(
     {"credential_version": enabled["credential_version"], "revision": enabled["revision"]}
 )
@@ -117,4 +127,4 @@ stale_path = f"/internal/v1/provider-connection-secrets/{connection_id}?" + urll
     {"credential_version": enabled["credential_version"], "revision": enabled["revision"] + 1}
 )
 gateway_get(stale_path, expected=404)
-print("PASS authenticated region-scoped Control Event relay and exact-version secret delivery")
+print("PASS authenticated relay, multi-projection bootstrap, and exact-version secret delivery")

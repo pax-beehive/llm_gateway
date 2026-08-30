@@ -361,6 +361,59 @@ func TestAPIKeyConcurrencyLeaseIsHardAcrossStoreInstances(t *testing.T) {
 	}
 }
 
+func TestRegionalBootstrapRemovesTenantThatLeftRegion(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	if err := accessprojection.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	pepper := []byte("regional-bootstrap-test-pepper")
+	store, err := accessprojection.New(db, accessprojection.PepperRing{CurrentVersion: 1, Peppers: map[int16][]byte{1: pepper}}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	region := "bootstrap-region-" + suffix
+	tenantID := "tenant-bootstrap-" + suffix
+	keyID := "gak-bootstrap-" + suffix
+	rawKey := "gw_bootstrap_key_" + suffix
+	digest := hmac.New(sha256.New, pepper)
+	_, _ = digest.Write([]byte(rawKey))
+	snapshot := access.Snapshot{Tenant: access.TenantSnapshot{
+		ID: tenantID, Status: access.TenantActive, Revision: 1, HomeRegion: region, ExecutionEpoch: 1,
+		Policy: core.TenantPolicy{Revision: 1},
+	}, Keys: []access.KeySnapshot{{
+		ID: keyID, Prefix: "gw_bootstrap", SecretDigest: digest.Sum(nil), DigestVersion: 1,
+		Status: access.APIKeyActive, Revision: 1, Policy: core.APIKeyPolicy{Revision: 1},
+	}}, CreatedAt: now}
+	if err := store.ReplaceSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Authenticate(ctx, rawKey); err != nil {
+		t.Fatalf("authenticate seeded projection: %v", err)
+	}
+	if err := store.ReplaceSnapshots(ctx, region, []access.Snapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Authenticate(ctx, rawKey); !errors.Is(err, access.ErrInvalidAPIKey) {
+		t.Fatalf("removed regional Tenant authentication = %v", err)
+	}
+	var heads int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_access_heads WHERE aggregate_id IN ($1,$2)`, tenantID, keyID).Scan(&heads); err != nil || heads != 0 {
+		t.Fatalf("stale regional heads = %d/%v", heads, err)
+	}
+}
+
 func TestControlOutboxEventsBuildLocalProjectionWithoutRuntimeControlPlaneCalls(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
