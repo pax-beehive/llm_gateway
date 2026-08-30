@@ -1,0 +1,9 @@
+.git
+.github
+.terraform
+**/.terraform
+*.tfstate
+*.tfstate.*
+.env
+coverage.out
+docs

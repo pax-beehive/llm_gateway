@@ -431,16 +431,20 @@ func configureStore(apiKeys, homeRegions map[string]string, executionEpochs map[
 	if os.Getenv("GATEWAY_ENV") == "production" && os.Getenv("GATEWAY_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
 		return nil, nil, func() {}, errors.New("production requires GATEWAY_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted")
 	}
+	cloudSQLInstance := strings.TrimSpace(os.Getenv("GATEWAY_CLOUD_SQL_INSTANCE"))
 	if os.Getenv("GATEWAY_ENV") == "production" {
-		if err := dbtransport.RequireAuthenticatedEncryption(databaseURL); err != nil {
+		if err := dbtransport.RequireAuthenticatedTransport(databaseURL, cloudSQLInstance); err != nil {
 			return nil, nil, func() {}, fmt.Errorf("Gateway database transport: %w", err)
 		}
 	}
-	db, err := sql.Open("pgx", databaseURL)
+	db, cleanupTransport, err := dbtransport.Open(context.Background(), databaseURL, cloudSQLInstance)
 	if err != nil {
 		return nil, nil, func() {}, err
 	}
-	cleanup := func() { _ = db.Close() }
+	cleanup := func() {
+		_ = db.Close()
+		_ = cleanupTransport()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {

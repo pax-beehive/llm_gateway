@@ -29,3 +29,28 @@ func TestRequireAuthenticatedEncryption(t *testing.T) {
 		})
 	}
 }
+
+func TestRequireAuthenticatedTransport(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		databaseURL string
+		instance    string
+		wantError   bool
+	}{
+		{name: "verified direct TLS", databaseURL: "postgres://db.example.test/gateway?sslmode=verify-full"},
+		{name: "Cloud SQL Connector", databaseURL: "user=gateway dbname=gateway", instance: "pax-fde-prod:us-west1:llm-gateway-prod-postgres"},
+		{name: "direct plaintext", databaseURL: "postgres://db.example.test/gateway?sslmode=disable", wantError: true},
+		{name: "malformed connector instance", databaseURL: "user=gateway dbname=gateway", instance: "pax-fde-prod/us-west1/instance", wantError: true},
+		{name: "uppercase connector instance", databaseURL: "user=gateway dbname=gateway", instance: "PAX:us-west1:instance", wantError: true},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			err := dbtransport.RequireAuthenticatedTransport(test.databaseURL, test.instance)
+			if (err != nil) != test.wantError {
+				t.Fatalf("error = %v, wantError=%t", err, test.wantError)
+			}
+		})
+	}
+}

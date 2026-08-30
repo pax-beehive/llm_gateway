@@ -1,0 +1,5 @@
+project_id       = "pax-fde-prod"
+region           = "us-west1"
+environment      = "prod"
+database_version = "POSTGRES_18"
+database_tier    = "db-custom-2-7680"

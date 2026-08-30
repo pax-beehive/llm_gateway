@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/subtle"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -49,18 +48,20 @@ func run() error {
 	if databaseURL == "" {
 		return errors.New("METERING_DATABASE_URL is required")
 	}
+	cloudSQLInstance := strings.TrimSpace(os.Getenv("METERING_CLOUD_SQL_INSTANCE"))
 	if !devMode {
 		if os.Getenv("METERING_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
 			return errors.New("production Metering requires authenticated database transport attestation")
 		}
-		if err := dbtransport.RequireAuthenticatedEncryption(databaseURL); err != nil {
+		if err := dbtransport.RequireAuthenticatedTransport(databaseURL, cloudSQLInstance); err != nil {
 			return err
 		}
 	}
-	database, err := sql.Open("pgx", databaseURL)
+	database, cleanupTransport, err := dbtransport.Open(ctx, databaseURL, cloudSQLInstance)
 	if err != nil {
 		return err
 	}
+	defer cleanupTransport()
 	defer database.Close()
 	database.SetMaxOpenConns(20)
 	database.SetMaxIdleConns(5)

@@ -62,15 +62,17 @@ func run() error {
 	if !devMode && os.Getenv("CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION") != "authenticated-encrypted" {
 		return errors.New("production requires CONTROL_PLANE_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted")
 	}
+	cloudSQLInstance := strings.TrimSpace(os.Getenv("CONTROL_PLANE_CLOUD_SQL_INSTANCE"))
 	if !devMode {
-		if err := dbtransport.RequireAuthenticatedEncryption(databaseURL); err != nil {
+		if err := dbtransport.RequireAuthenticatedTransport(databaseURL, cloudSQLInstance); err != nil {
 			return fmt.Errorf("control-plane database transport: %w", err)
 		}
 	}
-	database, err := sql.Open("pgx", databaseURL)
+	database, cleanupTransport, err := dbtransport.Open(ctx, databaseURL, cloudSQLInstance)
 	if err != nil {
 		return err
 	}
+	defer cleanupTransport()
 	defer database.Close()
 	database.SetMaxOpenConns(20)
 	database.SetMaxIdleConns(5)

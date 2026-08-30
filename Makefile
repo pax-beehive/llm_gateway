@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-metering-role test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-control-relay-blackbox test-operations-blackbox test-metering-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev run-metering-dev bootstrap-access repair-access-projection prune-control-events configure-tenant-admin-roles configure-metering-role compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-metering-role test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-control-relay-blackbox test-operations-blackbox test-metering-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev run-metering-dev migrate-schema bootstrap-access repair-access-projection prune-control-events configure-tenant-admin-roles configure-metering-role compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -100,6 +100,10 @@ run-metering-dev:
 	GOCACHE=$(GOCACHE) METERING_DEV_MODE=true METERING_MIGRATE=true \
 	METERING_DATABASE_URL="$${METERING_DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
 	go run ./cmd/metering
+
+migrate-schema:
+	@test -n "$(ADMIN_DATABASE_URL)" || { echo "ADMIN_DATABASE_URL is required" >&2; exit 1; }
+	GOCACHE=$(GOCACHE) SCHEMA_MIGRATION_CONFIRM=apply go run ./cmd/schema-migrate
 
 bootstrap-access:
 	@test -n "$(GATEWAY_DATABASE_URL)" || { echo "GATEWAY_DATABASE_URL is required" >&2; exit 1; }

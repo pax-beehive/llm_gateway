@@ -1,0 +1,2 @@
+bucket = "pax-fde-prod-tfstate"
+prefix = "llm-gateway/prod"

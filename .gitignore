@@ -4,3 +4,8 @@
 /.vscode/
 *.log
 coverage.out
+.terraform/
+*.tfstate
+*.tfstate.*
+infra/gcp/backend.hcl
+infra/gcp/*.auto.tfvars

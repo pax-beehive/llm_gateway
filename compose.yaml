@@ -32,7 +32,7 @@ services:
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD", "/llm-gateway", "healthcheck"]
+      test: ["CMD", "/service", "healthcheck"]
       interval: 5s
       timeout: 2s
       retries: 10
