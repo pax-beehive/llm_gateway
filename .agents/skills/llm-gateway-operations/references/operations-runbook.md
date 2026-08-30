@@ -64,6 +64,18 @@ Do not mutate digest rows manually or purge historical usage attribution.
 
 Inspect oldest pending age and count for outbox, consumer inbox, quota reconciliation, Cache Protection, and retention. Determine whether the worker is stopped, fenced, processing a poison event, or waiting on a true external dependency. Prefer repairing the blocked item or consumer offset with an audited procedure over deleting backlog.
 
+For Metering, query `/control/v1/operations/metering` before inspecting the
+service directly. Separate heartbeat staleness, projection cutoff, oldest
+pending usage event, poison-event count, and queued exports. A missing
+observation is `unavailable`; a stale heartbeat or poison event is `degraded`.
+Do not infer a Metering cutoff from the Gateway Usage Ledger head.
+
+Production CSV exports use a single-region GCS bucket. Verify the configured
+region and grant the Workload Identity only `storage.buckets.get`,
+`storage.objects.create`, and `storage.objects.get`. `ifGenerationMatch=0`
+prevents overwrite; a retry that finds different bytes is an integrity
+incident, not permission to replace the object.
+
 ## Health and readiness
 
 `/healthz` proves the process can answer. ADR 0008 defines `/readyz`, heartbeats, revision receipts, and lag. A control-plane, Metering, or Human IAM outage should not make a Gateway unready when its local access/routing snapshots, authoritative store, Home Region configuration, and outbox capacity remain healthy.

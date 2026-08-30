@@ -43,6 +43,7 @@ SELECT EXISTS (
 		'gateway_provider_connection_projection_gaps'::regclass,
 		'operations_schema_metadata'::regclass,
 		'operations_gateway_heartbeats'::regclass,
+		'operations_metering_heartbeats'::regclass,
 		'operations_access_rollout_receipts'::regclass,
 		'gateway_schema_metadata'::regclass,
         'gateway_access_projection'::regclass,
@@ -89,6 +90,7 @@ REVOKE ALL PRIVILEGES ON TABLE
 	gateway_provider_connection_projection_gaps,
 	operations_schema_metadata,
 	operations_gateway_heartbeats,
+	operations_metering_heartbeats,
 	operations_access_rollout_receipts,
 	gateway_schema_metadata,
     gateway_access_projection,
@@ -130,6 +132,7 @@ REVOKE ALL PRIVILEGES ON TABLE
 	gateway_provider_connection_projection_gaps,
 	operations_schema_metadata,
 	operations_gateway_heartbeats,
+	operations_metering_heartbeats,
 	operations_access_rollout_receipts,
 	gateway_schema_metadata,
     gateway_access_projection,
@@ -201,6 +204,7 @@ GRANT SELECT, INSERT, UPDATE ON TABLE routing_rollout_receipts TO :"tenant_admin
 GRANT SELECT ON TABLE gateway_routing_catalog_inbox TO :"tenant_admin_role";
 GRANT SELECT ON TABLE operations_schema_metadata TO :"tenant_admin_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE operations_gateway_heartbeats TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE operations_metering_heartbeats TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE operations_access_rollout_receipts TO :"tenant_admin_role";
 REVOKE ALL PRIVILEGES ON TABLE tenant_quota_counters,api_key_quota_counters,quota_reservations
 FROM PUBLIC, :"tenant_admin_role";

@@ -20,6 +20,8 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/metering"
+	"github.com/toddzheng/llm-gateway/internal/operations"
+	"github.com/toddzheng/llm-gateway/internal/secretcustody"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 )
 
@@ -88,6 +90,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	startedAt := time.Now().UTC()
 	if os.Getenv("METERING_BOOTSTRAP_LEDGER") == "true" {
 		for {
 			count, err := service.BackfillGatewayLedger(ctx, 1000)
@@ -107,14 +110,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	exportDirectory := strings.TrimSpace(os.Getenv("METERING_EXPORT_DIRECTORY"))
-	if exportDirectory == "" {
-		if !devMode {
-			return errors.New("METERING_EXPORT_DIRECTORY is required")
-		}
-		exportDirectory = "/tmp/llm-gateway-metering-exports"
-	}
-	exportStore, err := metering.NewFileExportStore(exportDirectory)
+	exportStore, err := configureExportStore(ctx, devMode)
 	if err != nil {
 		return err
 	}
@@ -129,7 +125,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	reporter, err := configureOperationsReporter(devMode)
+	if err != nil {
+		return err
+	}
 	go runWorkers(ctx, service, exportStore, envOr("METERING_WORKER_ID", "metering-local"))
+	if reporter != nil {
+		go runOperationsReporter(ctx, reporter, service, startedAt)
+	}
 	server := &http.Server{Addr: envOr("METERING_ADDR", ":8082"), Handler: otelhttp.NewHandler(handler, "metering.http"), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
 	errorsChannel := make(chan error, 1)
 	go func() { errorsChannel <- server.ListenAndServe() }()
@@ -143,6 +146,86 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
+	}
+}
+
+func configureExportStore(ctx context.Context, devMode bool) (metering.ExportStore, error) {
+	backend := strings.ToLower(strings.TrimSpace(os.Getenv("METERING_EXPORT_BACKEND")))
+	if backend == "" {
+		if devMode {
+			backend = "filesystem"
+		} else {
+			backend = "gcs"
+		}
+	}
+	switch backend {
+	case "filesystem":
+		if !devMode {
+			return nil, errors.New("filesystem Metering export backend is development-only")
+		}
+		directory := strings.TrimSpace(os.Getenv("METERING_EXPORT_DIRECTORY"))
+		if directory == "" {
+			directory = "/tmp/llm-gateway-metering-exports"
+		}
+		return metering.NewFileExportStore(directory)
+	case "gcs":
+		provider := secretcustody.NewMetadataTokenProvider()
+		return metering.NewGCSExportStore(ctx, metering.GCSExportStoreConfig{
+			Bucket: os.Getenv("METERING_EXPORT_GCS_BUCKET"), Prefix: os.Getenv("METERING_EXPORT_GCS_PREFIX"),
+			Region: os.Getenv("METERING_EXPORT_GCS_REGION"),
+			AccessToken: func(tokenCtx context.Context) (string, error) {
+				token, err := provider.Token(tokenCtx)
+				return token.AccessToken, err
+			},
+		})
+	default:
+		return nil, errors.New("METERING_EXPORT_BACKEND must be filesystem or gcs")
+	}
+}
+
+func configureOperationsReporter(devMode bool) (*operations.MeteringReporter, error) {
+	endpoint := strings.TrimSpace(os.Getenv("METERING_OPERATIONS_URL"))
+	if endpoint == "" {
+		if !devMode {
+			return nil, errors.New("production requires METERING_OPERATIONS_URL")
+		}
+		return nil, nil
+	}
+	if !devMode && !strings.HasPrefix(endpoint, "https://") {
+		return nil, errors.New("production METERING_OPERATIONS_URL must use HTTPS")
+	}
+	key := []byte(os.Getenv("METERING_OPERATIONS_HMAC_KEY"))
+	if devMode && len(key) == 0 {
+		key = []byte("local-development-metering-hmac-key-001")
+	}
+	return operations.NewMeteringReporter(endpoint, envOr("METERING_ID", "metering-local"),
+		envOr("METERING_REGION", "local"), key, nil, time.Now)
+}
+
+func runOperationsReporter(ctx context.Context, reporter *operations.MeteringReporter, service *metering.Service, startedAt time.Time) {
+	report := func() {
+		status, err := service.Status(ctx)
+		if err == nil {
+			err = reporter.Report(ctx, operations.MeteringObservation{
+				ProjectionGeneration: status.ProjectionGeneration, ProjectionCutoff: status.ProjectionCutoff,
+				PendingEvents: status.PendingEvents, OldestPendingAt: status.OldestPendingAt,
+				PoisonEvents: status.PoisonEvents, QueuedExports: status.QueuedExports, StartedAt: startedAt,
+			})
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("Metering Operations reporting degraded", "error_code", "operations_report_failed")
+		}
+	}
+	report()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report()
+		}
 	}
 }
 

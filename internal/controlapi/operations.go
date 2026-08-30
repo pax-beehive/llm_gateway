@@ -51,6 +51,44 @@ func (server *Server) receiveGatewayObservation(writer http.ResponseWriter, requ
 	writeJSON(writer, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
+func (server *Server) receiveMeteringObservation(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		methodNotAllowed(writer, http.MethodPost)
+		return
+	}
+	if server.meteringVerifier == nil || server.meteringObservations == nil {
+		writeAPIError(writer, http.StatusServiceUnavailable, "service_unavailable", "Metering observations are not configured")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(request.Body, 64<<10+1))
+	if err != nil || len(body) == 0 || len(body) > 64<<10 {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "Metering observation is invalid")
+		return
+	}
+	identity, err := server.meteringVerifier.Verify(request.Context(), request.Header.Get("Authorization"), request.Method, request.URL.RequestURI(), body)
+	if err != nil {
+		writer.Header().Set("WWW-Authenticate", "Metering-HMAC")
+		writeAPIError(writer, http.StatusUnauthorized, "invalid_metering_identity", "Metering identity is missing or invalid")
+		return
+	}
+	var observation operations.MeteringObservation
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&observation); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "Metering observation is invalid")
+		return
+	}
+	if err := server.meteringObservations.RecordMeteringObservation(request.Context(), identity, observation); err != nil {
+		if errors.Is(err, operations.ErrInvalidArgument) {
+			writeAPIError(writer, http.StatusBadRequest, "invalid_request", "Metering observation is invalid")
+			return
+		}
+		writeAPIError(writer, http.StatusServiceUnavailable, "service_unavailable", "Metering observation could not be recorded")
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
 func (server *Server) routeOperations(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) bool {
 	const root = "/control/v1/operations"
 	if request.URL.Path != root && !strings.HasPrefix(request.URL.Path, root+"/") {
@@ -77,6 +115,10 @@ func (server *Server) routeOperations(writer http.ResponseWriter, request *http.
 		value, err = server.operations.ListGateways(request.Context(), actor)
 	case len(parts) == 2 && parts[0] == "gateways":
 		value, err = server.operations.GetGateway(request.Context(), actor, operationPathID(parts[1]))
+	case len(parts) == 1 && parts[0] == "metering":
+		value, err = server.operations.ListMetering(request.Context(), actor)
+	case len(parts) == 2 && parts[0] == "metering":
+		value, err = server.operations.GetMetering(request.Context(), actor, operationPathID(parts[1]))
 	case len(parts) == 1 && parts[0] == "publications":
 		value, err = server.operations.ListPublications(request.Context(), actor)
 	case len(parts) == 2 && parts[0] == "publications":

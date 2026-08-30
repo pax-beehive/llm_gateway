@@ -31,17 +31,19 @@ type ReceiptRecorder interface {
 }
 
 type Service struct {
-	database     *sql.DB
-	receipts     ReceiptRecorder
-	now          func() time.Time
-	staleAfter   time.Duration
-	heartbeatLag metric.Float64Histogram
-	routingLag   metric.Int64Histogram
-	accessLag    metric.Int64Histogram
-	backlog      metric.Int64Histogram
-	consumerLag  metric.Float64Histogram
-	oldestOutbox metric.Float64Histogram
-	revocation   metric.Float64Histogram
+	database          *sql.DB
+	receipts          ReceiptRecorder
+	now               func() time.Time
+	staleAfter        time.Duration
+	heartbeatLag      metric.Float64Histogram
+	routingLag        metric.Int64Histogram
+	accessLag         metric.Int64Histogram
+	backlog           metric.Int64Histogram
+	consumerLag       metric.Float64Histogram
+	oldestOutbox      metric.Float64Histogram
+	revocation        metric.Float64Histogram
+	meteringHeartbeat metric.Float64Histogram
+	meteringCutoff    metric.Float64Histogram
 }
 
 func NewService(database *sql.DB, receipts ReceiptRecorder, now func() time.Time) (*Service, error) {
@@ -59,9 +61,11 @@ func NewService(database *sql.DB, receipts ReceiptRecorder, now func() time.Time
 	consumerLag, _ := meter.Float64Histogram("gateway.operations.consumer_lag_seconds")
 	oldestOutbox, _ := meter.Float64Histogram("gateway.operations.oldest_unpublished_outbox_age_seconds")
 	revocation, _ := meter.Float64Histogram("gateway.operations.key_revocation_propagation_seconds")
+	meteringHeartbeat, _ := meter.Float64Histogram("gateway.operations.metering_heartbeat_lag_seconds")
+	meteringCutoff, _ := meter.Float64Histogram("gateway.operations.metering_projection_cutoff_lag_seconds")
 	return &Service{database: database, receipts: receipts, now: now, staleAfter: 15 * time.Second,
 		heartbeatLag: heartbeatLag, routingLag: routingLag, accessLag: accessLag, backlog: backlog, consumerLag: consumerLag,
-		oldestOutbox: oldestOutbox, revocation: revocation}, nil
+		oldestOutbox: oldestOutbox, revocation: revocation, meteringHeartbeat: meteringHeartbeat, meteringCutoff: meteringCutoff}, nil
 }
 
 func (service *Service) RecordGatewayObservation(ctx context.Context, identity GatewayIdentity, observation GatewayObservation) error {
@@ -158,6 +162,64 @@ func (service *Service) RecordGatewayObservation(ctx context.Context, identity G
 	return nil
 }
 
+func (service *Service) RecordMeteringObservation(ctx context.Context, identity MeteringIdentity, observation MeteringObservation) error {
+	if err := validateMeteringObservation(identity, observation, service.now().UTC()); err != nil {
+		return err
+	}
+	observation.ObservedAt = observation.ObservedAt.UTC().Truncate(time.Microsecond)
+	result, err := service.database.ExecContext(ctx, `INSERT INTO operations_metering_heartbeats (
+		metering_id,region,projection_generation,projection_cutoff,pending_events,oldest_pending_at,
+		poison_events,queued_exports,started_at,observed_at,received_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+	ON CONFLICT (metering_id) DO UPDATE SET region=EXCLUDED.region,
+		projection_generation=EXCLUDED.projection_generation,projection_cutoff=EXCLUDED.projection_cutoff,
+		pending_events=EXCLUDED.pending_events,oldest_pending_at=EXCLUDED.oldest_pending_at,
+		poison_events=EXCLUDED.poison_events,queued_exports=EXCLUDED.queued_exports,
+		started_at=EXCLUDED.started_at,observed_at=EXCLUDED.observed_at,received_at=EXCLUDED.received_at
+	WHERE EXCLUDED.observed_at > operations_metering_heartbeats.observed_at
+	  AND EXCLUDED.projection_generation >= operations_metering_heartbeats.projection_generation
+	  AND EXCLUDED.projection_cutoff >= operations_metering_heartbeats.projection_cutoff`,
+		identity.MeteringID, identity.Region, observation.ProjectionGeneration, observation.ProjectionCutoff.UTC(),
+		observation.PendingEvents, observation.OldestPendingAt, observation.PoisonEvents, observation.QueuedExports,
+		observation.StartedAt.UTC(), observation.ObservedAt, service.now().UTC())
+	if err != nil {
+		return err
+	}
+	accepted, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if accepted == 1 {
+		now := service.now().UTC()
+		service.meteringHeartbeat.Record(ctx, nonnegativeSeconds(now.Sub(observation.ObservedAt)), metric.WithAttributes(attribute.String("region", identity.Region)))
+		service.meteringCutoff.Record(ctx, nonnegativeSeconds(now.Sub(observation.ProjectionCutoff)), metric.WithAttributes(attribute.String("region", identity.Region)))
+		for kind, value := range map[string]int64{"metering_events": observation.PendingEvents, "metering_poison": observation.PoisonEvents, "metering_exports": observation.QueuedExports} {
+			service.backlog.Record(ctx, value, metric.WithAttributes(attribute.String("kind", kind), attribute.String("region", identity.Region)))
+		}
+	}
+	return nil
+}
+
+func validateMeteringObservation(identity MeteringIdentity, observation MeteringObservation, now time.Time) error {
+	skew := now.Sub(observation.ObservedAt)
+	if !resourceID.MatchString(identity.MeteringID) || strings.TrimSpace(identity.Region) == "" ||
+		observation.MeteringID != identity.MeteringID || observation.Region != identity.Region ||
+		observation.EventSchemaVersion != CurrentMeteringObservationVersion || observation.ProjectionGeneration <= 0 ||
+		observation.ProjectionCutoff.IsZero() || observation.PendingEvents < 0 || observation.PoisonEvents < 0 ||
+		observation.QueuedExports < 0 || observation.StartedAt.IsZero() || observation.ObservedAt.IsZero() ||
+		observation.StartedAt.After(observation.ObservedAt) || observation.ProjectionCutoff.After(observation.ObservedAt) ||
+		skew > 5*time.Minute || skew < -5*time.Minute {
+		return ErrInvalidArgument
+	}
+	if observation.OldestPendingAt != nil && (observation.PendingEvents == 0 || observation.OldestPendingAt.After(observation.ObservedAt)) {
+		return ErrInvalidArgument
+	}
+	if observation.PendingEvents > 0 && observation.OldestPendingAt == nil {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
 func validateObservation(identity GatewayIdentity, observation GatewayObservation, now time.Time) error {
 	observedSkew := now.Sub(observation.ObservedAt)
 	if !resourceID.MatchString(identity.GatewayID) || strings.TrimSpace(identity.Region) == "" || observation.GatewayID != identity.GatewayID || observation.Region != identity.Region ||
@@ -230,7 +292,9 @@ func (service *Service) ListGateways(ctx context.Context, actor tenantadmin.Acto
 	if err != nil {
 		return GatewayPage{}, err
 	}
-	service.finishGatewaySummaries(ctx, page.Data, desiredRouting, desiredAccess)
+	if err := service.finishGatewaySummaries(ctx, page.Data, desiredRouting, desiredAccess); err != nil {
+		return GatewayPage{}, err
+	}
 	return page, nil
 }
 
@@ -256,7 +320,9 @@ func (service *Service) GetGateway(ctx context.Context, actor tenantadmin.ActorE
 	if err := service.loadAccessReceipts(ctx, values); err != nil {
 		return GatewaySummary{}, err
 	}
-	service.finishGatewaySummaries(ctx, values, routing, accessByRegion)
+	if err := service.finishGatewaySummaries(ctx, values, routing, accessByRegion); err != nil {
+		return GatewaySummary{}, err
+	}
 	return values[0], nil
 }
 
@@ -339,8 +405,12 @@ func (service *Service) desiredRevisionsByRegion(ctx context.Context, gateways [
 	return routing, desired, nil
 }
 
-func (service *Service) finishGatewaySummaries(ctx context.Context, values []GatewaySummary, desiredRouting int64, desiredAccessByRegion map[string]int64) {
+func (service *Service) finishGatewaySummaries(ctx context.Context, values []GatewaySummary, desiredRouting int64, desiredAccessByRegion map[string]int64) error {
 	now := service.now().UTC()
+	meteringByRegion, err := service.latestMeteringByRegion(ctx)
+	if err != nil {
+		return err
+	}
 	for index := range values {
 		value := &values[index]
 		value.DesiredRoutingRevision = desiredRouting
@@ -366,9 +436,112 @@ func (service *Service) finishGatewaySummaries(ctx context.Context, values []Gat
 		if now.Sub(value.ObservedAt) > service.staleAfter {
 			value.HeartbeatStatus = "stale"
 		}
+		value.Backlogs.MeteringProjectionCutoff = nil
+		value.Backlogs.MeteringProjectionStatus = "unavailable"
+		if metering, exists := meteringByRegion[value.Region]; exists {
+			cutoff := metering.ProjectionCutoff
+			value.Backlogs.MeteringProjectionCutoff = &cutoff
+			value.Backlogs.MeteringProjectionStatus = metering.ProjectionStatus
+		}
 		service.routingLag.Record(ctx, value.RoutingRevisionLag)
 		service.accessLag.Record(ctx, value.AccessRevisionLag)
 	}
+	return nil
+}
+
+const meteringSelect = `SELECT metering_id,region,projection_generation,projection_cutoff,pending_events,
+	oldest_pending_at,poison_events,queued_exports,started_at,observed_at,received_at FROM operations_metering_heartbeats`
+
+func scanMetering(row rowScanner) (MeteringSummary, error) {
+	var summary MeteringSummary
+	err := row.Scan(&summary.MeteringID, &summary.Region, &summary.ProjectionGeneration, &summary.ProjectionCutoff,
+		&summary.PendingEvents, &summary.OldestPendingAt, &summary.PoisonEvents, &summary.QueuedExports,
+		&summary.StartedAt, &summary.ObservedAt, &summary.ReceivedAt)
+	if err != nil {
+		return MeteringSummary{}, err
+	}
+	summary.EventSchemaVersion = CurrentMeteringObservationVersion
+	return summary, nil
+}
+
+func (service *Service) finishMetering(summary *MeteringSummary) {
+	now := service.now().UTC()
+	summary.HeartbeatLagSeconds = nonnegativeSeconds(now.Sub(summary.ObservedAt))
+	summary.HeartbeatStatus = "current"
+	summary.ProjectionStatus = "current"
+	if summary.OldestPendingAt != nil {
+		summary.OldestPendingAgeSeconds = nonnegativeSeconds(now.Sub(*summary.OldestPendingAt))
+		if now.Sub(*summary.OldestPendingAt) > service.staleAfter {
+			summary.ProjectionStatus = "degraded"
+		}
+	}
+	if now.Sub(summary.ObservedAt) > service.staleAfter {
+		summary.HeartbeatStatus = "stale"
+		summary.ProjectionStatus = "degraded"
+	}
+	if summary.PoisonEvents > 0 {
+		summary.ProjectionStatus = "degraded"
+	}
+}
+
+func (service *Service) latestMeteringByRegion(ctx context.Context) (map[string]MeteringSummary, error) {
+	rows, err := service.database.QueryContext(ctx, meteringSelect+` ORDER BY region,observed_at DESC,metering_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]MeteringSummary{}
+	for rows.Next() {
+		value, err := scanMetering(rows)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := result[value.Region]; exists {
+			continue
+		}
+		service.finishMetering(&value)
+		result[value.Region] = value
+	}
+	return result, rows.Err()
+}
+
+func (service *Service) ListMetering(ctx context.Context, actor tenantadmin.ActorEnvelope) (MeteringPage, error) {
+	if !canRead(actor) {
+		return MeteringPage{}, ErrPolicyDenied
+	}
+	rows, err := service.database.QueryContext(ctx, meteringSelect+` ORDER BY region,metering_id LIMIT 500`)
+	if err != nil {
+		return MeteringPage{}, err
+	}
+	defer rows.Close()
+	page := MeteringPage{Data: []MeteringSummary{}}
+	for rows.Next() {
+		value, err := scanMetering(rows)
+		if err != nil {
+			return MeteringPage{}, err
+		}
+		service.finishMetering(&value)
+		page.Data = append(page.Data, value)
+	}
+	return page, rows.Err()
+}
+
+func (service *Service) GetMetering(ctx context.Context, actor tenantadmin.ActorEnvelope, id string) (MeteringSummary, error) {
+	if !canRead(actor) {
+		return MeteringSummary{}, ErrPolicyDenied
+	}
+	if !resourceID.MatchString(id) {
+		return MeteringSummary{}, ErrInvalidArgument
+	}
+	value, err := scanMetering(service.database.QueryRowContext(ctx, meteringSelect+` WHERE metering_id=$1`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return MeteringSummary{}, ErrNotFound
+	}
+	if err != nil {
+		return MeteringSummary{}, err
+	}
+	service.finishMetering(&value)
+	return value, nil
 }
 
 func (service *Service) GetOutbox(ctx context.Context, actor tenantadmin.ActorEnvelope) (OutboxStatus, error) {

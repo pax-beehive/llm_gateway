@@ -161,6 +161,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	meteringVerifier, err := configureMeteringVerifier(devMode)
+	if err != nil {
+		return err
+	}
 	eventPublisher, err := controlrelay.NewPostgresPublisher(database)
 	if err != nil {
 		return err
@@ -194,6 +198,7 @@ func run() error {
 		Administration: administration, Credentials: credentials,
 		ProviderConnections: providerConnections, RoutingCatalog: routingCatalog,
 		Operations: operationsService, GatewayObservations: operationsService, GatewayVerifier: gatewayVerifier,
+		MeteringObservations: operationsService, MeteringVerifier: meteringVerifier,
 		Verifier:       verifier,
 		QuotaSnapshots: quota.NewPostgresController(database, time.Now),
 	})
@@ -328,6 +333,26 @@ func configureGatewayVerifier(devMode bool) (operations.GatewayVerifier, error) 
 		regions = map[string]string{"gateway-local": "local"}
 	}
 	return operations.NewHMACVerifier(keys, regions, time.Now)
+}
+
+func configureMeteringVerifier(devMode bool) (operations.MeteringVerifier, error) {
+	keys := map[string]string{}
+	regions := map[string]string{}
+	if encoded := strings.TrimSpace(os.Getenv("CONTROL_METERING_HMAC_KEYS_JSON")); encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &keys); err != nil {
+			return nil, fmt.Errorf("CONTROL_METERING_HMAC_KEYS_JSON: %w", err)
+		}
+	}
+	if encoded := strings.TrimSpace(os.Getenv("CONTROL_METERING_REGIONS_JSON")); encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &regions); err != nil {
+			return nil, fmt.Errorf("CONTROL_METERING_REGIONS_JSON: %w", err)
+		}
+	}
+	if devMode && len(keys) == 0 {
+		keys = map[string]string{"metering-local": "local-development-metering-hmac-key-001"}
+		regions = map[string]string{"metering-local": "local"}
+	}
+	return operations.NewMeteringHMACVerifier(keys, regions, time.Now)
 }
 
 func envInt(name string, fallback int) int {

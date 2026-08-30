@@ -166,7 +166,7 @@ Rejected. The current operations need bounded domain workers, leases, and receip
 - Logs and operation results pass secret/content redaction tests.
 - A rolling-version integration test exercises compatible schema and event-version transitions.
 
-## Implementation status (2026-08-29)
+## Implementation status (2026-08-30)
 
 The proposed design is implemented with bounded `/readyz` probes, schema-range
 gates, machine-authenticated Gateway observations, monotonic heartbeats,
@@ -179,9 +179,13 @@ outbox age, and quota/cache/retention backlogs. The production control plane no
 longer trusts the shared PostgreSQL Gateway inbox as rollout authority; its
 collector is development compatibility only. OpenTelemetry histograms cover
 heartbeat, revision, consumer, outbox-age, revocation, and bounded backlog
-signals. Metering cutoff is explicitly reported as unavailable until ADR 0007
-has an active projection; Operations does not manufacture a cutoff from Usage
-Ledger writes.
+signals. Metering now publishes a separate content-free, HMAC-authenticated
+regional heartbeat containing its active projection generation/cutoff and
+bounded relay/export backlog signals. Operations stores those observations
+monotonically, reports missing observations as unavailable and stale/poisoned
+ones as degraded, and joins the latest same-region cutoff into Gateway
+summaries. It never manufactures a cutoff from Usage Ledger writes and Gateway
+inference never calls Metering or Operations synchronously.
 
 The external relay gate is now implemented independently from Operations.
 Production Gateways fetch bounded batches from

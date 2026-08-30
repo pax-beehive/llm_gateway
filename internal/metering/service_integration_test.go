@@ -174,6 +174,12 @@ func TestRelayDeduplicatesCorrectsRebuildsAndIsolatesTenants(t *testing.T) {
 		t.Fatalf("Response usage=%#v/%v", responseUsage, err)
 	}
 	exportCutoff := now.Add(2 * time.Hour)
+	// Keep the test independent from the database server's wall clock. Events
+	// already consumed before the request belong to the immutable export; the
+	// late event below is explicitly moved beyond the ingestion cutoff.
+	if _, err := database.ExecContext(ctx, `UPDATE metering_inbox SET consumed_at=$2 WHERE tenant_id=$1`, tenantA, exportCutoff.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	exportService, _ := metering.NewService(database, func() time.Time { return exportCutoff })
 	exportJob, err := exportService.RequestExport(ctx, metering.Filter{TenantID: tenantA})
 	if err != nil {

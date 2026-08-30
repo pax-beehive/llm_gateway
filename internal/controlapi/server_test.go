@@ -56,6 +56,59 @@ func TestMachineAuthenticatedGatewayObservationDoesNotUseHumanIAM(t *testing.T) 
 	}
 }
 
+func TestMachineAuthenticatedMeteringObservationDoesNotUseHumanIAM(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	called := false
+	handler := controlapi.New(controlapi.Config{
+		MeteringVerifier: meteringVerifierFunc(func(_ context.Context, authorization, method, path string, body []byte) (operations.MeteringIdentity, error) {
+			if authorization != "Metering-HMAC signed" || method != http.MethodPost || path != "/internal/v1/operations/metering-observations" || len(body) == 0 {
+				t.Fatalf("machine assertion request = %q %q %q", authorization, method, path)
+			}
+			return operations.MeteringIdentity{MeteringID: "metering-a", Region: "us-west1"}, nil
+		}),
+		MeteringObservations: meteringObservationIngestorFunc(func(_ context.Context, identity operations.MeteringIdentity, observation operations.MeteringObservation) error {
+			called = true
+			if identity.MeteringID != observation.MeteringID || identity.Region != observation.Region {
+				t.Fatalf("identity/observation = %#v/%#v", identity, observation)
+			}
+			return nil
+		}),
+		Verifier: controlapi.IdentityVerifierFunc(func(context.Context, string) (controlapi.VerifiedIdentity, error) {
+			t.Fatal("Metering observation reached Human IAM")
+			return controlapi.VerifiedIdentity{}, nil
+		}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/operations/metering-observations", jsonBody(t, operations.MeteringObservation{
+		EventSchemaVersion: operations.CurrentMeteringObservationVersion, MeteringID: "metering-a", Region: "us-west1",
+		ProjectionGeneration: 2, ProjectionCutoff: now.Add(-time.Second), StartedAt: now.Add(-time.Hour), ObservedAt: now,
+	}))
+	request.Header.Set("Authorization", "Metering-HMAC signed")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || !called {
+		t.Fatalf("status/called/body = %d/%v/%s", response.Code, called, response.Body.String())
+	}
+}
+
+func TestMeteringObservationRejectsUnknownContentBearingFields(t *testing.T) {
+	called := false
+	handler := controlapi.New(controlapi.Config{
+		MeteringVerifier: meteringVerifierFunc(func(context.Context, string, string, string, []byte) (operations.MeteringIdentity, error) {
+			return operations.MeteringIdentity{MeteringID: "metering-a", Region: "us-west1"}, nil
+		}),
+		MeteringObservations: meteringObservationIngestorFunc(func(context.Context, operations.MeteringIdentity, operations.MeteringObservation) error {
+			called = true
+			return nil
+		}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/operations/metering-observations", bytes.NewBufferString(`{"metering_id":"metering-a","region":"us-west1","prompt":"must not enter operations"}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || called {
+		t.Fatalf("status/called/body = %d/%v/%s", response.Code, called, response.Body.String())
+	}
+}
+
 func TestGatewayObservationRejectsUnknownContentBearingFields(t *testing.T) {
 	called := false
 	handler := controlapi.New(controlapi.Config{
@@ -546,6 +599,18 @@ func (function gatewayVerifierFunc) Verify(ctx context.Context, authorization, m
 type observationIngestorFunc func(context.Context, operations.GatewayIdentity, operations.GatewayObservation) error
 
 func (function observationIngestorFunc) RecordGatewayObservation(ctx context.Context, identity operations.GatewayIdentity, observation operations.GatewayObservation) error {
+	return function(ctx, identity, observation)
+}
+
+type meteringVerifierFunc func(context.Context, string, string, string, []byte) (operations.MeteringIdentity, error)
+
+func (function meteringVerifierFunc) Verify(ctx context.Context, authorization, method, path string, body []byte) (operations.MeteringIdentity, error) {
+	return function(ctx, authorization, method, path, body)
+}
+
+type meteringObservationIngestorFunc func(context.Context, operations.MeteringIdentity, operations.MeteringObservation) error
+
+func (function meteringObservationIngestorFunc) RecordMeteringObservation(ctx context.Context, identity operations.MeteringIdentity, observation operations.MeteringObservation) error {
 	return function(ctx, identity, observation)
 }
 

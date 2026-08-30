@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	CurrentObservationVersion = 3
-	MinimumObservationVersion = 2
-	CurrentDatabaseSchema     = 23
-	MinimumDatabaseSchema     = 23
+	CurrentObservationVersion         = 3
+	MinimumObservationVersion         = 2
+	CurrentMeteringObservationVersion = 1
+	CurrentDatabaseSchema             = 24
+	MinimumDatabaseSchema             = 23
 )
 
 type CheckResult struct {
@@ -101,6 +102,38 @@ type GatewayPage struct {
 	Data []GatewaySummary `json:"data"`
 }
 
+type MeteringObservation struct {
+	EventSchemaVersion   int        `json:"event_schema_version"`
+	MeteringID           string     `json:"metering_id"`
+	Region               string     `json:"region"`
+	ProjectionGeneration int64      `json:"projection_generation"`
+	ProjectionCutoff     time.Time  `json:"projection_cutoff"`
+	PendingEvents        int64      `json:"pending_events"`
+	OldestPendingAt      *time.Time `json:"oldest_pending_at,omitempty"`
+	PoisonEvents         int64      `json:"poison_events"`
+	QueuedExports        int64      `json:"queued_exports"`
+	StartedAt            time.Time  `json:"started_at"`
+	ObservedAt           time.Time  `json:"observed_at"`
+}
+
+type MeteringIdentity struct {
+	MeteringID string
+	Region     string
+}
+
+type MeteringSummary struct {
+	MeteringObservation
+	ReceivedAt              time.Time `json:"received_at"`
+	HeartbeatLagSeconds     float64   `json:"heartbeat_lag_seconds"`
+	HeartbeatStatus         string    `json:"heartbeat_status"`
+	ProjectionStatus        string    `json:"projection_status"`
+	OldestPendingAgeSeconds float64   `json:"oldest_pending_age_seconds"`
+}
+
+type MeteringPage struct {
+	Data []MeteringSummary `json:"data"`
+}
+
 type OutboxStatus struct {
 	PendingCount                int64      `json:"outbox_pending_count"`
 	OldestUnpublishedAgeSeconds float64    `json:"oldest_unpublished_outbox_age_seconds"`
@@ -145,6 +178,8 @@ type ConsumerPage struct {
 type QueryService interface {
 	ListGateways(context.Context, tenantadmin.ActorEnvelope) (GatewayPage, error)
 	GetGateway(context.Context, tenantadmin.ActorEnvelope, string) (GatewaySummary, error)
+	ListMetering(context.Context, tenantadmin.ActorEnvelope) (MeteringPage, error)
+	GetMetering(context.Context, tenantadmin.ActorEnvelope, string) (MeteringSummary, error)
 	ListPublications(context.Context, tenantadmin.ActorEnvelope) (PublicationPage, error)
 	GetPublication(context.Context, tenantadmin.ActorEnvelope, string) (PublicationSummary, error)
 	GetOutbox(context.Context, tenantadmin.ActorEnvelope) (OutboxStatus, error)

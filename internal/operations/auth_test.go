@@ -41,3 +41,24 @@ func TestGatewayHMACBindsIdentityMethodPathBodyAndTime(t *testing.T) {
 		t.Fatal("stale assertion authenticated")
 	}
 }
+
+func TestMeteringHMACIsSeparateAndBindsIdentityRequestAndTime(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	key := []byte("metering-observation-hmac-key-00001")
+	verifier, err := operations.NewMeteringHMACVerifier(map[string]string{"metering-a": string(key)}, map[string]string{"metering-a": "us-west1"}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"metering_id":"metering-a"}`)
+	authorization, err := operations.MeteringAuthorization(key, "metering-a", now, "POST", "/internal/v1/operations/metering-observations", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := verifier.Verify(context.Background(), authorization, "POST", "/internal/v1/operations/metering-observations", body)
+	if err != nil || identity.MeteringID != "metering-a" || identity.Region != "us-west1" {
+		t.Fatalf("identity/error = %#v/%v", identity, err)
+	}
+	if _, err := verifier.Verify(context.Background(), authorization, "POST", "/internal/v1/operations/gateway-observations", body); err == nil {
+		t.Fatal("Metering assertion authenticated for a different request")
+	}
+}

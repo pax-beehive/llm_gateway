@@ -208,3 +208,66 @@ func TestGatewayObservationsAreIdempotentAndCannotMoveRevisionsBackward(t *testi
 		})
 	}
 }
+
+func TestMeteringObservationIsMonotonicQueryableAndJoinedByRegion(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, migrate := range []func(context.Context, *sql.DB) error{migrations.Migrate, tenantadmin.Migrate, routingcatalog.Migrate, operations.Migrate} {
+		if err := migrate(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	service, err := operations.NewService(db, nil, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	meteringID, gatewayID, region := "metering-"+suffix, "gateway-"+suffix, "region-"+suffix
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM operations_gateway_heartbeats WHERE gateway_id=$1`, gatewayID)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM operations_metering_heartbeats WHERE metering_id=$1`, meteringID)
+	})
+	oldest := now.Add(-10 * time.Second)
+	observation := operations.MeteringObservation{
+		EventSchemaVersion: operations.CurrentMeteringObservationVersion, MeteringID: meteringID, Region: region,
+		ProjectionGeneration: 7, ProjectionCutoff: now.Add(-time.Second), PendingEvents: 2, OldestPendingAt: &oldest,
+		StartedAt: now.Add(-time.Hour), ObservedAt: now,
+	}
+	if err := service.RecordMeteringObservation(ctx, operations.MeteringIdentity{MeteringID: meteringID, Region: region}, observation); err != nil {
+		t.Fatal(err)
+	}
+	stale := observation
+	stale.ObservedAt = now.Add(-time.Second)
+	stale.ProjectionGeneration = 6
+	stale.ProjectionCutoff = now.Add(-time.Minute)
+	if err := service.RecordMeteringObservation(ctx, operations.MeteringIdentity{MeteringID: meteringID, Region: region}, stale); err != nil {
+		t.Fatal(err)
+	}
+	actor := tenantadmin.ActorEnvelope{Type: "human", ID: "operator-a", Scopes: []string{tenantadmin.ScopePlatformRead}}
+	meteringSummary, err := service.GetMetering(ctx, actor, meteringID)
+	if err != nil || meteringSummary.ProjectionGeneration != 7 || meteringSummary.ProjectionStatus != "current" || meteringSummary.OldestPendingAgeSeconds != 10 {
+		t.Fatalf("Metering summary/error = %#v/%v", meteringSummary, err)
+	}
+	gateway := operations.GatewayObservation{
+		EventSchemaVersion: operations.CurrentObservationVersion, GatewayID: gatewayID, Region: region, BuildSHA: "abcdef1",
+		DatabaseSchemaVersion: operations.CurrentDatabaseSchema, StartedAt: now.Add(-time.Hour), ObservedAt: now,
+		Consumers: []operations.ConsumerObservation{}, Backlogs: operations.BacklogSignals{MeteringProjectionStatus: "unavailable"},
+	}
+	if err := service.RecordGatewayObservation(ctx, operations.GatewayIdentity{GatewayID: gatewayID, Region: region}, gateway); err != nil {
+		t.Fatal(err)
+	}
+	gatewaySummary, err := service.GetGateway(ctx, actor, gatewayID)
+	if err != nil || gatewaySummary.Backlogs.MeteringProjectionStatus != "current" || gatewaySummary.Backlogs.MeteringProjectionCutoff == nil || !gatewaySummary.Backlogs.MeteringProjectionCutoff.Equal(observation.ProjectionCutoff) {
+		t.Fatalf("Gateway Metering projection/error = %#v/%v", gatewaySummary.Backlogs, err)
+	}
+}

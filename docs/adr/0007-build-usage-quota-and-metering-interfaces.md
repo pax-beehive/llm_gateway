@@ -140,8 +140,15 @@ the least-privilege Metering runtime role is explicitly denied authoritative
 Usage Ledger and Response access. Duplicate delivery, ambiguous
 acknowledgement, bootstrap/live-event overlap, correction, rebuild equivalence,
 Tenant isolation, quota atomicity, role isolation, and content-free export
-boundaries have automated coverage. The initial export adapter writes
-create-only objects to an approved regional durable filesystem mount behind the
-`ExportStore` port.
+boundaries have automated coverage. Production exports use a GCS bucket behind
+the `ExportStore` port. Metering authenticates with Workload Identity, verifies
+the bucket is in the expected single region, and uses the
+`ifGenerationMatch=0` precondition so a live object cannot be overwritten.
+Idempotent retries compare existing bytes and fail closed on mismatch; the
+create-only filesystem adapter is development-only. Metering also emits a
+separate content-free, HMAC-authenticated regional soft-state observation.
+Central Operations stores it monotonically, exposes projection
+cutoff/backlog/heartbeat state, and joins the latest same-region status into
+Gateway summaries without adding an inference-time dependency.
 
 This ADR remains proposed until the decision is explicitly accepted.

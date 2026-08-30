@@ -53,15 +53,17 @@ type Administration interface {
 }
 
 type Config struct {
-	Administration      Administration
-	Credentials         CredentialAdministration
-	ProviderConnections ProviderConnectionAdministration
-	RoutingCatalog      RoutingCatalogAdministration
-	Operations          operations.QueryService
-	GatewayObservations GatewayObservationIngestor
-	GatewayVerifier     operations.GatewayVerifier
-	Verifier            IdentityVerifier
-	QuotaSnapshots      QuotaSnapshotQuery
+	Administration       Administration
+	Credentials          CredentialAdministration
+	ProviderConnections  ProviderConnectionAdministration
+	RoutingCatalog       RoutingCatalogAdministration
+	Operations           operations.QueryService
+	GatewayObservations  GatewayObservationIngestor
+	GatewayVerifier      operations.GatewayVerifier
+	MeteringObservations MeteringObservationIngestor
+	MeteringVerifier     operations.MeteringVerifier
+	Verifier             IdentityVerifier
+	QuotaSnapshots       QuotaSnapshotQuery
 }
 
 type QuotaSnapshotQuery interface {
@@ -70,6 +72,10 @@ type QuotaSnapshotQuery interface {
 
 type GatewayObservationIngestor interface {
 	RecordGatewayObservation(context.Context, operations.GatewayIdentity, operations.GatewayObservation) error
+}
+
+type MeteringObservationIngestor interface {
+	RecordMeteringObservation(context.Context, operations.MeteringIdentity, operations.MeteringObservation) error
 }
 
 type RoutingCatalogAdministration interface {
@@ -112,22 +118,25 @@ type CredentialAdministration interface {
 }
 
 type Server struct {
-	administration      Administration
-	credentials         CredentialAdministration
-	providerConnections ProviderConnectionAdministration
-	routingCatalog      RoutingCatalogAdministration
-	operations          operations.QueryService
-	gatewayObservations GatewayObservationIngestor
-	gatewayVerifier     operations.GatewayVerifier
-	verifier            IdentityVerifier
-	quotaSnapshots      QuotaSnapshotQuery
+	administration       Administration
+	credentials          CredentialAdministration
+	providerConnections  ProviderConnectionAdministration
+	routingCatalog       RoutingCatalogAdministration
+	operations           operations.QueryService
+	gatewayObservations  GatewayObservationIngestor
+	gatewayVerifier      operations.GatewayVerifier
+	meteringObservations MeteringObservationIngestor
+	meteringVerifier     operations.MeteringVerifier
+	verifier             IdentityVerifier
+	quotaSnapshots       QuotaSnapshotQuery
 }
 
 func New(config Config) http.Handler {
 	return &Server{administration: config.Administration, credentials: config.Credentials,
 		providerConnections: config.ProviderConnections, routingCatalog: config.RoutingCatalog,
 		operations: config.Operations, gatewayObservations: config.GatewayObservations,
-		gatewayVerifier: config.GatewayVerifier, verifier: config.Verifier, quotaSnapshots: config.QuotaSnapshots}
+		gatewayVerifier: config.GatewayVerifier, meteringObservations: config.MeteringObservations,
+		meteringVerifier: config.MeteringVerifier, verifier: config.Verifier, quotaSnapshots: config.QuotaSnapshots}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -137,6 +146,10 @@ func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	if request.URL.Path == "/internal/v1/operations/gateway-observations" {
 		server.receiveGatewayObservation(writer, request)
+		return
+	}
+	if request.URL.Path == "/internal/v1/operations/metering-observations" {
+		server.receiveMeteringObservation(writer, request)
 		return
 	}
 	if server.administration == nil || server.verifier == nil {

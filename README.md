@@ -101,6 +101,8 @@ CONTROL_SECRET_CUSTODY_BACKEND=gcp-secret-manager
 CONTROL_GCP_SECRET_PROJECT=provider-secret-project
 CONTROL_GATEWAY_HMAC_KEYS_JSON={"gateway-us-west-1":"at-least-32-byte-machine-key"}
 CONTROL_GATEWAY_REGIONS_JSON={"gateway-us-west-1":"us-west"}
+CONTROL_METERING_HMAC_KEYS_JSON={"metering-us-west-1":"different-at-least-32-byte-machine-key"}
+CONTROL_METERING_REGIONS_JSON={"metering-us-west-1":"us-west1"}
 ```
 
 Metering runs as a third, independently deployable process. The first
@@ -115,9 +117,16 @@ METERING_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted
 METERING_IAM_JWKS_URL=https://iam.example/.well-known/jwks.json
 METERING_IAM_ISSUER=https://iam.example
 METERING_IAM_AUDIENCE=llm-gateway-metering
-METERING_EXPORT_DIRECTORY=/regional-immutable-metering-exports
+METERING_EXPORT_BACKEND=gcs
+METERING_EXPORT_GCS_BUCKET=regional-immutable-metering-exports
+METERING_EXPORT_GCS_PREFIX=exports
+METERING_EXPORT_GCS_REGION=us-west1
 METERING_EXPORT_SIGNING_KEY=at-least-32-byte-download-signing-key
 METERING_WORKER_ID=metering-us-west-1
+METERING_ID=metering-us-west-1
+METERING_REGION=us-west1
+METERING_OPERATIONS_URL=https://control.example
+METERING_OPERATIONS_HMAC_KEY=different-at-least-32-byte-machine-key
 ```
 
 The Gateway transaction that completes billable work now writes its immutable
@@ -129,9 +138,13 @@ oldest pending time, active projection generation/cutoff, and queued exports.
 Tenant and platform identities can query summaries, bounded hour/day series,
 stable-cursor events, Tenant/key aliases, and Response usage. CSV exports are
 asynchronous, fixed to their requested cutoff, integrity checked, and exposed
-through five-minute HMAC-signed downloads. The current `ExportStore` adapter
-uses create-only files, so production must place `METERING_EXPORT_DIRECTORY`
-on its approved regional durable storage mount.
+through five-minute HMAC-signed downloads. Production uses a native GCS
+`ExportStore` with Workload Identity, verifies the configured bucket is in the
+expected single region, and creates every object with `ifGenerationMatch=0`.
+An idempotent retry must read the same bytes; different existing bytes fail
+closed. Grant the Metering identity only `storage.buckets.get`,
+`storage.objects.create`, and `storage.objects.get` on that bucket. The
+filesystem adapter and `METERING_EXPORT_DIRECTORY` are development-only.
 
 Run the Metering schema as an owner job, then apply its runtime boundary with
 `make configure-metering-role ADMIN_DATABASE_URL=... METERING_DB_ROLE=...`.
@@ -141,7 +154,8 @@ operator invocation using a time-bounded bootstrap role with ledger read
 access: set `METERING_BOOTSTRAP_LEDGER=true`; the process backfills bounded
 content-free facts, rebuilds a fenced generation, and exits before serving.
 Production refuses in-process migration, plaintext database transport, a role
-mismatch, missing JWKS configuration, or a short export signing key.
+mismatch, missing JWKS/Operations machine identity, non-HTTPS Operations, a
+non-regional or wrong-region export bucket, or a short export signing key.
 
 Run schema migration as a separate owner job, then apply least-privilege grants
 with `make configure-tenant-admin-roles ADMIN_DATABASE_URL=... TENANT_ADMIN_DB_ROLE=... GATEWAY_DB_ROLE=...`.
@@ -212,9 +226,15 @@ exact body. Production control-plane processes do not promote the legacy shared
 Gateway inbox; that collector remains development compatibility only. Configure
 `GATEWAY_OPERATIONS_URL`, `GATEWAY_OPERATIONS_HMAC_KEY`, `GATEWAY_ID`,
 `GATEWAY_LOCAL_REGION`, and `GATEWAY_BUILD_SHA`. Operations queries live under
-`/control/v1/operations/{gateways,publications,outbox,consumers,jobs}` and expose
+`/control/v1/operations/{gateways,metering,publications,outbox,consumers,jobs}`.
+Metering separately sends content-free HMAC-signed regional observations to
+`/internal/v1/operations/metering-observations`; these expose projection
+generation/cutoff, pending age/count, poison count, export backlog, and
+heartbeat health. The control plane joins the latest same-region observation
+into Gateway summaries without making Metering an inference dependency.
+Operations queries expose
 desired/applied revisions, heartbeat and consumer lag, outbox age, quota/cache/
-retention backlog, revocation propagation, explicit Metering availability,
+retention backlog, revocation propagation, explicit Metering cutoff/status,
 build SHA, and schema version. Desired Access revisions are computed per region,
 while the applied relay cursor advances across the globally ordered source.
 

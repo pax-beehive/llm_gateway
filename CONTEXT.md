@@ -36,6 +36,12 @@ _Avoid_: Usage counter, dashboard row
 A rebuildable Tenant or Gateway API Key aggregation derived transactionally from Usage Ledger facts for reporting and quota operations.
 _Avoid_: Billing source of truth
 
+**Metering Observation**:
+A content-free, HMAC-authenticated regional soft-state report of Metering
+heartbeat, projection generation/cutoff, pending and poison events, and export
+backlog. Operations may display it but never uses it to authorize inference.
+_Avoid_: Usage Ledger head, inference dependency, Gateway-owned Metering status
+
 **Provider**:
 An upstream model vendor or inference platform that accepts model requests and reports usage.
 _Avoid_: Backend, vendor API
