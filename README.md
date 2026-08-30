@@ -103,6 +103,46 @@ CONTROL_GATEWAY_HMAC_KEYS_JSON={"gateway-us-west-1":"at-least-32-byte-machine-ke
 CONTROL_GATEWAY_REGIONS_JSON={"gateway-us-west-1":"us-west"}
 ```
 
+Metering runs as a third, independently deployable process. The first
+deployment may share PostgreSQL physically, but it uses a separate runtime role
+and owns only its inbox, immutable facts, projection generations, and export
+jobs:
+
+```text
+METERING_DATABASE_URL=postgres://metering_runtime@...
+METERING_DB_ROLE=metering_runtime
+METERING_DATABASE_TRANSPORT_ATTESTATION=authenticated-encrypted
+METERING_IAM_JWKS_URL=https://iam.example/.well-known/jwks.json
+METERING_IAM_ISSUER=https://iam.example
+METERING_IAM_AUDIENCE=llm-gateway-metering
+METERING_EXPORT_DIRECTORY=/regional-immutable-metering-exports
+METERING_EXPORT_SIGNING_KEY=at-least-32-byte-download-signing-key
+METERING_WORKER_ID=metering-us-west-1
+```
+
+The Gateway transaction that completes billable work now writes its immutable
+Usage Ledger fact, settles the exact Quota Reservation, and enqueues a stable,
+content-free usage event atomically. Metering consumes those events with leased
+claims and inbox deduplication; inference does not call Metering synchronously.
+`GET /metering/v1/operations/status` exposes pending/poison event counts,
+oldest pending time, active projection generation/cutoff, and queued exports.
+Tenant and platform identities can query summaries, bounded hour/day series,
+stable-cursor events, Tenant/key aliases, and Response usage. CSV exports are
+asynchronous, fixed to their requested cutoff, integrity checked, and exposed
+through five-minute HMAC-signed downloads. The current `ExportStore` adapter
+uses create-only files, so production must place `METERING_EXPORT_DIRECTORY`
+on its approved regional durable storage mount.
+
+Run the Metering schema as an owner job, then apply its runtime boundary with
+`make configure-metering-role ADMIN_DATABASE_URL=... METERING_DB_ROLE=...`.
+That role can consume usage outbox rows but cannot read `responses` or any
+authoritative Usage Ledger. Historical initialization is a separate one-shot
+operator invocation using a time-bounded bootstrap role with ledger read
+access: set `METERING_BOOTSTRAP_LEDGER=true`; the process backfills bounded
+content-free facts, rebuilds a fenced generation, and exits before serving.
+Production refuses in-process migration, plaintext database transport, a role
+mismatch, missing JWKS configuration, or a short export signing key.
+
 Run schema migration as a separate owner job, then apply least-privilege grants
 with `make configure-tenant-admin-roles ADMIN_DATABASE_URL=... TENANT_ADMIN_DB_ROLE=... GATEWAY_DB_ROLE=...`.
 The control-plane runtime refuses in-process production migration and verifies
@@ -454,6 +494,14 @@ make test-routing-catalog-blackbox
 The control-plane development process uses deterministic Secret Custody and
 Provider adapters, so this black box performs no Provider network calls and
 incurs no Provider cost.
+
+With Compose PostgreSQL and `make run-metering-dev` running, exercise Metering
+readiness, Tenant summary isolation, asynchronous immutable CSV export, signed
+download, integrity/content-free headers, and projection status:
+
+```sh
+make test-metering-blackbox
+```
 
 The OpenAI SDK black-box suite covers public model listing, Responses
 create/retrieve/input-items/delete, `previous_response_id`, Responses streaming,

@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-control-relay-blackbox test-operations-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev bootstrap-access repair-access-projection prune-control-events configure-tenant-admin-roles compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-metering-role test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-control-relay-blackbox test-operations-blackbox test-metering-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev run-metering-dev bootstrap-access repair-access-projection prune-control-events configure-tenant-admin-roles configure-metering-role compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -20,8 +20,9 @@ test-integration:
 		./internal/access ./internal/store ./internal/configuration ./internal/cacheprotection \
 		./internal/quota ./internal/httpapi ./internal/tenantadmin ./internal/credentialadmin \
 		./internal/accessprojection ./internal/providerconnection ./internal/routingcatalog ./internal/controlrelay \
-		./internal/operations ./cmd/llm-gateway
+		./internal/operations ./internal/metering ./cmd/llm-gateway
 	$(MAKE) test-tenant-admin-roles TEST_DATABASE_URL="$(TEST_DATABASE_URL)"
+	$(MAKE) test-metering-role TEST_DATABASE_URL="$(TEST_DATABASE_URL)"
 
 integration-up:
 	docker compose up -d --wait postgres
@@ -32,6 +33,10 @@ test-integration-local: integration-up
 test-tenant-admin-roles:
 	@test -n "$(TEST_DATABASE_URL)" || { echo "TEST_DATABASE_URL is required" >&2; exit 1; }
 	psql "$(TEST_DATABASE_URL)" -f tests/sql/tenant_admin_roles_test.sql
+
+test-metering-role:
+	@test -n "$(TEST_DATABASE_URL)" || { echo "TEST_DATABASE_URL is required" >&2; exit 1; }
+	psql "$(TEST_DATABASE_URL)" -f tests/sql/metering_role_test.sql
 
 test-openai-sdk-blackbox:
 	python3 tests/blackbox/openai_sdk.py
@@ -53,6 +58,9 @@ test-control-relay-blackbox:
 
 test-operations-blackbox:
 	python3 tests/blackbox/operations.py
+
+test-metering-blackbox:
+	python3 tests/blackbox/metering.py
 
 test-codex-sandbox-blackbox:
 	bash tests/blackbox/codex_sandbox_multiturn.sh
@@ -88,6 +96,11 @@ run-control-plane-dev:
 	CONTROL_PLANE_DATABASE_URL="$${CONTROL_PLANE_DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
 	go run ./cmd/control-plane
 
+run-metering-dev:
+	GOCACHE=$(GOCACHE) METERING_DEV_MODE=true METERING_MIGRATE=true \
+	METERING_DATABASE_URL="$${METERING_DATABASE_URL:-postgres://gateway:gateway-dev-only@127.0.0.1:55433/llm_gateway?sslmode=disable}" \
+	go run ./cmd/metering
+
 bootstrap-access:
 	@test -n "$(GATEWAY_DATABASE_URL)" || { echo "GATEWAY_DATABASE_URL is required" >&2; exit 1; }
 	GOCACHE=$(GOCACHE) go run ./cmd/access-bootstrap
@@ -111,6 +124,11 @@ configure-tenant-admin-roles:
 		-v tenant_admin_role="$(TENANT_ADMIN_DB_ROLE)" \
 		-v gateway_role="$(GATEWAY_DB_ROLE)" \
 		-f scripts/postgres/configure-tenant-admin-roles.sql
+
+configure-metering-role:
+	@test -n "$(ADMIN_DATABASE_URL)" || { echo "ADMIN_DATABASE_URL is required" >&2; exit 1; }
+	@test -n "$(METERING_DB_ROLE)" || { echo "METERING_DB_ROLE is required" >&2; exit 1; }
+	psql "$(ADMIN_DATABASE_URL)" -v metering_role="$(METERING_DB_ROLE)" -f scripts/postgres/configure-metering-role.sql
 
 compose-up:
 	docker compose up --build

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/metering"
 	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
@@ -43,6 +44,10 @@ func (s *PostgresResponseStore) RecordCapabilityUsage(ctx context.Context, usage
 	if err := core.ValidateCapabilityProviderUsage(providerUsage); err != nil {
 		return err
 	}
+	publicModel := usage.PublicModel
+	if publicModel == "" {
+		publicModel = usage.Model
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -57,12 +62,12 @@ func (s *PostgresResponseStore) RecordCapabilityUsage(ctx context.Context, usage
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO capability_usage_ledger (
 			id, tenant_id, api_key_id, operation_id, home_region, execution_epoch, quota_reservation_id, capability,
-			route_id, provider, model, price_snapshot_id, provider_usage,
+			route_id, provider, model, public_model, price_snapshot_id, provider_usage,
 			input_units, dimensions, documents, amount_micros, currency, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		usage.ID, usage.TenantID, usage.APIKeyID, usage.OperationID, usage.HomeRegion, usage.ExecutionEpoch,
 		usage.QuotaReservationID, usage.Capability,
-		usage.RouteID, usage.Provider, usage.Model, usage.PriceSnapshot.ID, providerUsage,
+		usage.RouteID, usage.Provider, usage.Model, publicModel, usage.PriceSnapshot.ID, providerUsage,
 		usage.InputUnits, usage.Dimensions, usage.Documents, usage.AmountMicros, usage.Currency, usage.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("insert immutable capability usage: %w", err)
@@ -82,16 +87,25 @@ func (s *PostgresResponseStore) RecordCapabilityUsage(ctx context.Context, usage
 	); err != nil {
 		return fmt.Errorf("update capability usage projection: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO transactional_outbox (
-			tenant_id, aggregate_type, aggregate_id, aggregate_revision, event_type, payload
-		) VALUES ($1,'capability_usage',$2,1,'capability.usage_recorded',jsonb_build_object(
-			'operation_id',$2::text,'api_key_id',$3::text,'capability',$4::text,'provider',$5::text,'model',$6::text,
-			'input_units',$7::bigint,'dimensions',$8::bigint,'documents',$9::bigint,'amount_micros',$10::bigint,'currency',$11::text
-		))`, usage.TenantID, usage.OperationID, usage.APIKeyID, usage.Capability, usage.Provider, usage.Model,
-		usage.InputUnits, usage.Dimensions, usage.Documents, usage.AmountMicros, usage.Currency,
-	); err != nil {
+	eventPayload, err := json.Marshal(metering.CapabilityUsageEvent(usage))
+	if err != nil {
+		return err
+	}
+	if err := insertAggregateOutbox(ctx, tx, usage.TenantID, "capability_usage", usage.OperationID, 1,
+		"capability.usage_recorded", eventPayload); err != nil {
 		return fmt.Errorf("record capability usage event: %w", err)
+	}
+	if usage.QuotaReservationID != "" {
+		actual := quota.ActualUsage{Requests: 1, SpendMicros: usage.AmountMicros}
+		switch usage.Capability {
+		case core.CapabilityEmbeddings:
+			actual.EmbeddingInputUnits = usage.InputUnits
+		case core.CapabilityRerank:
+			actual.RerankDocuments = usage.Documents
+		}
+		if err := quota.CommitReservationTx(ctx, tx, usage.QuotaReservationID, usage.TenantID, usage.APIKeyID, "capability", actual); err != nil {
+			return fmt.Errorf("settle capability quota reservation: %w", err)
+		}
 	}
 	return tx.Commit()
 }
@@ -598,9 +612,19 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 	if err := insertOutbox(ctx, tx, tenantID, response, "response.completed", payload); err != nil {
 		return err
 	}
-	usagePayload, _ := json.Marshal(usage)
+	usagePayload, _ := json.Marshal(metering.ResponseUsageEvent(usage, response))
 	if err := insertAggregateOutbox(ctx, tx, tenantID, "usage", usage.ID, 1, "usage.recorded", usagePayload); err != nil {
 		return err
+	}
+	if usage.QuotaReservationID != "" {
+		if err := quota.CommitReservationTx(ctx, tx, usage.QuotaReservationID, tenantID, usage.APIKeyID, "response", quota.ActualUsage{
+			Requests:     1,
+			InputTokens:  usage.Usage.InputTokens,
+			OutputTokens: usage.Usage.OutputTokens,
+			SpendMicros:  usage.AmountMicros,
+		}); err != nil {
+			return fmt.Errorf("settle response quota reservation: %w", err)
+		}
 	}
 	return tx.Commit()
 }

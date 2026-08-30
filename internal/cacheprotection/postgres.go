@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/metering"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
 type PostgresIntentRepository struct {
@@ -233,10 +235,21 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 		if rows != 1 {
 			return Intent{}, errors.New("cache lease fencing conflict after refresh")
 		}
-		outboxPayload, _ := json.Marshal(map[string]any{
-			"usage_id": usageID, "cache_refresh_intent_id": intent.ID,
-			"cache_lease_id": intent.CacheLeaseID, "amount_micros": refreshCost,
-			"currency": intent.Candidate.RefreshPriceSnapshot.Currency,
+		publicModel := intent.Anchor.PublicModel
+		if publicModel == "" {
+			publicModel = intent.Anchor.Model
+		}
+		outboxPayload, _ := json.Marshal(metering.UsageEvent{
+			EventID:       "gateway-cache-refresh-usage:" + intent.TenantID + ":" + usageID,
+			SchemaVersion: metering.CurrentEventSchemaVersion, Type: metering.EventCacheRefreshRecorded,
+			UsageID: usageID, TenantID: intent.TenantID, APIKeyID: intent.Anchor.APIKeyID,
+			OperationID: intent.ID, Capability: "cache_refresh", RouteID: intent.Anchor.RouteID,
+			Provider: intent.Anchor.Provider, PublicModel: publicModel,
+			ProviderModel: intent.Candidate.RefreshPriceSnapshot.Model, Region: intent.Anchor.Region,
+			PriceSnapshotID: intent.Candidate.RefreshPriceSnapshot.ID, InputTokens: usage.InputTokens,
+			CachedInputTokens: usage.CachedInputTokens, CacheWriteInputTokens: usage.CacheWriteInputTokens,
+			OutputTokens: usage.OutputTokens, AmountMicros: refreshCost,
+			Currency: intent.Candidate.RefreshPriceSnapshot.Currency, Outcome: "committed", OccurredAt: intent.UpdatedAt,
 		})
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO transactional_outbox (
@@ -244,6 +257,19 @@ func (r *PostgresIntentRepository) Update(ctx context.Context, intent Intent, st
 			) VALUES ($1,'cache_refresh',$2,$3,'cache_refresh.usage_recorded',$4)
 			ON CONFLICT DO NOTHING`, intent.TenantID, intent.ID, intent.CacheLeaseRevision, outboxPayload); err != nil {
 			return Intent{}, err
+		}
+		var reservationID string
+		err = tx.QueryRowContext(ctx, `
+			SELECT id FROM quota_reservations
+			WHERE tenant_id = $1 AND cache_refresh_intent_id = $2`,
+			intent.TenantID, intent.ID).Scan(&reservationID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Intent{}, fmt.Errorf("load refresh quota reservation: %w", err)
+		}
+		if err == nil {
+			if err := quota.CommitReservationTx(ctx, tx, reservationID, intent.TenantID, intent.Anchor.APIKeyID, "cache_refresh", quota.ActualUsage{SpendMicros: refreshCost}); err != nil {
+				return Intent{}, fmt.Errorf("settle refresh quota reservation: %w", err)
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

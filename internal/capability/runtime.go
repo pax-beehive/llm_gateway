@@ -150,7 +150,7 @@ func (r *Runtime) Embed(ctx context.Context, request core.EmbeddingRequest) (str
 		record := core.CapabilityUsageRecord{
 			ID: operationID + "_usage", TenantID: request.TenantID, APIKeyID: request.APIKeyID, OperationID: operationID,
 			HomeRegion: request.HomeRegion, ExecutionEpoch: request.ExecutionEpoch,
-			Capability: core.CapabilityEmbeddings, RouteID: route.ID, Provider: route.Provider, Model: result.Model,
+			Capability: core.CapabilityEmbeddings, RouteID: route.ID, Provider: route.Provider, Model: result.Model, PublicModel: request.Model,
 			PriceSnapshot: route.PriceSnapshot, ProviderUsage: result.ProviderUsage, InputUnits: result.InputUnits,
 			Dimensions: result.Dimensions, AmountMicros: amount, Currency: route.PriceSnapshot.Currency, CreatedAt: r.now().UTC(),
 		}
@@ -363,7 +363,7 @@ func (r *Runtime) Moderate(ctx context.Context, request core.ModerationRequest) 
 		record := core.CapabilityUsageRecord{
 			ID: operationID + "_usage", TenantID: request.TenantID, APIKeyID: request.APIKeyID, OperationID: operationID,
 			HomeRegion: request.HomeRegion, ExecutionEpoch: request.ExecutionEpoch,
-			Capability: core.CapabilityModeration, RouteID: route.ID, Provider: route.Provider, Model: result.Model,
+			Capability: core.CapabilityModeration, RouteID: route.ID, Provider: route.Provider, Model: result.Model, PublicModel: request.Model,
 			PriceSnapshot: route.PriceSnapshot, ProviderUsage: result.ProviderUsage, InputUnits: result.InputUnits,
 			AmountMicros: amount, Currency: route.PriceSnapshot.Currency, CreatedAt: r.now().UTC(),
 		}
@@ -474,7 +474,7 @@ func (r *Runtime) Rerank(ctx context.Context, request core.RerankRequest) (strin
 		record := core.CapabilityUsageRecord{
 			ID: operationID + "_usage", TenantID: request.TenantID, APIKeyID: request.APIKeyID, OperationID: operationID,
 			HomeRegion: request.HomeRegion, ExecutionEpoch: request.ExecutionEpoch,
-			Capability: core.CapabilityRerank, RouteID: route.ID, Provider: route.Provider, Model: result.Model,
+			Capability: core.CapabilityRerank, RouteID: route.ID, Provider: route.Provider, Model: result.Model, PublicModel: request.Model,
 			PriceSnapshot: route.PriceSnapshot, ProviderUsage: result.ProviderUsage, InputUnits: result.ProviderTokens,
 			Documents: result.Documents, AmountMicros: amount, Currency: route.PriceSnapshot.Currency, CreatedAt: r.now().UTC(),
 		}

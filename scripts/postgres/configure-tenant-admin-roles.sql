@@ -202,6 +202,9 @@ GRANT SELECT ON TABLE gateway_routing_catalog_inbox TO :"tenant_admin_role";
 GRANT SELECT ON TABLE operations_schema_metadata TO :"tenant_admin_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE operations_gateway_heartbeats TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE operations_access_rollout_receipts TO :"tenant_admin_role";
+REVOKE ALL PRIVILEGES ON TABLE tenant_quota_counters,api_key_quota_counters,quota_reservations
+FROM PUBLIC, :"tenant_admin_role";
+GRANT SELECT ON TABLE tenant_quota_counters,api_key_quota_counters,quota_reservations TO :"tenant_admin_role";
 
 GRANT SELECT ON TABLE gateway_schema_metadata TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_history TO :"gateway_role";

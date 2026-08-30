@@ -363,14 +363,38 @@ func (c *PostgresController) finish(ctx context.Context, reservationID, targetSt
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := finishReservationTx(ctx, tx, reservationID, "", "", "", targetStatus, actual); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CommitReservationTx settles quota inside the caller's authoritative usage
+// transaction. The caller must commit or roll back the transaction.
+func CommitReservationTx(ctx context.Context, tx *sql.Tx, reservationID, tenantID, apiKeyID, kind string, actual ActualUsage) error {
+	if tx == nil || reservationID == "" || tenantID == "" || apiKeyID == "" || kind == "" {
+		return ErrReservationNotFound
+	}
+	if actual.Requests < 0 || actual.InputTokens < 0 || actual.OutputTokens < 0 || actual.SpendMicros < 0 || actual.EmbeddingInputUnits < 0 || actual.RerankDocuments < 0 {
+		return errors.New("actual quota usage cannot be negative")
+	}
+	if actual.InputTokens > int64(^uint64(0)>>1)-actual.OutputTokens {
+		return errors.New("actual quota token total overflows int64")
+	}
+	return finishReservationTx(ctx, tx, reservationID, tenantID, apiKeyID, kind, "committed", actual)
+}
+
+func finishReservationTx(ctx context.Context, tx *sql.Tx, reservationID, tenantID, apiKeyID, kind, targetStatus string, actual ActualUsage) error {
 	var record reservationRecord
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT id, tenant_id, api_key_id, status, kind, COALESCE(response_id,''), COALESCE(cache_refresh_intent_id,''),
 		       COALESCE(capability_operation_id,''), COALESCE(capability,''), currency, reserved_requests,
 		       reserved_input_tokens, reserved_output_tokens, reserved_spend_micros,
 		       reserved_embedding_input_units, reserved_rerank_documents,
 		       minute_window_start, day_window_start, month_window_start
-		FROM quota_reservations WHERE id = $1 FOR UPDATE`, reservationID).Scan(
+		FROM quota_reservations
+		WHERE id = $1 AND ($2 = '' OR tenant_id = $2) AND ($3 = '' OR api_key_id = $3) AND ($4 = '' OR kind = $4)
+		FOR UPDATE`, reservationID, tenantID, apiKeyID, kind).Scan(
 		&record.id, &record.tenantID, &record.apiKeyID, &record.status, &record.kind, &record.responseID, &record.refreshIntentID,
 		&record.capabilityOperationID, &record.capability, &record.currency, &record.reservedRequests,
 		&record.reservedInputTokens, &record.reservedOutputTokens, &record.reservedSpendMicros,
@@ -384,7 +408,7 @@ func (c *PostgresController) finish(ctx context.Context, reservationID, targetSt
 		return err
 	}
 	if record.status == targetStatus {
-		return tx.Commit()
+		return nil
 	}
 	if record.status != "reserved" {
 		return fmt.Errorf("quota reservation is already %s", record.status)
@@ -392,7 +416,7 @@ func (c *PostgresController) finish(ctx context.Context, reservationID, targetSt
 	if err := settleReservationTx(ctx, tx, record, targetStatus, actual); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (c *PostgresController) Reconcile(ctx context.Context, limit int) (int, error) {

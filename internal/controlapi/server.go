@@ -19,6 +19,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
@@ -60,6 +61,11 @@ type Config struct {
 	GatewayObservations GatewayObservationIngestor
 	GatewayVerifier     operations.GatewayVerifier
 	Verifier            IdentityVerifier
+	QuotaSnapshots      QuotaSnapshotQuery
+}
+
+type QuotaSnapshotQuery interface {
+	EnforcementSnapshot(context.Context, string, string, time.Time) (quota.EnforcementSnapshot, error)
 }
 
 type GatewayObservationIngestor interface {
@@ -114,13 +120,14 @@ type Server struct {
 	gatewayObservations GatewayObservationIngestor
 	gatewayVerifier     operations.GatewayVerifier
 	verifier            IdentityVerifier
+	quotaSnapshots      QuotaSnapshotQuery
 }
 
 func New(config Config) http.Handler {
 	return &Server{administration: config.Administration, credentials: config.Credentials,
 		providerConnections: config.ProviderConnections, routingCatalog: config.RoutingCatalog,
 		operations: config.Operations, gatewayObservations: config.GatewayObservations,
-		gatewayVerifier: config.GatewayVerifier, verifier: config.Verifier}
+		gatewayVerifier: config.GatewayVerifier, verifier: config.Verifier, quotaSnapshots: config.QuotaSnapshots}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -227,6 +234,18 @@ func (server *Server) route(writer http.ResponseWriter, request *http.Request, a
 			return
 		}
 		server.listPolicyRevisions(writer, request, actor, tenantID)
+	case "effective-policy":
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer, http.MethodGet)
+			return
+		}
+		server.getTenantEffectivePolicy(writer, request, actor, tenantID)
+	case "quota-snapshot":
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer, http.MethodGet)
+			return
+		}
+		server.getQuotaSnapshot(writer, request, actor, tenantID, "")
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
 	}
@@ -304,6 +323,12 @@ func (server *Server) routeGatewayAPIKeys(
 			return
 		}
 		server.getGatewayAPIKeyEffectivePolicy(writer, request, actor, tenantID, credentialID)
+	case "quota-snapshot":
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer, http.MethodGet)
+			return
+		}
+		server.getQuotaSnapshot(writer, request, actor, tenantID, credentialID)
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
 	}
@@ -535,6 +560,40 @@ func (server *Server) getGatewayAPIKeyEffectivePolicy(writer http.ResponseWriter
 		return
 	}
 	writeJSON(writer, http.StatusOK, policy)
+}
+
+func (server *Server) getTenantEffectivePolicy(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID string) {
+	policy, err := server.administration.GetTenantPolicy(request.Context(), actor, tenantID)
+	if err != nil {
+		writeServiceError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"tenant_policy": policy.Policy,
+		"limits":        policy.Policy.Limits,
+	})
+}
+
+func (server *Server) getQuotaSnapshot(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tenantID, credentialID string) {
+	if server.quotaSnapshots == nil {
+		writeAPIError(writer, http.StatusServiceUnavailable, "service_unavailable", "Quota query is not configured")
+		return
+	}
+	if credentialID == "" {
+		if _, err := server.administration.GetTenantPolicy(request.Context(), actor, tenantID); err != nil {
+			writeServiceError(writer, err)
+			return
+		}
+	} else if _, err := server.credentials.GetEffectivePolicy(request.Context(), actor, tenantID, credentialID); err != nil {
+		writeCredentialError(writer, err)
+		return
+	}
+	snapshot, err := server.quotaSnapshots.EnforcementSnapshot(request.Context(), tenantID, credentialID, time.Now().UTC())
+	if err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, "quota_snapshot_unavailable", "Quota snapshot is unavailable")
+		return
+	}
+	writeJSON(writer, http.StatusOK, snapshot)
 }
 
 func writeCredentialMutation(writer http.ResponseWriter, result credentialadmin.MutationResult, err error) {

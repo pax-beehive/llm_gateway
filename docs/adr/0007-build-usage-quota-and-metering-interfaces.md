@@ -120,3 +120,28 @@ Rejected. Corrections must remain attributable and reconstructable.
 - Quota snapshots reconcile committed, reserved, uncertain, and remaining values.
 - `store:false` black-box tests prove no content enters usage events, projections, or exports.
 - Metering outage does not prevent inference while durable outbox capacity remains available.
+
+## Implementation status (2026-08-30)
+
+The proposed design is implemented with a separate `cmd/metering` process,
+content-free versioned Response, Stage A capability, and Cache Refresh usage
+events, stable logical usage identities, leased outbox claims, inbox
+deduplication, append-only corrections with actor and reason attribution, and
+generation-fenced daily projections. Tenant-scoped summary, bounded
+time-series, stable-cursor event, Tenant/key alias, Response usage, asynchronous
+CSV export, signed download, rebuild, and operational-status interfaces are
+present. The control plane exposes effective Policy and Quota Snapshot queries
+that separate committed, reserved, uncertain, and remaining capacity.
+
+Response, capability, and Cache Refresh completion now commit immutable usage,
+the exact typed Quota Reservation settlement, and the usage outbox event in one
+PostgreSQL transaction. Controlled ledger bootstrap is a one-shot operator mode;
+the least-privilege Metering runtime role is explicitly denied authoritative
+Usage Ledger and Response access. Duplicate delivery, ambiguous
+acknowledgement, bootstrap/live-event overlap, correction, rebuild equivalence,
+Tenant isolation, quota atomicity, role isolation, and content-free export
+boundaries have automated coverage. The initial export adapter writes
+create-only objects to an approved regional durable filesystem mount behind the
+`ExportStore` port.
+
+This ADR remains proposed until the decision is explicitly accepted.

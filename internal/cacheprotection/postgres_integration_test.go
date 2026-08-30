@@ -18,6 +18,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
 func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
@@ -96,6 +97,18 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	if planned.Status != cacheprotection.IntentPlanned {
 		t.Fatalf("planned status = %q", planned.Status)
 	}
+	refreshLimit := int64(2_000_000)
+	refreshLimits := core.QuotaLimits{RefreshMonthlySpendMicros: &refreshLimit, Currency: "USD"}
+	quotaController := quota.NewPostgresController(db, func() time.Time { return now })
+	refreshReservation, err := quotaController.ReserveRefresh(ctx, quota.RefreshReservationRequest{
+		TenantID: tenantID, APIKeyID: key.ID, CacheRefreshIntentID: planned.ID,
+		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
+		TenantLimits: refreshLimits, APIKeyLimits: refreshLimits,
+		ReservedSpendMicros: 1_500_000, Currency: "USD", ExpiresAt: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	worker := cacheprotection.NewCoordinator(repository, func() time.Time { return now.Add(4*time.Minute + 55*time.Second) })
 	completed, err := worker.RunDue(ctx, 10, func(provider.CacheAnchor) provider.CacheProtector { return protector })
 	if err != nil {
@@ -103,6 +116,17 @@ func TestPostgresWorkerClaimsAndRefreshesIntentExactlyOnce(t *testing.T) {
 	}
 	if len(completed) != 1 || completed[0].Status != cacheprotection.IntentSucceeded {
 		t.Fatalf("completed intents = %#v", completed)
+	}
+	var refreshReservationStatus string
+	var committedRefreshSpend int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT status,committed_spend_micros FROM quota_reservations WHERE id=$1`, refreshReservation.ID).Scan(
+		&refreshReservationStatus, &committedRefreshSpend,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if refreshReservationStatus != "committed" || committedRefreshSpend != 1_250_000 {
+		t.Fatalf("refresh reservation after usage transaction = %s/%d", refreshReservationStatus, committedRefreshSpend)
 	}
 	again, err := worker.RunDue(ctx, 10, func(provider.CacheAnchor) provider.CacheProtector { return protector })
 	if err != nil || len(again) != 0 || refreshCalls.Load() != 1 {

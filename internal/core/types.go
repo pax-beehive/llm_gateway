@@ -309,6 +309,7 @@ type UsageRecord struct {
 	QuotaReservationID string
 	ResponseID         string
 	AttemptID          string
+	RouteID            string
 	PriceSnapshot      PriceSnapshot
 	ProviderUsage      json.RawMessage
 	Usage              Usage

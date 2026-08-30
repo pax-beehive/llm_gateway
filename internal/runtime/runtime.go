@@ -428,7 +428,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 		}
 		usageRecord := core.UsageRecord{
 			ID: newID("usage"), TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: response.ID,
-			AttemptID: response.Attempts[len(response.Attempts)-1].ID, PriceSnapshot: route.PriceSnapshot,
+			AttemptID: response.Attempts[len(response.Attempts)-1].ID, RouteID: route.ID, PriceSnapshot: route.PriceSnapshot,
 			ProviderUsage: providerUsage, Usage: response.Usage,
 			AmountMicros: calculateUsageAmount(response.Usage, route.PriceSnapshot), Currency: route.PriceSnapshot.Currency,
 			CacheUsageReliable: route.CacheUsageReliable, CreatedAt: completed,
@@ -750,6 +750,7 @@ func (r *Runtime) planCacheProtection(ctx context.Context, request core.Request,
 		return
 	}
 	observation.Anchor.APIKeyID = request.APIKeyID
+	observation.Anchor.PublicModel = request.Model
 	now := r.now().UTC()
 	ttl := observation.EstimatedExpiresAt.Sub(now)
 	if ttl <= 0 {

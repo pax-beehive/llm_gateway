@@ -88,7 +88,7 @@ func TestEmbeddingReservesBeforeExecutionAndSettlesTypedUsage(t *testing.T) {
 		t.Fatalf("settlement = %#v", controller.committed)
 	}
 	records := usageStore.CapabilityUsageRecords("tenant-a")
-	if len(records) != 1 || records[0].QuotaReservationID != "reservation-1" {
+	if len(records) != 1 || records[0].QuotaReservationID != "reservation-1" || records[0].PublicModel != "embed-model" {
 		t.Fatalf("usage records = %#v", records)
 	}
 }

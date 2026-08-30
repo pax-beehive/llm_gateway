@@ -79,6 +79,81 @@ func TestPostgresUsageIsAttributedAndProjectedByAPIKey(t *testing.T) {
 	}
 }
 
+func TestPostgresFinalizationRollsBackWhenQuotaReservationDoesNotMatchUsageKind(t *testing.T) {
+	db, ctx := integrationDatabase(t)
+	responseStore := store.NewPostgresResponseStore(db)
+	if err := migrations.Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	tenantID := fmt.Sprintf("usage-quota-atomic-%d", time.Now().UnixNano())
+	monthlyLimit := int64(100)
+	limits := core.QuotaLimits{MonthlySpendMicros: &monthlyLimit, Currency: "USD"}
+	accessService, err := access.NewPostgresService(db, []byte("integration-test-pepper"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accessService.CreateTenant(ctx, access.Tenant{
+		ID: tenantID, Slug: tenantID, DisplayName: "Atomic usage tenant", Status: access.TenantActive,
+		HomeRegion: "local", ExecutionEpoch: 1, Policy: core.TenantPolicy{Revision: 1, Limits: limits},
+	}, access.ChangeActor{Type: "test", ID: "integration"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupTenant(t, db, tenantID) })
+	key, err := accessService.ImportAPIKey(ctx, access.APIKeySpec{
+		TenantID: tenantID, Name: "atomic key", RawKey: "gw_test_atomic_" + tenantID,
+		Policy: core.APIKeyPolicy{Revision: 1, Limits: limits},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	controller := quota.NewPostgresController(db, func() time.Time { return now })
+	reservation, err := controller.Reserve(ctx, quota.ReservationRequest{
+		TenantID: tenantID, APIKeyID: key.ID, CapabilityOperationID: "wrong-kind-operation", Capability: core.CapabilityEmbeddings,
+		HomeRegion: "local", ExecutionEpoch: 1, TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
+		TenantLimits: limits, APIKeyLimits: limits, Requests: 1, ReservedEmbeddingInputUnits: 1,
+		Currency: "USD", ExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := core.Response{
+		ID: "atomic-response", Object: "response", CreatedAt: now.Unix(), Status: core.ResponseStatusInProgress,
+		Model: "model", HomeRegion: "local", ExecutionEpoch: 1, Revision: 1, RetainContent: true, Output: []core.Item{},
+	}
+	if err := responseStore.Create(ctx, tenantID, response); err != nil {
+		t.Fatal(err)
+	}
+	response.Status = core.ResponseStatusCompleted
+	err = responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, core.UsageRecord{
+		ID: "atomic-usage", TenantID: tenantID, APIKeyID: key.ID, ResponseID: response.ID,
+		AttemptID: "atomic-attempt", QuotaReservationID: reservation.ID, RouteID: "atomic-route",
+		PriceSnapshot: core.PriceSnapshot{ID: "atomic-price", Provider: "provider", Model: "model", Region: "local", Currency: "USD", EffectiveAt: now.Unix(), Source: "integration-test"},
+		ProviderUsage: []byte(`{}`), Currency: "USD", CreatedAt: now,
+	})
+	if !errors.Is(err, quota.ErrReservationNotFound) {
+		t.Fatalf("finalization error = %v, want mismatched quota reservation", err)
+	}
+	var status string
+	var revision int64
+	if err := db.QueryRowContext(ctx, `SELECT status,revision FROM responses WHERE tenant_id=$1 AND id=$2`, tenantID, response.ID).Scan(&status, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(core.ResponseStatusInProgress) || revision != 1 {
+		t.Fatalf("response changed after rolled back finalization: %s/%d", status, revision)
+	}
+	var usageCount, usageEventCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM usage_ledger WHERE tenant_id=$1 AND id='atomic-usage'`, tenantID).Scan(&usageCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM transactional_outbox WHERE tenant_id=$1 AND event_type='usage.recorded'`, tenantID).Scan(&usageEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if usageCount != 0 || usageEventCount != 0 {
+		t.Fatalf("rolled back usage ledger/outbox counts = %d/%d", usageCount, usageEventCount)
+	}
+}
+
 func TestPostgresCapabilityUsageIsImmutableContentFreeAndProjected(t *testing.T) {
 	db, ctx := integrationDatabase(t)
 	responseStore := store.NewPostgresResponseStore(db)

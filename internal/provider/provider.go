@@ -31,6 +31,7 @@ type CacheAnchor struct {
 	RouteID          string
 	Provider         string
 	Model            string
+	PublicModel      string
 	CredentialScope  string
 	Region           string
 	CacheKey         string

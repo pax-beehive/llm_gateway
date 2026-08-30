@@ -26,6 +26,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/secretcustody"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
@@ -193,7 +194,8 @@ func run() error {
 		Administration: administration, Credentials: credentials,
 		ProviderConnections: providerConnections, RoutingCatalog: routingCatalog,
 		Operations: operationsService, GatewayObservations: operationsService, GatewayVerifier: gatewayVerifier,
-		Verifier: verifier,
+		Verifier:       verifier,
+		QuotaSnapshots: quota.NewPostgresController(database, time.Now),
 	})
 	readiness := operations.NewProbe(750*time.Millisecond, time.Now, map[string]operations.Check{
 		"database": func(checkCtx context.Context) error { return database.PingContext(checkCtx) },

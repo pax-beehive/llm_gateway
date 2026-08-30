@@ -115,6 +115,7 @@ type CapabilityUsageRecord struct {
 	RouteID            string
 	Provider           string
 	Model              string
+	PublicModel        string
 	PriceSnapshot      PriceSnapshot
 	ProviderUsage      json.RawMessage
 	InputUnits         int64

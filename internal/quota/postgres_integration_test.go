@@ -122,6 +122,16 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	if snapshot.MonthlySpend.Reserved != 0 || snapshot.MonthlySpend.Committed != 20 {
 		t.Fatalf("monthly spend snapshot = %#v", snapshot.MonthlySpend)
 	}
+	enforcement, err := controller.EnforcementSnapshot(ctx, tenantID, key.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	monthly := enforcement.Balances["monthly_spend_micros"]
+	if enforcement.TenantPolicyRevision != 1 || enforcement.APIKeyPolicyRevision != 1 ||
+		monthly.Committed != 20 || monthly.Reserved != 0 || monthly.Uncertain != 0 ||
+		monthly.Remaining == nil || *monthly.Remaining != 40 {
+		t.Fatalf("enforcement snapshot = %#v", enforcement)
+	}
 	capabilityReservation, err := controller.Reserve(ctx, quota.ReservationRequest{
 		TenantID: tenantID, APIKeyID: key.ID, CapabilityOperationID: "embedding-operation", Capability: core.CapabilityEmbeddings,
 		HomeRegion: "local", ExecutionEpoch: 1,
@@ -147,9 +157,16 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	var capabilityStatus string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM quota_reservations WHERE id = $1`, capabilityReservation.ID).Scan(&capabilityStatus); err != nil {
+		t.Fatal(err)
+	}
+	if capabilityStatus != "committed" {
+		t.Fatalf("capability reservation status after usage transaction = %q", capabilityStatus)
+	}
 	settled, err := controller.Reconcile(ctx, 10)
-	if err != nil || settled != 1 {
-		t.Fatalf("reconcile capability usage = %d / %v", settled, err)
+	if err != nil || settled != 0 {
+		t.Fatalf("reconcile already committed capability usage = %d / %v", settled, err)
 	}
 	snapshot, err = controller.APIKeySnapshot(ctx, tenantID, key.ID, "USD", now)
 	if err != nil {
@@ -293,8 +310,8 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if reconciled, err := controller.Reconcile(ctx, 10); err != nil || reconciled != 1 {
-		t.Fatalf("fallback reconciliation = %d / %v, want one successful attempt", reconciled, err)
+	if reconciled, err := controller.Reconcile(ctx, 10); err != nil || reconciled != 0 {
+		t.Fatalf("fallback reconciliation = %d / %v, successful attempt must already be committed", reconciled, err)
 	}
 	var failedStatus, successStatus string
 	if err := db.QueryRowContext(ctx, `SELECT status FROM quota_reservations WHERE id = $1`, failedAttempt.ID).Scan(&failedStatus); err != nil {
