@@ -79,8 +79,10 @@ GATEWAY_TRUSTED_PROXY_CIDRS=10.0.0.0/8,2001:db8::/32
 GATEWAY_CACHE_PROTECTION_MODE=off
 GATEWAY_ROUTING_CATALOG=true
 GATEWAY_ID=gateway-us-west-1
-GATEWAY_SECRET_CUSTODY_BACKEND=gcp-secret-manager
-GATEWAY_GCP_SECRET_PROJECT=provider-secret-project
+GATEWAY_CONTROL_RELAY_URL=https://control.example
+GATEWAY_CONTROL_RELAY_HMAC_KEY=at-least-32-byte-machine-key
+GATEWAY_OPERATIONS_URL=https://control.example
+GATEWAY_OPERATIONS_HMAC_KEY=at-least-32-byte-machine-key
 ```
 
 The Tenant Administration control plane is a separate process and requires a
@@ -104,10 +106,11 @@ CONTROL_GATEWAY_REGIONS_JSON={"gateway-us-west-1":"us-west"}
 Run schema migration as a separate owner job, then apply least-privilege grants
 with `make configure-tenant-admin-roles ADMIN_DATABASE_URL=... TENANT_ADMIN_DB_ROLE=... GATEWAY_DB_ROLE=...`.
 The control-plane runtime refuses in-process production migration and verifies
-its connected role. The Gateway role reads immutable control events and owns
-only its local Access and Routing Catalog projection tables plus rollout
-receipts; it receives no read
-access to authoritative Tenant or Gateway API Key tables. Production refuses to
+its connected role. The Gateway role owns only its local Access, Provider
+Connection execution, and Routing Catalog projection tables, relay cursor, and
+rollout receipts. It has no read access to `control_outbox`, the control-plane
+Provider Connection view, or authoritative Tenant and Gateway API Key tables.
+Production refuses to
 start unless `GATEWAY_ACCESS_PROJECTION=true`. Both production processes require
 the transport attestation and reject PostgreSQL configurations that are not
 certificate-verified TLS; the repair command enforces the same rule on both its
@@ -115,14 +118,21 @@ source and destination connections.
 `/healthz` is liveness only. `/readyz` performs bounded local dependency,
 schema, projection, Routing Catalog, fence, and durable-outbox checks without
 calling Providers, Human IAM, Billing, Metering, or the remote control plane.
-Tenant mutations atomically append `control_outbox`; that is durable enqueue,
-not delivery proof. The initial shared-PostgreSQL consumer applies events through
-an inbox and aggregate revisions, reports gaps and lag in structured logs, and
-supports atomic snapshot repair. ADR 0008 owns cross-database Gateway identity,
-durable receipt ingestion, alerts, readiness, and replacement of the shared
-event reader with an authenticated encrypted relay before physical database
-separation. The Operations/receipt surfaces are implemented; the relay remains
-an explicit incomplete deployment gate.
+Tenant, credential, Provider Connection, and Routing Catalog mutations
+atomically append `control_outbox`; that is durable enqueue, not delivery proof.
+Production Gateways pull a bounded, globally ordered, region-scoped stream from
+`/internal/v1/control-events`. The persisted cursor advances only after every
+local projection accepts the batch, so retry is idempotent and revision gaps
+fail closed. Each fetch also records the control-plane source head and last
+successful fetch time; Operations exposes their difference as relay backlog.
+Fetch and projection failures durably record a stable error code; transient
+execution-secret delivery failures leave the batch cursor unchanged even though
+the newly observed source head remains visible. Startup fails unless the bounded
+catch-up reaches `cursor == source_head`; only then does the Gateway compile and
+install the persisted Routing Catalog. HTTPS supplies transport encryption and
+the Gateway HMAC binds its
+identity to the timestamp, method, exact path, and query. The original shared
+PostgreSQL consumers remain development compatibility adapters only.
 
 Gateways send signed soft-state heartbeats plus durable Routing Catalog and
 Access Projection rollout observations to
@@ -135,7 +145,8 @@ Gateway inbox; that collector remains development compatibility only. Configure
 `/control/v1/operations/{gateways,publications,outbox,consumers,jobs}` and expose
 desired/applied revisions, heartbeat and consumer lag, outbox age, quota/cache/
 retention backlog, revocation propagation, explicit Metering availability,
-build SHA, and schema version.
+build SHA, and schema version. Desired Access revisions are computed per region,
+while the applied relay cursor advances across the globally ordered source.
 
 Provider Connection Administration stores upstream credentials in GCP Secret
 Manager through Workload Identity. PostgreSQL stores only the Secret Manager
@@ -154,10 +165,15 @@ inventory observations and their raw-response hash, but never publishes Model
 Routes. Credentials can only be delivered to the exact built-in endpoint for
 the declared Provider identity.
 
-The execution-plane `GatewayResolver` reads only enabled connections through
-`gateway_provider_connection_resolutions` and resolves immutable secret versions
-using Secret Custody workload identity. The Gateway database role has no access
-to Provider Connection management tables.
+Provider Connection schema-3 events carry a complete secret-free execution
+projection: Provider identity, validated Base URL, region, credential scope,
+capability declaration, administrative status, connection revision, and
+credential version. A Gateway compiles routes from that local projection. It
+fetches the exact immutable credential only from
+`/internal/v1/provider-connection-secrets/{connection_id}` over the same
+authenticated HTTPS machine boundary, with both connection revision and
+credential version required. The response is `no-store`; neither events nor the
+Gateway projection contain secret material or Secret Manager references.
 
 Repair a specific Tenant after a detected revision gap with a bounded operator
 job that has read access to the authoritative control database and write access

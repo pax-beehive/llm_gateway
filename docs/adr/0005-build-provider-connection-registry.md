@@ -27,11 +27,14 @@ inside Secret Custody. Discovery persists a hash
 of the bounded raw Provider response and cannot mutate the existing routing
 configuration. Provider endpoints are restricted to the exact built-in host for
 the declared Provider and are revalidated immediately before credential access.
-The execution-plane `GatewayResolver` uses a Gateway-only view of enabled
-connections plus workload-authenticated Secret Custody access to retrieve the
-immutable credential version; ADR 0006 remains responsible for publishing a
-Model Route that references the connection. The ADR remains `proposed` until it
-is explicitly accepted.
+The production execution-plane resolver uses a Gateway-local, schema-3
+secret-free Provider Connection projection. During Routing Catalog compilation
+it retrieves the exact immutable credential through ADR 0008's authenticated
+HTTPS execution-secret endpoint using both connection revision and credential
+version. The legacy Gateway-only database view and direct Secret Custody adapter
+remain development compatibility paths. ADR 0006 remains responsible for
+publishing a Model Route that references the connection. The ADR remains
+`proposed` until it is explicitly accepted.
 
 ## Context
 

@@ -11,8 +11,8 @@ func TestEmbeddedGatewayMigrationsRemainContiguous(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 21 {
-		t.Fatalf("migration count = %d, want 21", len(entries))
+	if len(entries) != 22 {
+		t.Fatalf("migration count = %d, want 22", len(entries))
 	}
 	for index, entry := range entries {
 		prefix := fmt.Sprintf("%06d_", index+1)

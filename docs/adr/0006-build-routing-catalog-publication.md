@@ -158,5 +158,7 @@ receipts, and last-valid-snapshot behavior. Selection priority, stable weighted
 ordering, maximum concurrency, explicit visibility, active/draining/disabled
 administrative state, and observed health are enforced at runtime. Unit,
 PostgreSQL integration, and control-plane black-box coverage exercise these
-boundaries. The ADR remains proposed until the decision is explicitly accepted;
-the external distribution/readiness work remains owned by ADR 0008.
+boundaries. Production distribution now consumes ADR 0008's authenticated
+Control Event relay and compiles from the local Provider Connection execution
+projection; the shared PostgreSQL consumer remains development compatibility.
+The ADR remains proposed until the decision is explicitly accepted.

@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
+	"github.com/toddzheng/llm-gateway/internal/controlrelay"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
@@ -155,7 +156,23 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Operations: %w", err)
 	}
-	gatewayVerifier, err := configureGatewayObservationVerifier(devMode)
+	gatewayVerifier, err := configureGatewayVerifier(devMode)
+	if err != nil {
+		return err
+	}
+	eventPublisher, err := controlrelay.NewPostgresPublisher(database)
+	if err != nil {
+		return err
+	}
+	eventRelay, err := controlrelay.NewHandler(eventPublisher, gatewayVerifier)
+	if err != nil {
+		return err
+	}
+	secretPublisher, err := controlrelay.NewPostgresSecretPublisher(database, secretStore)
+	if err != nil {
+		return err
+	}
+	secretRelay, err := controlrelay.NewSecretHandler(secretPublisher, gatewayVerifier)
 	if err != nil {
 		return err
 	}
@@ -191,6 +208,8 @@ func run() error {
 		},
 	})
 	mux := http.NewServeMux()
+	mux.Handle(controlrelay.EventPath, eventRelay)
+	mux.Handle(controlrelay.SecretPathPrefix, secretRelay)
 	mux.Handle("/", operations.Handler(api, readiness))
 	address := envOr("CONTROL_PLANE_ADDR", ":8081")
 	server := &http.Server{
@@ -280,7 +299,7 @@ func configureSecretCustody(devMode bool) (secretcustody.Store, error) {
 	return store, nil
 }
 
-func configureGatewayObservationVerifier(devMode bool) (operations.GatewayVerifier, error) {
+func configureGatewayVerifier(devMode bool) (operations.GatewayVerifier, error) {
 	keys := map[string]string{}
 	regions := map[string]string{}
 	if encoded := strings.TrimSpace(os.Getenv("CONTROL_GATEWAY_HMAC_KEYS_JSON")); encoded != "" {

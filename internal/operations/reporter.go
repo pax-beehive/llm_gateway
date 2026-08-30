@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -90,7 +91,9 @@ func ObserveGateway(ctx context.Context, database *sql.DB, gatewayID, region, bu
 	if err := database.QueryRowContext(ctx, `SELECT current_version FROM gateway_schema_metadata WHERE component='gateway'`).Scan(&observation.DatabaseSchemaVersion); err != nil {
 		return GatewayObservation{}, err
 	}
-	if err := database.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM gateway_access_inbox`).Scan(&observation.AccessProjectionRevision); err != nil {
+	if err := database.QueryRowContext(ctx, `SELECT COALESCE(
+		(SELECT cursor FROM gateway_control_event_offsets WHERE stream_name='control-plane'),
+		(SELECT max(delivery_sequence) FROM gateway_access_inbox),0)`).Scan(&observation.AccessProjectionRevision); err != nil {
 		return GatewayObservation{}, err
 	}
 	if err := database.QueryRowContext(ctx, `SELECT COALESCE(min(execution_epoch),0) FROM gateway_access_projection WHERE tenant_status='active'`).Scan(&observation.ExecutionEpochFloor); err != nil {
@@ -125,7 +128,11 @@ func ObserveGateway(ctx context.Context, database *sql.DB, gatewayID, region, bu
 	if err != nil {
 		return GatewayObservation{}, err
 	}
-	observation.Consumers = []ConsumerObservation{accessConsumer, routingConsumer}
+	relayConsumer, err := observeRelayConsumer(ctx, database, now)
+	if err != nil {
+		return GatewayObservation{}, err
+	}
+	observation.Consumers = []ConsumerObservation{accessConsumer, relayConsumer, routingConsumer}
 	SortConsumers(observation.Consumers)
 	rows, err := database.QueryContext(ctx, `SELECT publication_id,catalog_revision,status,COALESCE(error_code,''),observed_at
 		FROM gateway_routing_catalog_inbox WHERE gateway_id=$1 ORDER BY observed_at DESC,event_id DESC LIMIT 128`, gatewayID)
@@ -180,58 +187,70 @@ func MarkAccessReceiptsReported(ctx context.Context, database *sql.DB, observati
 
 func observeAccessConsumer(ctx context.Context, database *sql.DB, now time.Time) (ConsumerObservation, error) {
 	value := ConsumerObservation{Name: "access_projection"}
-	var lastAt, oldestGap, oldestPending *time.Time
-	var gapCount, pending int64
+	var lastAt, oldestGap *time.Time
+	var gapCount int64
 	err := database.QueryRowContext(ctx, `SELECT COALESCE((SELECT event_id FROM gateway_access_inbox ORDER BY received_at DESC,event_id DESC LIMIT 1),''),
 		COALESCE((SELECT count(*) FROM gateway_access_gaps),0),(SELECT max(received_at) FROM gateway_access_inbox),
-		(SELECT min(detected_at) FROM gateway_access_gaps),
-		(SELECT count(*) FROM control_outbox o WHERE o.aggregate_type IN ('Tenant','GatewayAPIKey') AND o.schema_version=2
-			AND NOT EXISTS (SELECT 1 FROM gateway_access_inbox i WHERE i.event_id=o.event_id)),
-		(SELECT min(occurred_at) FROM control_outbox o WHERE o.aggregate_type IN ('Tenant','GatewayAPIKey') AND o.schema_version=2
-			AND NOT EXISTS (SELECT 1 FROM gateway_access_inbox i WHERE i.event_id=o.event_id))`).Scan(
-		&value.LastEventID, &gapCount, &lastAt, &oldestGap, &pending, &oldestPending)
+		(SELECT min(detected_at) FROM gateway_access_gaps)`).Scan(
+		&value.LastEventID, &gapCount, &lastAt, &oldestGap)
 	if err != nil {
 		return ConsumerObservation{}, err
 	}
 	if lastAt != nil {
 		value.LastSucceededAt = *lastAt
 	}
-	value.PendingCount = pending
-	oldest := oldestPending
-	if oldestGap != nil && (oldest == nil || oldestGap.Before(*oldest)) {
-		oldest = oldestGap
-	}
-	if oldest != nil {
-		value.LagSeconds = nonnegativeSeconds(now.Sub(*oldest))
+	if oldestGap != nil {
+		value.LagSeconds = nonnegativeSeconds(now.Sub(*oldestGap))
 	}
 	if gapCount > 0 {
+		value.PendingCount = gapCount
 		value.ErrorCode = "revision_gap"
+	}
+	return value, nil
+}
+
+func observeRelayConsumer(ctx context.Context, database *sql.DB, now time.Time) (ConsumerObservation, error) {
+	value := ConsumerObservation{Name: "control_event_relay"}
+	var cursor, sourceHead int64
+	var lastSucceededAt, failureStartedAt *time.Time
+	var lastErrorCode string
+	err := database.QueryRowContext(ctx, `SELECT cursor,source_head,last_succeeded_at,failure_started_at,COALESCE(last_error_code,'')
+		FROM gateway_control_event_offsets WHERE stream_name='control-plane'`).Scan(&cursor, &sourceHead, &lastSucceededAt, &failureStartedAt, &lastErrorCode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return value, nil
+	}
+	if err != nil {
+		return ConsumerObservation{}, err
+	}
+	value.LastEventID = strconv.FormatInt(cursor, 10)
+	value.PendingCount = max64(sourceHead-cursor, 0)
+	value.ErrorCode = lastErrorCode
+	if lastSucceededAt != nil {
+		value.LastSucceededAt = lastSucceededAt.UTC()
+		if value.PendingCount > 0 || value.ErrorCode != "" {
+			value.LagSeconds = nonnegativeSeconds(now.Sub(*lastSucceededAt))
+		}
+	} else if failureStartedAt != nil && value.ErrorCode != "" {
+		value.LagSeconds = nonnegativeSeconds(now.Sub(*failureStartedAt))
 	}
 	return value, nil
 }
 
 func observeRoutingConsumer(ctx context.Context, database *sql.DB, gatewayID string, now time.Time) (ConsumerObservation, error) {
 	value := ConsumerObservation{Name: "routing_catalog"}
-	var lastAt, oldestPending *time.Time
+	var lastAt *time.Time
 	var status, errorCode string
 	err := database.QueryRowContext(ctx, `SELECT
 		COALESCE((SELECT event_id FROM gateway_routing_catalog_inbox WHERE gateway_id=$1 ORDER BY observed_at DESC,event_id DESC LIMIT 1),''),
 		COALESCE((SELECT status FROM gateway_routing_catalog_inbox WHERE gateway_id=$1 ORDER BY observed_at DESC,event_id DESC LIMIT 1),''),
 		COALESCE((SELECT error_code FROM gateway_routing_catalog_inbox WHERE gateway_id=$1 ORDER BY observed_at DESC,event_id DESC LIMIT 1),''),
-		(SELECT max(observed_at) FROM gateway_routing_catalog_inbox WHERE gateway_id=$1 AND status='applied'),
-		(SELECT count(*) FROM control_outbox o WHERE o.aggregate_type='RoutingCatalog' AND o.schema_version=1
-			AND NOT EXISTS (SELECT 1 FROM gateway_routing_catalog_inbox i WHERE i.gateway_id=$1 AND i.event_id=o.event_id)),
-		(SELECT min(occurred_at) FROM control_outbox o WHERE o.aggregate_type='RoutingCatalog' AND o.schema_version=1
-			AND NOT EXISTS (SELECT 1 FROM gateway_routing_catalog_inbox i WHERE i.gateway_id=$1 AND i.event_id=o.event_id))`, gatewayID).Scan(
-		&value.LastEventID, &status, &errorCode, &lastAt, &value.PendingCount, &oldestPending)
+		(SELECT max(observed_at) FROM gateway_routing_catalog_inbox WHERE gateway_id=$1 AND status='applied')`, gatewayID).Scan(
+		&value.LastEventID, &status, &errorCode, &lastAt)
 	if err != nil {
 		return ConsumerObservation{}, err
 	}
 	if lastAt != nil {
 		value.LastSucceededAt = *lastAt
-	}
-	if oldestPending != nil {
-		value.LagSeconds = nonnegativeSeconds(now.Sub(*oldestPending))
 	}
 	if status == routingcatalog.ReceiptRejected {
 		value.ErrorCode = errorCode

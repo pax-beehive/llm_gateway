@@ -3,6 +3,7 @@
 package providerconnection_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -85,6 +86,16 @@ func TestRegisterProviderConnectionStoresOnlySecretReferenceAndEmitsEvidence(t *
 	}
 	if auditCount != 1 || outboxCount != 1 {
 		t.Fatalf("audit/outbox counts = %d/%d", auditCount, outboxCount)
+	}
+	var eventSchema int
+	var executionPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT schema_version,payload FROM control_outbox
+		WHERE aggregate_type='ProviderConnection' AND aggregate_id=$1 AND event_type='ProviderConnectionRegistered'`, id).Scan(&eventSchema, &executionPayload); err != nil {
+		t.Fatal(err)
+	}
+	if eventSchema != 3 || !bytes.Contains(executionPayload, []byte(`"base_url"`)) || !bytes.Contains(executionPayload, []byte(`"capability_declaration"`)) ||
+		bytes.Contains(executionPayload, []byte("secret_ref")) || bytes.Contains(executionPayload, []byte("provider-secret-material")) {
+		t.Fatalf("execution projection event schema/payload = %d/%s", eventSchema, executionPayload)
 	}
 	for _, table := range []string{"provider_connections", "provider_connection_credential_versions", "control_audit_events", "control_outbox", "control_command_idempotency"} {
 		var leaked bool

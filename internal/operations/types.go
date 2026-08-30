@@ -11,7 +11,7 @@ import (
 const (
 	CurrentObservationVersion = 3
 	MinimumObservationVersion = 2
-	CurrentDatabaseSchema     = 21
+	CurrentDatabaseSchema     = 22
 	MinimumDatabaseSchema     = 21
 )
 

@@ -98,8 +98,12 @@ func (service *Service) Update(ctx context.Context, actor tenantadmin.ActorEnvel
 	if err := requireOne(result); err != nil {
 		return MutationResult{}, err
 	}
+	extra := map[string]any{"changed_fields": changedFields}
+	if current.Region != region {
+		extra["previous_region"] = current.Region
+	}
 	return service.completeConnectionMutation(ctx, transaction, actor, updateOperation, idempotencyKey, requestHash,
-		command.ConnectionID, "ProviderConnectionChanged", map[string]any{"changed_fields": changedFields})
+		command.ConnectionID, "ProviderConnectionChanged", extra)
 }
 
 func (service *Service) Enable(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command StatusCommand) (MutationResult, error) {

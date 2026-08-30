@@ -183,10 +183,40 @@ signals. Metering cutoff is explicitly reported as unavailable until ADR 0007
 has an active projection; Operations does not manufacture a cutoff from Usage
 Ledger writes.
 
-The existing shared-PostgreSQL control-event reader remains a development
-compatibility transport for Access and Routing Catalog delivery. The encrypted
-external relay and local Provider Connection execution projection are still
-required before this ADR is implementation-complete and before physical
-control/data-plane database separation; Operations does not turn its heartbeat
-interface into a generic event bus. This ADR remains proposed until those gates
-pass and the decision is explicitly accepted.
+The external relay gate is now implemented independently from Operations.
+Production Gateways fetch bounded batches from
+`GET /internal/v1/control-events` over HTTPS with a Gateway HMAC identity bound
+to the exact method, path, and query. The control-plane publisher advances a
+global delivery cursor across unrelated events while returning only the
+Gateway's region-scoped Access and Provider Connection events plus global
+Routing Catalog publications. Gateway cursor persistence happens only after
+all local consumers accept the batch; inboxes and aggregate revisions make
+retry idempotent and revision gaps fail closed. Transient execution-secret
+delivery failures are retryable and therefore hold the cursor rather than
+creating a permanent rejection receipt. Fetch observation is persisted before
+projection acknowledgement: every successful fetch records its source head and
+fetch time even when a projection rejects the batch. `last_succeeded_at` advances
+only after every projection accepts and the cursor is acknowledged; a continuous
+failure interval preserves its first-failure time. Failed fetches record
+last-attempt time and a stable error code. Startup proceeds only after a bounded
+catch-up proves `cursor == source_head`. The global relay backlog has both the
+Operations query and OpenTelemetry evidence required by this ADR. Desired
+Access revisions are computed per Gateway region; the applied relay cursor is
+globally comparable because it advances across filtered events. Shared-PostgreSQL readers remain
+development compatibility adapters and the Gateway runtime role no longer has
+`SELECT` on `control_outbox`.
+
+Provider Connection schema-3 events carry the complete non-secret execution
+metadata required by the local Gateway projection. Existing connections receive
+a current-state backfill event. Secret material and Secret Manager references
+are excluded. Routing compilation retrieves one exact immutable credential from
+the dedicated authenticated, `no-store` execution-secret endpoint using the
+connection revision and credential version; inference continues from its local
+compiled snapshot during control-plane outages. Startup catches up the Provider
+Connection execution projection before compiling and installing the persisted
+Routing Catalog. A two-schema integration test
+proves relay, projection, and secret resolution while the Gateway schema has no
+`control_outbox` at all. The relay and execution-projection implementation gates
+now pass. A retained-history floor and multi-projection bootstrap protocol remain
+required before introducing bounded control-outbox retention. This ADR remains
+`proposed` until the decision is explicitly accepted.

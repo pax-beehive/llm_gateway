@@ -40,6 +40,22 @@ _Avoid_: Billing source of truth
 An upstream model vendor or inference platform that accepts model requests and reports usage.
 _Avoid_: Backend, vendor API
 
+**Control Event Relay**:
+The authenticated, encrypted, globally ordered delivery boundary that projects
+control-plane facts into one Gateway region without granting the Gateway access
+to control-plane tables.
+_Avoid_: Shared outbox reader, Operations heartbeat bus
+
+**Provider Connection Execution Projection**:
+The Gateway-local, secret-free metadata needed to compile Model Routes for one
+Provider Connection revision and credential version.
+_Avoid_: Provider Connection management replica, secret-reference view
+
+**Execution Secret Delivery**:
+A bounded machine interface that returns the exact immutable Provider credential
+for one enabled regional Provider Connection revision during route compilation.
+_Avoid_: Secret event, inference-time control-plane lookup
+
 **Model Route**:
 A policy-governed path from a requested model capability to one concrete provider, model, credential scope, and region.
 _Avoid_: Endpoint, deployment

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
+	"github.com/toddzheng/llm-gateway/internal/controlevent"
 	"github.com/toddzheng/llm-gateway/internal/core"
 )
 
@@ -215,6 +216,20 @@ func (store *Store) Apply(ctx context.Context, event ControlEvent) (ApplyResult,
 		lag = 0
 	}
 	return ApplyResult{Disposition: DispositionApplied, Lag: lag}, nil
+}
+
+// Consume applies the access subset of an externally relayed Control Event
+// stream. Other aggregate types are handled by sibling Gateway projections.
+func (store *Store) Consume(ctx context.Context, event controlevent.Event) error {
+	if event.AggregateType != "Tenant" && event.AggregateType != "GatewayAPIKey" {
+		return nil
+	}
+	_, err := store.Apply(ctx, ControlEvent{
+		EventID: event.EventID, DeliverySequence: event.DeliverySequence, SchemaVersion: event.SchemaVersion,
+		AggregateType: event.AggregateType, AggregateID: event.AggregateID, AggregateRevision: event.AggregateRevision,
+		TenantID: event.TenantID, EventType: event.EventType, OccurredAt: event.OccurredAt, Payload: event.Payload,
+	})
+	return err
 }
 
 func validateEvent(event ControlEvent) error {
@@ -663,14 +678,6 @@ func (store *Store) Status(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 	if err := store.database.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM gateway_access_inbox`).Scan(&status.MaxDeliverySequence); err != nil {
-		return Status{}, err
-	}
-	if err := store.database.QueryRowContext(ctx, `
-		SELECT count(*), min(occurred_at)
-		FROM control_outbox
-		WHERE aggregate_type IN ('Tenant','GatewayAPIKey') AND schema_version = 2
-		  AND NOT EXISTS (SELECT 1 FROM gateway_access_inbox i WHERE i.event_id = control_outbox.event_id)`).Scan(
-		&status.PendingEventCount, &status.OldestPendingAt); err != nil {
 		return Status{}, err
 	}
 	var maxLagSeconds sql.NullFloat64

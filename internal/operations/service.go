@@ -226,7 +226,7 @@ func (service *Service) ListGateways(ctx context.Context, actor tenantadmin.Acto
 	if err := service.loadAccessReceipts(ctx, page.Data); err != nil {
 		return GatewayPage{}, err
 	}
-	desiredRouting, desiredAccess, err := service.desiredRevisions(ctx)
+	desiredRouting, desiredAccess, err := service.desiredRevisionsByRegion(ctx, page.Data)
 	if err != nil {
 		return GatewayPage{}, err
 	}
@@ -248,7 +248,7 @@ func (service *Service) GetGateway(ctx context.Context, actor tenantadmin.ActorE
 	if err != nil {
 		return GatewaySummary{}, err
 	}
-	routing, access, err := service.desiredRevisions(ctx)
+	routing, accessByRegion, err := service.desiredRevisionsByRegion(ctx, []GatewaySummary{summary})
 	if err != nil {
 		return GatewaySummary{}, err
 	}
@@ -256,7 +256,7 @@ func (service *Service) GetGateway(ctx context.Context, actor tenantadmin.ActorE
 	if err := service.loadAccessReceipts(ctx, values); err != nil {
 		return GatewaySummary{}, err
 	}
-	service.finishGatewaySummaries(ctx, values, routing, access)
+	service.finishGatewaySummaries(ctx, values, routing, accessByRegion)
 	return values[0], nil
 }
 
@@ -319,25 +319,35 @@ func scanGateway(row rowScanner) (GatewaySummary, error) {
 	return summary, nil
 }
 
-func (service *Service) desiredRevisions(ctx context.Context) (int64, int64, error) {
-	var routing, access int64
+func (service *Service) desiredRevisionsByRegion(ctx context.Context, gateways []GatewaySummary) (int64, map[string]int64, error) {
+	var routing int64
 	if err := service.database.QueryRowContext(ctx, `SELECT COALESCE(max(revision),0) FROM routing_catalog_revisions`).Scan(&routing); err != nil {
-		return 0, 0, err
+		return 0, nil, err
 	}
-	if err := service.database.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM control_outbox WHERE aggregate_type IN ('Tenant','GatewayAPIKey')`).Scan(&access); err != nil {
-		return 0, 0, err
+	desired := make(map[string]int64)
+	for _, gateway := range gateways {
+		if _, exists := desired[gateway.Region]; exists {
+			continue
+		}
+		var access int64
+		if err := service.database.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM control_outbox
+			WHERE aggregate_type IN ('Tenant','GatewayAPIKey') AND schema_version=2
+			AND COALESCE(payload->>'home_region'=$1,false)`, gateway.Region).Scan(&access); err != nil {
+			return 0, nil, err
+		}
+		desired[gateway.Region] = access
 	}
-	return routing, access, nil
+	return routing, desired, nil
 }
 
-func (service *Service) finishGatewaySummaries(ctx context.Context, values []GatewaySummary, desiredRouting, desiredAccess int64) {
+func (service *Service) finishGatewaySummaries(ctx context.Context, values []GatewaySummary, desiredRouting int64, desiredAccessByRegion map[string]int64) {
 	now := service.now().UTC()
 	for index := range values {
 		value := &values[index]
 		value.DesiredRoutingRevision = desiredRouting
-		value.DesiredAccessRevision = desiredAccess
+		value.DesiredAccessRevision = desiredAccessByRegion[value.Region]
 		value.RoutingRevisionLag = max64(desiredRouting-value.RoutingCatalogRevision, 0)
-		value.AccessRevisionLag = max64(desiredAccess-value.AccessProjectionRevision, 0)
+		value.AccessRevisionLag = max64(value.DesiredAccessRevision-value.AccessProjectionRevision, 0)
 		for _, consumer := range value.Consumers {
 			switch consumer.Name {
 			case "access_projection":

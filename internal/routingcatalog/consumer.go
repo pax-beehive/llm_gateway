@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/toddzheng/llm-gateway/internal/controlevent"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 )
 
@@ -91,40 +92,47 @@ func (consumer *Consumer) RunNext(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return true, consumer.applyPublishedEvent(ctx, event)
+}
+
+func (consumer *Consumer) applyPublishedEvent(ctx context.Context, event publishedEvent) error {
 	if event.Revision < consumer.router.Revision() {
 		if err := consumer.recordRejected(ctx, event, "catalog_revision_stale"); err != nil {
-			return false, err
+			return err
 		}
-		return true, nil
+		return nil
 	}
 	if event.InvalidCode != "" {
 		if err := consumer.recordRejected(ctx, event, event.InvalidCode); err != nil {
-			return false, err
+			return err
 		}
-		return true, nil
+		return nil
 	}
 	compiled, compileErr := consumer.compiler.CompileSnapshot(ctx, event.Document)
 	if compileErr != nil {
-		if err := consumer.recordRejected(ctx, event, "catalog_compile_failed"); err != nil {
-			return false, err
+		if errors.Is(compileErr, controlevent.ErrExecutionSecretUnavailable) {
+			return compileErr
 		}
-		return true, nil
+		if err := consumer.recordRejected(ctx, event, "catalog_compile_failed"); err != nil {
+			return err
+		}
+		return nil
 	}
 	if event.Revision >= consumer.router.Revision() {
 		if err := consumer.router.ReplaceAt(event.Revision, event.OccurredAt, compiled.Routes); err != nil {
 			if recordErr := consumer.recordRejected(ctx, event, "catalog_swap_failed"); recordErr != nil {
-				return false, recordErr
+				return recordErr
 			}
-			return true, nil
+			return nil
 		}
 	}
 	// An applied receipt is authoritative rollout evidence, so it must never
 	// become visible before the in-process router has installed the snapshot.
 	// Persistence after an equal-revision swap is retry-safe.
 	if err := consumer.recordApplied(ctx, event); err != nil {
-		return false, err
+		return err
 	}
-	return true, nil
+	return nil
 }
 
 type providerConnectionEvent struct {
@@ -132,6 +140,7 @@ type providerConnectionEvent struct {
 	ConnectionID string
 	Revision     int64
 	EventType    string
+	Region       string
 }
 
 func (consumer *Consumer) runConnectionEvent(ctx context.Context) (bool, error) {
@@ -154,12 +163,16 @@ func (consumer *Consumer) runConnectionEvent(ctx context.Context) (bool, error) 
 	if err != nil {
 		return false, err
 	}
+	return true, consumer.applyConnectionEvent(ctx, event)
+}
+
+func (consumer *Consumer) applyConnectionEvent(ctx context.Context, event providerConnectionEvent) error {
 	projected, err := LoadProjected(ctx, consumer.database)
 	if errors.Is(err, ErrNotFound) {
-		return true, consumer.recordConnectionInbox(ctx, event, "ignored", "")
+		return consumer.recordConnectionInbox(ctx, event, "ignored", "")
 	}
 	if err != nil {
-		return false, err
+		return err
 	}
 	affected := false
 	for _, route := range projected.Document.Routes {
@@ -169,10 +182,10 @@ func (consumer *Consumer) runConnectionEvent(ctx context.Context) (bool, error) 
 		}
 	}
 	if !affected {
-		return true, consumer.recordConnectionInbox(ctx, event, "ignored", "")
+		return consumer.recordConnectionInbox(ctx, event, "ignored", "")
 	}
 	document := projected.Document
-	if event.EventType == "ProviderConnectionDisabled" {
+	if event.EventType == "ProviderConnectionDisabled" || event.Region != "" && event.Region != consumer.region {
 		filtered := make([]ManagedRoute, 0, len(document.Routes))
 		for _, route := range document.Routes {
 			if route.ProviderConnectionID != event.ConnectionID {
@@ -188,12 +201,51 @@ func (consumer *Consumer) runConnectionEvent(ctx context.Context) (bool, error) 
 		routes, compileErr = compiled.Routes, err
 	}
 	if compileErr != nil {
-		return true, consumer.recordConnectionInbox(ctx, event, "rejected", "provider_connection_recompile_failed")
+		if errors.Is(compileErr, controlevent.ErrExecutionSecretUnavailable) {
+			return compileErr
+		}
+		return consumer.recordConnectionInbox(ctx, event, "rejected", "provider_connection_recompile_failed")
 	}
 	if err := consumer.router.ReplaceAt(projected.Revision, consumer.now().UTC(), routes); err != nil {
-		return false, err
+		return err
 	}
-	return true, consumer.recordConnectionInbox(ctx, event, "applied", "")
+	return consumer.recordConnectionInbox(ctx, event, "applied", "")
+}
+
+// Consume applies an externally relayed event without reading the control-plane
+// database. Unsupported event types are intentionally ignored so one ordered
+// stream can feed multiple local projections.
+func (consumer *Consumer) Consume(ctx context.Context, envelope controlevent.Event) error {
+	switch {
+	case envelope.AggregateType == "RoutingCatalog" && envelope.EventType == "RoutingCatalogPublished":
+		if envelope.SchemaVersion != 1 {
+			return errors.New("unsupported Routing Catalog event schema")
+		}
+		event := publishedEvent{EventID: envelope.EventID, Revision: envelope.AggregateRevision, OccurredAt: envelope.OccurredAt, PublicationID: envelope.AggregateID}
+		consumer.decodePublishedEvent(&event, envelope.AggregateID, envelope.Payload)
+		return consumer.applyPublishedEvent(ctx, event)
+	case envelope.AggregateType == "ProviderConnection":
+		var payload struct {
+			ConnectionID string `json:"connection_id"`
+			Region       string `json:"region"`
+			Revision     int64  `json:"revision"`
+		}
+		if envelope.SchemaVersion != 3 || json.Unmarshal(envelope.Payload, &payload) != nil || payload.ConnectionID != envelope.AggregateID || payload.Revision != envelope.AggregateRevision {
+			return errors.New("invalid Provider Connection event")
+		}
+		return consumer.applyConnectionEvent(ctx, providerConnectionEvent{EventID: envelope.EventID, ConnectionID: payload.ConnectionID, Revision: payload.Revision, EventType: envelope.EventType, Region: payload.Region})
+	case envelope.AggregateType == "ProviderOperation" && envelope.EventType == "ProviderConnectionHealthObserved":
+		var payload struct {
+			ConnectionID       string `json:"connection_id"`
+			ConnectionRevision int64  `json:"connection_revision"`
+		}
+		if envelope.SchemaVersion != 2 || json.Unmarshal(envelope.Payload, &payload) != nil || payload.ConnectionID == "" || payload.ConnectionRevision <= 0 {
+			return errors.New("invalid Provider Connection health event")
+		}
+		return consumer.applyConnectionEvent(ctx, providerConnectionEvent{EventID: envelope.EventID, ConnectionID: payload.ConnectionID, Revision: payload.ConnectionRevision, EventType: envelope.EventType})
+	default:
+		return nil
+	}
 }
 
 func (consumer *Consumer) recordConnectionInbox(ctx context.Context, event providerConnectionEvent, status, errorCode string) error {
@@ -215,6 +267,11 @@ func (consumer *Consumer) nextEvent(ctx context.Context) (publishedEvent, error)
 	if err != nil {
 		return publishedEvent{}, err
 	}
+	consumer.decodePublishedEvent(&event, aggregateID, payload)
+	return event, nil
+}
+
+func (consumer *Consumer) decodePublishedEvent(event *publishedEvent, aggregateID string, payload []byte) {
 	event.PublicationID = aggregateID
 	var decoded struct {
 		PublicationID   string           `json:"publication_id"`
@@ -225,7 +282,7 @@ func (consumer *Consumer) nextEvent(ctx context.Context) (publishedEvent, error)
 	}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		event.InvalidCode = "catalog_event_invalid"
-		return event, nil
+		return
 	}
 	if decoded.Validation.Errors == nil {
 		decoded.Validation.Errors = []ValidationIssue{}
@@ -238,16 +295,15 @@ func (consumer *Consumer) nextEvent(ctx context.Context) (publishedEvent, error)
 		decoded.ValidationHash == "" ||
 		aggregateID != "global" && aggregateID != decoded.PublicationID {
 		event.InvalidCode = "catalog_event_identity_invalid"
-		return event, nil
+		return
 	}
 	if computedValidationHash != decoded.ValidationHash {
 		event.InvalidCode = "catalog_validation_hash_mismatch"
-		return event, nil
+		return
 	}
 	event.PublicationID = decoded.PublicationID
 	event.ValidationHash = decoded.ValidationHash
 	event.Document = decoded.Document
-	return event, nil
 }
 
 func (consumer *Consumer) recordApplied(ctx context.Context, event publishedEvent) error {

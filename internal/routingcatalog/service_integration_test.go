@@ -13,6 +13,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/toddzheng/llm-gateway/internal/controlevent"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
@@ -395,6 +396,53 @@ func TestGatewayConsumerRejectsOneRevisionAndContinuesToLaterPublication(t *test
 	rejectedStatus, err := service.GetPublication(ctx, actor, rejected.Publication.ID)
 	if err != nil || rejectedStatus.Status != routingcatalog.PublicationFailed || rejectedStatus.Receipts[0].ErrorCode != "catalog_compile_failed" {
 		t.Fatalf("rejected publication = %#v / %v", rejectedStatus, err)
+	}
+}
+
+func TestGatewayConsumerRetriesTemporaryExecutionSecretFailure(t *testing.T) {
+	ctx, db, service, actor := newIntegrationService(t)
+	base := int64(0)
+	if current, err := service.Current(ctx, actor); err == nil {
+		base = current.Revision
+	}
+	id := fmt.Sprintf("rcd-secret-retry-%d", time.Now().UnixNano())
+	created, err := service.CreateDraft(ctx, actor, "create-"+id, routingcatalog.CreateDraftCommand{ID: id, BaseRevision: base, Document: validDocument()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validated, err := service.ValidateDraft(ctx, actor, routingcatalog.ValidateDraftCommand{DraftID: id, ExpectedRevision: created.Draft.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := service.PublishDraft(ctx, actor, "publish-"+id, routingcatalog.PublishDraftCommand{DraftID: id, ExpectedRevision: validated.Draft.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiler := routingcatalog.RuntimeCompilerFunc(func(context.Context, routingcatalog.Document) ([]provider.Route, error) {
+		return nil, fmt.Errorf("secret relay: %w", controlevent.ErrExecutionSecretUnavailable)
+	})
+	gatewayID := fmt.Sprintf("gateway-secret-retry-%d", time.Now().UnixNano())
+	consumer, err := routingcatalog.NewConsumer(db, compiler, provider.NewVersionedRouter(1, nil), gatewayID, "us-west", time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope controlevent.Event
+	if err := db.QueryRowContext(ctx, `SELECT event_id,delivery_sequence,schema_version,aggregate_type,aggregate_id,
+		aggregate_revision,COALESCE(tenant_id,''),event_type,occurred_at,payload FROM control_outbox
+		WHERE event_type='RoutingCatalogPublished' AND aggregate_id=$1`, published.Publication.ID).Scan(
+		&envelope.EventID, &envelope.DeliverySequence, &envelope.SchemaVersion, &envelope.AggregateType, &envelope.AggregateID,
+		&envelope.AggregateRevision, &envelope.TenantID, &envelope.EventType, &envelope.OccurredAt, &envelope.Payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Consume(ctx, envelope); !errors.Is(err, controlevent.ErrExecutionSecretUnavailable) {
+		t.Fatalf("temporary secret compilation = %v", err)
+	}
+	var acknowledged int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_routing_catalog_inbox WHERE gateway_id=$1`, gatewayID).Scan(&acknowledged); err != nil {
+		t.Fatal(err)
+	}
+	if acknowledged != 0 {
+		t.Fatalf("temporary secret failure was acknowledged: %d rows", acknowledged)
 	}
 }
 

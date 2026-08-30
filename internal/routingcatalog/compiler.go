@@ -31,6 +31,11 @@ func compileManaged(ctx context.Context, document Document, resolver RuntimeConn
 		return nil, ValidationReport{}, errors.New("Routing Catalog runtime compilation requires Provider Connection resolution")
 	}
 	resolved := make(map[string]providerconnection.ResolvedConnection, len(document.Routes))
+	defer func() {
+		for _, connection := range resolved {
+			clear(connection.Secret)
+		}
+	}()
 	for _, managed := range document.Routes {
 		if _, exists := resolved[managed.ProviderConnectionID]; exists {
 			continue

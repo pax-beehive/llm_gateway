@@ -210,8 +210,10 @@ func (service *Service) recordMutation(ctx context.Context, transaction *sql.Tx,
 	}
 	payload := map[string]any{
 		"connection_id": connection.ID, "provider": connection.Provider, "region": connection.Region,
+		"base_url":              connection.BaseURL,
 		"administrative_status": connection.AdministrativeStatus, "credential_scope": connection.CredentialScope,
-		"credential_version": connection.CredentialVersion, "revision": connection.Revision,
+		"capability_declaration": connection.CapabilityDeclaration,
+		"credential_version":     connection.CredentialVersion, "revision": connection.Revision,
 	}
 	for key, value := range extra {
 		payload[key] = value
@@ -234,7 +236,7 @@ func (service *Service) recordMutation(ctx context.Context, transaction *sql.Tx,
 		INSERT INTO control_outbox (
 			event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision,
 			tenant_id, event_type, occurred_at, payload
-		) VALUES ($1,2,'ProviderConnection',$2,$3,NULL,$4,$5,$6)`,
+		) VALUES ($1,3,'ProviderConnection',$2,$3,NULL,$4,$5,$6)`,
 		eventID, connection.ID, connection.Revision, eventType, now, encoded); err != nil {
 		return fmt.Errorf("append Provider Connection outbox: %w", err)
 	}

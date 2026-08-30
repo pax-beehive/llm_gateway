@@ -54,6 +54,25 @@ func TestGatewayLocalRegionDefaultsOnlyOutsideProduction(t *testing.T) {
 	}
 }
 
+func TestProductionControlRelayRequiresHTTPSAndGatewayIdentityKey(t *testing.T) {
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_ID", "gateway-west")
+	t.Setenv("GATEWAY_CONTROL_RELAY_HMAC_KEY", "gateway-control-relay-hmac-key-00000001")
+	t.Setenv("GATEWAY_CONTROL_RELAY_URL", "http://control.example.test")
+	if _, err := configureGatewayControlRelayClient(); err == nil {
+		t.Fatal("production accepted an unencrypted Control Event relay")
+	}
+	t.Setenv("GATEWAY_CONTROL_RELAY_URL", "https://control.example.test")
+	if _, err := configureGatewayControlRelayClient(); err != nil {
+		t.Fatalf("production HTTPS Control Event relay: %v", err)
+	}
+	t.Setenv("GATEWAY_CONTROL_RELAY_HMAC_KEY", "")
+	t.Setenv("GATEWAY_OPERATIONS_HMAC_KEY", "")
+	if _, err := configureGatewayControlRelayClient(); err == nil {
+		t.Fatal("production accepted a Control Event relay without a Gateway HMAC key")
+	}
+}
+
 func TestGatewayReadinessDependencyStates(t *testing.T) {
 	tests := map[string]struct {
 		ready   func() error
@@ -63,7 +82,7 @@ func TestGatewayReadinessDependencyStates(t *testing.T) {
 			ready: func() error { return gatewayRoutingReady(1) }, blocked: func() error { return gatewayRoutingReady(0) },
 		},
 		"schema": {
-			ready: func() error { return gatewaySchemaReady(operations.CurrentDatabaseSchema) }, blocked: func() error { return gatewaySchemaReady(operations.CurrentDatabaseSchema - 1) },
+			ready: func() error { return gatewaySchemaReady(operations.CurrentDatabaseSchema) }, blocked: func() error { return gatewaySchemaReady(operations.MinimumDatabaseSchema - 1) },
 		},
 		"durable outbox": {
 			ready: func() error { return gatewayOutboxReady(10, 10) }, blocked: func() error { return gatewayOutboxReady(11, 10) },

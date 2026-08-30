@@ -23,6 +23,8 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/capability"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
+	"github.com/toddzheng/llm-gateway/internal/controlevent"
+	"github.com/toddzheng/llm-gateway/internal/controlrelay"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
@@ -126,6 +128,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	relayConsumer, err := configureControlEventRelay(ctx, database, authenticator, router, localRegion)
+	if err != nil {
+		return err
+	}
+	if relayConsumer != nil {
+		go runControlEventRelay(ctx, relayConsumer)
+	}
 	var intentRepository cacheprotection.IntentRepository
 	var quotaController quota.Controller
 	if database != nil {
@@ -167,7 +176,7 @@ func run() error {
 	if quotaController != nil {
 		go runQuotaReconciliationWorker(ctx, quotaController)
 	}
-	if projection, ok := authenticator.(*accessprojection.Store); ok {
+	if projection, ok := authenticator.(*accessprojection.Store); ok && relayConsumer == nil {
 		go runAccessProjectionWorker(ctx, projection)
 	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
@@ -471,6 +480,14 @@ func configureAccessProjection(
 	if err != nil {
 		return nil, fmt.Errorf("configure Gateway Access Projection: %w", err)
 	}
+	if strings.TrimSpace(os.Getenv("GATEWAY_CONTROL_RELAY_URL")) != "" {
+		if os.Getenv("GATEWAY_ENV") == "production" {
+			if err := projection.ValidatePepperCoverage(ctx); err != nil {
+				return nil, fmt.Errorf("gate Gateway Access Projection digest pepper retirement: %w", err)
+			}
+		}
+		return projection, nil
+	}
 	for {
 		result, err := projection.ConsumeControlOutboxBatch(ctx, 1000)
 		if err != nil {
@@ -656,11 +673,13 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 }
 
 func configureManagedRoutingCatalog(ctx context.Context, database *sql.DB) (*provider.StaticRouter, error) {
-	secretStore, err := configureGatewaySecretCustody()
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(os.Getenv("GATEWAY_CONTROL_RELAY_URL")) != "" {
+		// The external relay must first advance the Provider Connection execution
+		// projection. Compiling a persisted catalog before that catch-up can ask
+		// the control plane for an obsolete exact credential version.
+		return provider.NewVersionedRouter(1, nil), nil
 	}
-	resolver, err := providerconnection.NewGatewayResolver(database, secretStore)
+	resolver, err := configureGatewayConnectionResolver(database)
 	if err != nil {
 		return nil, err
 	}
@@ -701,6 +720,150 @@ func configureManagedRoutingCatalog(ctx context.Context, database *sql.DB) (*pro
 	}
 	go runRoutingCatalogConsumer(ctx, consumer)
 	return router, nil
+}
+
+func configureGatewayConnectionResolver(database *sql.DB) (routingcatalog.RuntimeConnectionResolver, error) {
+	if strings.TrimSpace(os.Getenv("GATEWAY_CONTROL_RELAY_URL")) != "" {
+		client, err := configureGatewayControlRelayClient()
+		if err != nil {
+			return nil, err
+		}
+		return providerconnection.NewProjectedGatewayResolver(database, envOr("GATEWAY_LOCAL_REGION", "local"), client)
+	}
+	secretStore, err := configureGatewaySecretCustody()
+	if err != nil {
+		return nil, err
+	}
+	return providerconnection.NewGatewayResolver(database, secretStore)
+}
+
+func configureGatewayControlRelayClient() (*controlrelay.Client, error) {
+	endpoint := strings.TrimSpace(os.Getenv("GATEWAY_CONTROL_RELAY_URL"))
+	if endpoint == "" {
+		return nil, errors.New("GATEWAY_CONTROL_RELAY_URL is required")
+	}
+	if os.Getenv("GATEWAY_ENV") == "production" && !strings.HasPrefix(endpoint, "https://") {
+		return nil, errors.New("production GATEWAY_CONTROL_RELAY_URL must use HTTPS")
+	}
+	key := os.Getenv("GATEWAY_CONTROL_RELAY_HMAC_KEY")
+	if key == "" {
+		key = os.Getenv("GATEWAY_OPERATIONS_HMAC_KEY")
+	}
+	return controlrelay.NewClient(endpoint, envOr("GATEWAY_ID", "gateway-local"), []byte(key), nil, time.Now)
+}
+
+func configureControlEventRelay(ctx context.Context, database *sql.DB, authenticator httpapi.Authenticator, router *provider.StaticRouter, region string) (*controlrelay.Consumer, error) {
+	endpoint := strings.TrimSpace(os.Getenv("GATEWAY_CONTROL_RELAY_URL"))
+	if endpoint == "" {
+		if os.Getenv("GATEWAY_ENV") == "production" {
+			return nil, errors.New("production requires GATEWAY_CONTROL_RELAY_URL")
+		}
+		return nil, nil
+	}
+	if database == nil {
+		return nil, errors.New("Control Event relay requires Gateway PostgreSQL")
+	}
+	accessConsumer, ok := authenticator.(*accessprojection.Store)
+	if !ok {
+		return nil, errors.New("Control Event relay requires Gateway Access Projection")
+	}
+	if os.Getenv("GATEWAY_ROUTING_CATALOG") != "true" {
+		return nil, errors.New("Control Event relay requires GATEWAY_ROUTING_CATALOG=true")
+	}
+	if os.Getenv("GATEWAY_MIGRATE") == "true" {
+		if err := controlrelay.Migrate(ctx, database); err != nil {
+			return nil, err
+		}
+		if err := providerconnection.MigrateGatewayProjection(ctx, database); err != nil {
+			return nil, err
+		}
+	}
+	client, err := configureGatewayControlRelayClient()
+	if err != nil {
+		return nil, err
+	}
+	connectionProjection, err := providerconnection.NewProjection(database, region, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	resolver, err := providerconnection.NewProjectedGatewayResolver(database, region, client)
+	if err != nil {
+		return nil, err
+	}
+	compiler, err := routingcatalog.NewManagedCompiler(resolver, nil)
+	if err != nil {
+		return nil, err
+	}
+	routingConsumer, err := routingcatalog.NewConsumer(database, compiler, router, envOr("GATEWAY_ID", "gateway-local"), region, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	consumer, err := controlrelay.NewConsumer(database, "control-plane", client, []controlevent.Consumer{
+		accessConsumer, connectionProjection, routingConsumer,
+	}, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	caughtUp := false
+	for count := 0; count < 10_000; count++ {
+		worked, err := consumer.RunNext(ctx, 256)
+		if err != nil {
+			return nil, fmt.Errorf("catch up Control Event relay: %w", err)
+		}
+		if !worked {
+			caughtUp = true
+			break
+		}
+	}
+	status, err := consumer.Status(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read Control Event relay startup status: %w", err)
+	}
+	if !caughtUp || status.Cursor != status.SourceHead {
+		return nil, fmt.Errorf("Control Event relay startup catch-up incomplete: cursor %d source head %d", status.Cursor, status.SourceHead)
+	}
+	projected, err := routingcatalog.LoadProjected(ctx, database)
+	if errors.Is(err, routingcatalog.ErrNotFound) {
+		return nil, errors.New("managed Routing Catalog has no valid applied revision")
+	}
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := compiler.CompileSnapshot(ctx, projected.Document)
+	if err != nil {
+		return nil, fmt.Errorf("compile caught-up Routing Catalog revision %d: %w", projected.Revision, err)
+	}
+	if err := router.ReplaceAt(projected.Revision, projected.CreatedAt, compiled.Routes); err != nil {
+		return nil, fmt.Errorf("install caught-up Routing Catalog revision %d: %w", projected.Revision, err)
+	}
+	return consumer, nil
+}
+
+func runControlEventRelay(ctx context.Context, consumer *controlrelay.Consumer) {
+	run := func() {
+		for count := 0; count < 256; count++ {
+			worked, err := consumer.RunNext(ctx, 256)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Warn("Control Event relay consumer degraded", "error", err)
+				}
+				return
+			}
+			if !worked {
+				return
+			}
+		}
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func configureGatewaySecretCustody() (secretcustody.Store, error) {

@@ -35,6 +35,10 @@ SELECT EXISTS (
 		'gateway_routing_catalog_head'::regclass,
 		'gateway_routing_catalog_inbox'::regclass,
 		'gateway_provider_connection_inbox'::regclass,
+		'gateway_control_event_offsets'::regclass,
+		'gateway_provider_connection_projection'::regclass,
+		'gateway_provider_connection_projection_inbox'::regclass,
+		'gateway_provider_connection_projection_gaps'::regclass,
 		'operations_schema_metadata'::regclass,
 		'operations_gateway_heartbeats'::regclass,
 		'operations_access_rollout_receipts'::regclass,
@@ -75,6 +79,10 @@ REVOKE ALL PRIVILEGES ON TABLE
 	gateway_routing_catalog_head,
 	gateway_routing_catalog_inbox,
 	gateway_provider_connection_inbox,
+	gateway_control_event_offsets,
+	gateway_provider_connection_projection,
+	gateway_provider_connection_projection_inbox,
+	gateway_provider_connection_projection_gaps,
 	operations_schema_metadata,
 	operations_gateway_heartbeats,
 	operations_access_rollout_receipts,
@@ -110,6 +118,10 @@ REVOKE ALL PRIVILEGES ON TABLE
 	gateway_routing_catalog_head,
 	gateway_routing_catalog_inbox,
 	gateway_provider_connection_inbox,
+	gateway_control_event_offsets,
+	gateway_provider_connection_projection,
+	gateway_provider_connection_projection_inbox,
+	gateway_provider_connection_projection_gaps,
 	operations_schema_metadata,
 	operations_gateway_heartbeats,
 	operations_access_rollout_receipts,
@@ -183,13 +195,15 @@ GRANT SELECT ON TABLE operations_schema_metadata TO :"tenant_admin_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE operations_gateway_heartbeats TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE operations_access_rollout_receipts TO :"tenant_admin_role";
 
-GRANT SELECT ON TABLE control_outbox TO :"gateway_role";
-GRANT SELECT ON TABLE gateway_provider_connection_resolutions TO :"gateway_role";
 GRANT SELECT ON TABLE gateway_schema_metadata TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_history TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE gateway_routing_catalog_head TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_inbox TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_provider_connection_inbox TO :"gateway_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE gateway_control_event_offsets TO :"gateway_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE gateway_provider_connection_projection TO :"gateway_role";
+GRANT SELECT, INSERT ON TABLE gateway_provider_connection_projection_inbox TO :"gateway_role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE gateway_provider_connection_projection_gaps TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
     gateway_access_projection,
     gateway_access_inbox,

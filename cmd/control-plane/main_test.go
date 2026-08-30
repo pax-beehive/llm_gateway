@@ -54,7 +54,7 @@ func TestControlPlaneReadinessDependencyStates(t *testing.T) {
 		ready   error
 		blocked error
 	}{
-		"schema":         {ready: controlSchemaReady(operations.CurrentDatabaseSchema), blocked: controlSchemaReady(operations.CurrentDatabaseSchema - 1)},
+		"schema":         {ready: controlSchemaReady(operations.CurrentDatabaseSchema), blocked: controlSchemaReady(operations.MinimumDatabaseSchema - 1)},
 		"outbox":         {ready: controlOutboxReady(10, 10), blocked: controlOutboxReady(11, 10)},
 		"secret custody": {ready: controlSecretCustodyReady(true), blocked: controlSecretCustodyReady(false)},
 	}

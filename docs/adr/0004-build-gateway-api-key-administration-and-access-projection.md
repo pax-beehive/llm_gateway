@@ -21,9 +21,10 @@ Successful authentication is coalesced into an asynchronous regional
 `last_used_at` projection. Production startup gates missing active digest pepper
 versions and requires an authenticated-encrypted database transport attestation.
 
-The current transport adapter reads the shared immutable outbox. ADR 0008 owns
-the external relay, delivery receipts, alerts, and readiness gates required
-before physical control/data-plane database separation.
+Production delivery now uses ADR 0008's authenticated HTTPS Control Event relay
+and a durable Gateway-local cursor; the shared immutable-outbox reader remains a
+development compatibility adapter. Durable apply/reject receipts, alerts, and
+readiness are owned by ADR 0008.
 
 ## Context
 

@@ -109,8 +109,15 @@ func TestGatewayObservationsAreIdempotentAndCannotMoveRevisionsBackward(t *testi
 		t.Fatal(err)
 	}
 	gatewayID := fmt.Sprintf("gateway-operations-%d", time.Now().UnixNano())
-	identity := operations.GatewayIdentity{GatewayID: gatewayID, Region: "us-west"}
-	current := operations.GatewayObservation{EventSchemaVersion: operations.CurrentObservationVersion, GatewayID: gatewayID, Region: "us-west", BuildSHA: "abcdef1", DatabaseSchemaVersion: 21,
+	region := fmt.Sprintf("region-operations-%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `DELETE FROM control_outbox WHERE event_id LIKE 'operations-access-%'`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM control_outbox WHERE event_id LIKE 'operations-access-%'`)
+	})
+	identity := operations.GatewayIdentity{GatewayID: gatewayID, Region: region}
+	current := operations.GatewayObservation{EventSchemaVersion: operations.CurrentObservationVersion, GatewayID: gatewayID, Region: region, BuildSHA: "abcdef1", DatabaseSchemaVersion: 21,
 		RoutingCatalogRevision: 9, AccessProjectionRevision: 12, ExecutionEpochFloor: 3, LastUsageOutboxID: 14,
 		StartedAt: now.Add(-time.Hour), ObservedAt: now, Consumers: []operations.ConsumerObservation{}, Backlogs: operations.BacklogSignals{MeteringProjectionStatus: "unavailable"},
 		AccessReceipts: []operations.AccessRolloutReceipt{{EventID: "access-event-1", DeliverySequence: 12, AggregateType: "GatewayAPIKey",
@@ -147,6 +154,19 @@ func TestGatewayObservationsAreIdempotentAndCannotMoveRevisionsBackward(t *testi
 	if err := service.RecordGatewayObservation(ctx, identity, newerButBehind); err != nil {
 		t.Fatal(err)
 	}
+	var desiredAccess, otherRegionAccess int64
+	if err := db.QueryRowContext(ctx, `INSERT INTO control_outbox (
+		event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+	) VALUES ($1,2,'Tenant',$2,1,NULL,'TenantCreated',now(),jsonb_build_object('home_region',$3::text)) RETURNING delivery_sequence`,
+		"operations-access-"+gatewayID, "tenant-"+gatewayID, region).Scan(&desiredAccess); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `INSERT INTO control_outbox (
+		event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+	) VALUES ($1,2,'Tenant',$2,1,NULL,'TenantCreated',now(),jsonb_build_object('home_region',$3::text)) RETURNING delivery_sequence`,
+		"operations-access-other-"+gatewayID, "tenant-other-"+gatewayID, region+"-other").Scan(&otherRegionAccess); err != nil {
+		t.Fatal(err)
+	}
 	actor := tenantadmin.ActorEnvelope{Type: "human", ID: "operator", Scopes: []string{tenantadmin.ScopePlatformRead}}
 	got, err := service.GetGateway(ctx, actor, gatewayID)
 	if err != nil {
@@ -154,6 +174,9 @@ func TestGatewayObservationsAreIdempotentAndCannotMoveRevisionsBackward(t *testi
 	}
 	if got.RoutingCatalogRevision != 9 || got.AccessProjectionRevision != 12 || got.LastUsageOutboxID != 14 || got.HeartbeatStatus != "current" || len(got.AccessReceipts) != 2 {
 		t.Fatalf("Gateway summary = %#v", got)
+	}
+	if got.DesiredAccessRevision != desiredAccess || otherRegionAccess <= desiredAccess {
+		t.Fatalf("regional desired Access revision = %d, want %d (other region %d)", got.DesiredAccessRevision, desiredAccess, otherRegionAccess)
 	}
 	var accessReceipts int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM operations_access_rollout_receipts WHERE gateway_id=$1 AND event_id='access-event-1'`, gatewayID).Scan(&accessReceipts); err != nil || accessReceipts != 1 {
@@ -172,7 +195,7 @@ func TestGatewayObservationsAreIdempotentAndCannotMoveRevisionsBackward(t *testi
 				versioned.AccessReceipts = nil
 				versioned.Backlogs.MeteringProjectionStatus = ""
 			}
-			if err := service.RecordGatewayObservation(ctx, operations.GatewayIdentity{GatewayID: versioned.GatewayID, Region: "us-west"}, versioned); err != nil {
+			if err := service.RecordGatewayObservation(ctx, operations.GatewayIdentity{GatewayID: versioned.GatewayID, Region: region}, versioned); err != nil {
 				t.Fatalf("version %d: %v", version, err)
 			}
 		})
