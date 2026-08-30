@@ -48,8 +48,13 @@ resource "google_cloud_run_v2_job" "schema_migrate" {
 
   lifecycle {
     # Terraform bootstraps the Job; the main-branch release workflow owns the
-    # immutable image digest after bootstrap without reading foundation state.
-    ignore_changes = [template[0].template[0].containers[0].image]
+    # immutable image digest and gcloud release metadata after bootstrap
+    # without reading foundation state.
+    ignore_changes = [
+      client,
+      client_version,
+      template[0].template[0].containers[0].image,
+    ]
   }
 }
 
@@ -122,7 +127,12 @@ resource "google_cloud_run_v2_job" "role_config" {
   ]
 
   lifecycle {
-    # Keep release-image ownership out of the foundation state boundary.
-    ignore_changes = [template[0].template[0].containers[0].image]
+    # Keep release-image and gcloud metadata ownership out of the foundation
+    # state boundary.
+    ignore_changes = [
+      client,
+      client_version,
+      template[0].template[0].containers[0].image,
+    ]
   }
 }
