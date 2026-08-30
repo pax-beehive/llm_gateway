@@ -23,6 +23,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/secretcustody"
@@ -99,6 +100,9 @@ func run() error {
 		if err := routingcatalog.Migrate(ctx, database); err != nil {
 			return err
 		}
+		if err := operations.Migrate(ctx, database); err != nil {
+			return err
+		}
 	}
 	administration, err := tenantadmin.NewService(database, time.Now)
 	if err != nil {
@@ -147,15 +151,47 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Routing Catalog Administration: %w", err)
 	}
+	operationsService, err := operations.NewService(database, routingCatalog, time.Now)
+	if err != nil {
+		return fmt.Errorf("configure Operations: %w", err)
+	}
+	gatewayVerifier, err := configureGatewayObservationVerifier(devMode)
+	if err != nil {
+		return err
+	}
 	go runGatewayAPIKeyGraceReconciler(ctx, credentials)
 	go runProviderOperationWorker(ctx, providerConnections)
-	go runRoutingCatalogReceiptCollector(ctx, routingCatalog)
+	if devMode {
+		go runRoutingCatalogReceiptCollector(ctx, routingCatalog)
+	}
 	api := controlapi.New(controlapi.Config{
 		Administration: administration, Credentials: credentials,
-		ProviderConnections: providerConnections, RoutingCatalog: routingCatalog, Verifier: verifier,
+		ProviderConnections: providerConnections, RoutingCatalog: routingCatalog,
+		Operations: operationsService, GatewayObservations: operationsService, GatewayVerifier: gatewayVerifier,
+		Verifier: verifier,
+	})
+	readiness := operations.NewProbe(750*time.Millisecond, time.Now, map[string]operations.Check{
+		"database": func(checkCtx context.Context) error { return database.PingContext(checkCtx) },
+		"schema": func(checkCtx context.Context) error {
+			var version int
+			if err := database.QueryRowContext(checkCtx, `SELECT current_version FROM operations_schema_metadata WHERE component='control-plane'`).Scan(&version); err != nil {
+				return err
+			}
+			return controlSchemaReady(version)
+		},
+		"outbox_capacity": func(checkCtx context.Context) error {
+			var pending int64
+			if err := database.QueryRowContext(checkCtx, `SELECT count(*) FROM control_outbox WHERE published_at IS NULL`).Scan(&pending); err != nil {
+				return err
+			}
+			return controlOutboxReady(pending, int64(envInt("CONTROL_OUTBOX_READINESS_MAX_PENDING", 100000)))
+		},
+		"secret_custody": func(context.Context) error {
+			return controlSecretCustodyReady(secretStore != nil)
+		},
 	})
 	mux := http.NewServeMux()
-	mux.Handle("/", api)
+	mux.Handle("/", operations.Handler(api, readiness))
 	address := envOr("CONTROL_PLANE_ADDR", ":8081")
 	server := &http.Server{
 		Addr: address, Handler: otelhttp.NewHandler(mux, "control-plane.http"),
@@ -178,6 +214,27 @@ func run() error {
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	}
+}
+
+func controlSchemaReady(version int) error {
+	if !operations.SchemaCompatible(version, operations.MinimumDatabaseSchema, operations.CurrentDatabaseSchema) {
+		return errors.New("unsupported schema")
+	}
+	return nil
+}
+
+func controlOutboxReady(pending, maximum int64) error {
+	if pending < 0 || maximum < 0 || pending > maximum {
+		return errors.New("outbox capacity exceeded")
+	}
+	return nil
+}
+
+func controlSecretCustodyReady(configured bool) error {
+	if !configured {
+		return errors.New("secret custody unavailable")
+	}
+	return nil
 }
 
 func configureProviderLiveOperationPolicy(devMode bool) ([]providerconnection.LiveOperationPolicy, error) {
@@ -221,6 +278,38 @@ func configureSecretCustody(devMode bool) (secretcustody.Store, error) {
 		return nil, fmt.Errorf("configure GCP Secret Custody: %w", err)
 	}
 	return store, nil
+}
+
+func configureGatewayObservationVerifier(devMode bool) (operations.GatewayVerifier, error) {
+	keys := map[string]string{}
+	regions := map[string]string{}
+	if encoded := strings.TrimSpace(os.Getenv("CONTROL_GATEWAY_HMAC_KEYS_JSON")); encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &keys); err != nil {
+			return nil, fmt.Errorf("CONTROL_GATEWAY_HMAC_KEYS_JSON: %w", err)
+		}
+	}
+	if encoded := strings.TrimSpace(os.Getenv("CONTROL_GATEWAY_REGIONS_JSON")); encoded != "" {
+		if err := json.Unmarshal([]byte(encoded), &regions); err != nil {
+			return nil, fmt.Errorf("CONTROL_GATEWAY_REGIONS_JSON: %w", err)
+		}
+	}
+	if devMode && len(keys) == 0 {
+		keys = map[string]string{"gateway-local": "local-development-gateway-hmac-key-0001"}
+		regions = map[string]string{"gateway-local": "local"}
+	}
+	return operations.NewHMACVerifier(keys, regions, time.Now)
+}
+
+func envInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func runProviderOperationWorker(ctx context.Context, service *providerconnection.Service) {

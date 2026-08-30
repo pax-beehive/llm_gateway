@@ -97,6 +97,8 @@ CONTROL_API_KEY_CURRENT_DIGEST_VERSION=2
 CONTROL_API_KEY_PEPPERS_JSON={"1":"old...","2":"current..."}
 CONTROL_SECRET_CUSTODY_BACKEND=gcp-secret-manager
 CONTROL_GCP_SECRET_PROJECT=provider-secret-project
+CONTROL_GATEWAY_HMAC_KEYS_JSON={"gateway-us-west-1":"at-least-32-byte-machine-key"}
+CONTROL_GATEWAY_REGIONS_JSON={"gateway-us-west-1":"us-west"}
 ```
 
 Run schema migration as a separate owner job, then apply least-privilege grants
@@ -110,14 +112,30 @@ start unless `GATEWAY_ACCESS_PROJECTION=true`. Both production processes require
 the transport attestation and reject PostgreSQL configurations that are not
 certificate-verified TLS; the repair command enforces the same rule on both its
 source and destination connections.
-`/healthz` is liveness only. Full dependency and backlog readiness is introduced
-by ADR 0008; this process does not claim readiness before those checks exist.
+`/healthz` is liveness only. `/readyz` performs bounded local dependency,
+schema, projection, Routing Catalog, fence, and durable-outbox checks without
+calling Providers, Human IAM, Billing, Metering, or the remote control plane.
 Tenant mutations atomically append `control_outbox`; that is durable enqueue,
 not delivery proof. The initial shared-PostgreSQL consumer applies events through
 an inbox and aggregate revisions, reports gaps and lag in structured logs, and
-supports atomic snapshot repair. Authenticated external relay delivery,
-cross-database Gateway identity, alerts, and readiness gates are implemented by
-ADR 0008 before physical database separation.
+supports atomic snapshot repair. ADR 0008 owns cross-database Gateway identity,
+durable receipt ingestion, alerts, readiness, and replacement of the shared
+event reader with an authenticated encrypted relay before physical database
+separation. The Operations/receipt surfaces are implemented; the relay remains
+an explicit incomplete deployment gate.
+
+Gateways send signed soft-state heartbeats plus durable Routing Catalog and
+Access Projection rollout observations to
+`/internal/v1/operations/gateway-observations`. The HMAC binds
+the configured Gateway ID and region to the timestamp, HTTP method, path, and
+exact body. Production control-plane processes do not promote the legacy shared
+Gateway inbox; that collector remains development compatibility only. Configure
+`GATEWAY_OPERATIONS_URL`, `GATEWAY_OPERATIONS_HMAC_KEY`, `GATEWAY_ID`,
+`GATEWAY_LOCAL_REGION`, and `GATEWAY_BUILD_SHA`. Operations queries live under
+`/control/v1/operations/{gateways,publications,outbox,consumers,jobs}` and expose
+desired/applied revisions, heartbeat and consumer lag, outbox age, quota/cache/
+retention backlog, revocation propagation, explicit Metering availability,
+build SHA, and schema version.
 
 Provider Connection Administration stores upstream credentials in GCP Secret
 Manager through Workload Identity. PostgreSQL stores only the Secret Manager

@@ -32,6 +32,7 @@ type PepperRing struct {
 
 type ControlEvent struct {
 	EventID           string
+	DeliverySequence  int64
 	SchemaVersion     int
 	AggregateType     string
 	AggregateID       string
@@ -67,6 +68,7 @@ type Status struct {
 	OldestGapAt             *time.Time
 	HeadCount               int
 	MaxAggregateRevision    int64
+	MaxDeliverySequence     int64
 	PendingEventCount       int
 	OldestPendingAt         *time.Time
 	LastAppliedAt           *time.Time
@@ -163,16 +165,24 @@ func (store *Store) Apply(ctx context.Context, event ControlEvent) (ApplyResult,
 		return ApplyResult{Disposition: DispositionStale}, nil
 	}
 	if event.AggregateRevision != current+1 {
+		observedAt := store.now().UTC()
 		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO gateway_access_gaps (
-				aggregate_type, aggregate_id, expected_revision, received_revision, detected_at, last_event_id
-			) VALUES ($1,$2,$3,$4,$5,$6)
+				aggregate_type, aggregate_id, expected_revision, received_revision, detected_at, last_event_id,
+				delivery_sequence, event_occurred_at
+			) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7::bigint,0),$8)
 			ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET
 				expected_revision = EXCLUDED.expected_revision,
 				received_revision = GREATEST(gateway_access_gaps.received_revision, EXCLUDED.received_revision),
 				detected_at = LEAST(gateway_access_gaps.detected_at, EXCLUDED.detected_at),
-				last_event_id = EXCLUDED.last_event_id`,
-			event.AggregateType, event.AggregateID, current+1, event.AggregateRevision, store.now().UTC(), event.EventID); err != nil {
+				last_event_id = EXCLUDED.last_event_id,
+				delivery_sequence = EXCLUDED.delivery_sequence,
+				event_occurred_at = EXCLUDED.event_occurred_at`,
+			event.AggregateType, event.AggregateID, current+1, event.AggregateRevision, observedAt, event.EventID,
+			event.DeliverySequence, event.OccurredAt); err != nil {
+			return ApplyResult{}, err
+		}
+		if err := recordRolloutReceipt(ctx, transaction, event, "rejected", "revision_gap", observedAt); err != nil {
 			return ApplyResult{}, err
 		}
 		if err := transaction.Commit(); err != nil {
@@ -239,11 +249,27 @@ func recordInbox(ctx context.Context, transaction *sql.Tx, event ControlEvent, d
 	}
 	_, err := transaction.ExecContext(ctx, `
 		INSERT INTO gateway_access_inbox (
-			event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision,
+			event_id, delivery_sequence, schema_version, aggregate_type, aggregate_id, aggregate_revision,
 			event_type, event_occurred_at, apply_lag_seconds, disposition, received_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		event.EventID, event.SchemaVersion, event.AggregateType, event.AggregateID, event.AggregateRevision,
+		) VALUES ($1,NULLIF($2::bigint,0),$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		event.EventID, event.DeliverySequence, event.SchemaVersion, event.AggregateType, event.AggregateID, event.AggregateRevision,
 		event.EventType, event.OccurredAt, lag, disposition, receivedAt)
+	if err != nil {
+		return err
+	}
+	return recordRolloutReceipt(ctx, transaction, event, "applied", "", receivedAt)
+}
+
+func recordRolloutReceipt(ctx context.Context, transaction *sql.Tx, event ControlEvent, status, errorCode string, observedAt time.Time) error {
+	if event.DeliverySequence <= 0 {
+		return nil
+	}
+	_, err := transaction.ExecContext(ctx, `INSERT INTO gateway_access_rollout_receipts (
+		event_id,delivery_sequence,aggregate_type,aggregate_id,aggregate_revision,status,error_code,
+		event_occurred_at,observed_at
+	) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9)
+	ON CONFLICT DO NOTHING`, event.EventID, event.DeliverySequence, event.AggregateType, event.AggregateID,
+		event.AggregateRevision, status, errorCode, event.OccurredAt, observedAt)
 	return err
 }
 
@@ -634,6 +660,9 @@ func (store *Store) Status(ctx context.Context) (Status, error) {
 	if err := store.database.QueryRowContext(ctx, `
 		SELECT count(*), COALESCE(max(revision), 0) FROM gateway_access_heads`).Scan(
 		&status.HeadCount, &status.MaxAggregateRevision); err != nil {
+		return Status{}, err
+	}
+	if err := store.database.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM gateway_access_inbox`).Scan(&status.MaxDeliverySequence); err != nil {
 		return Status{}, err
 	}
 	if err := store.database.QueryRowContext(ctx, `

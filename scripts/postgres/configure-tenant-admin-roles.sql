@@ -35,10 +35,15 @@ SELECT EXISTS (
 		'gateway_routing_catalog_head'::regclass,
 		'gateway_routing_catalog_inbox'::regclass,
 		'gateway_provider_connection_inbox'::regclass,
+		'operations_schema_metadata'::regclass,
+		'operations_gateway_heartbeats'::regclass,
+		'operations_access_rollout_receipts'::regclass,
+		'gateway_schema_metadata'::regclass,
         'gateway_access_projection'::regclass,
         'gateway_access_inbox'::regclass,
         'gateway_access_heads'::regclass,
         'gateway_access_gaps'::regclass,
+        'gateway_access_rollout_receipts'::regclass,
         'gateway_access_response_slots'::regclass
     ) AND owner.rolname = :'gateway_role'
 ) AS gateway_owns_control_tables \gset
@@ -70,10 +75,15 @@ REVOKE ALL PRIVILEGES ON TABLE
 	gateway_routing_catalog_head,
 	gateway_routing_catalog_inbox,
 	gateway_provider_connection_inbox,
+	operations_schema_metadata,
+	operations_gateway_heartbeats,
+	operations_access_rollout_receipts,
+	gateway_schema_metadata,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
     gateway_access_gaps,
+    gateway_access_rollout_receipts,
     gateway_access_response_slots
 FROM PUBLIC;
 
@@ -100,12 +110,20 @@ REVOKE ALL PRIVILEGES ON TABLE
 	gateway_routing_catalog_head,
 	gateway_routing_catalog_inbox,
 	gateway_provider_connection_inbox,
+	operations_schema_metadata,
+	operations_gateway_heartbeats,
+	operations_access_rollout_receipts,
+	gateway_schema_metadata,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
     gateway_access_gaps,
+    gateway_access_rollout_receipts,
     gateway_access_response_slots
 FROM :"tenant_admin_role", :"gateway_role";
+
+REVOKE ALL PRIVILEGES ON SEQUENCE control_outbox_delivery_sequence_seq
+FROM PUBLIC, :"tenant_admin_role", :"gateway_role";
 
 GRANT SELECT, INSERT ON TABLE tenants TO :"tenant_admin_role";
 GRANT UPDATE (
@@ -139,6 +157,7 @@ GRANT SELECT, INSERT ON TABLE api_key_policy_revisions TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_command_idempotency TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_audit_events TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE control_outbox TO :"tenant_admin_role";
+GRANT USAGE, SELECT ON SEQUENCE control_outbox_delivery_sequence_seq TO :"tenant_admin_role";
 GRANT UPDATE (publish_attempts, published_at, last_error) ON control_outbox TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE provider_connections TO :"tenant_admin_role";
 GRANT UPDATE (
@@ -160,9 +179,13 @@ GRANT SELECT, INSERT, UPDATE ON TABLE routing_catalog_head TO :"tenant_admin_rol
 GRANT SELECT, INSERT, UPDATE ON TABLE routing_publications TO :"tenant_admin_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE routing_rollout_receipts TO :"tenant_admin_role";
 GRANT SELECT ON TABLE gateway_routing_catalog_inbox TO :"tenant_admin_role";
+GRANT SELECT ON TABLE operations_schema_metadata TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE operations_gateway_heartbeats TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE operations_access_rollout_receipts TO :"tenant_admin_role";
 
 GRANT SELECT ON TABLE control_outbox TO :"gateway_role";
 GRANT SELECT ON TABLE gateway_provider_connection_resolutions TO :"gateway_role";
+GRANT SELECT ON TABLE gateway_schema_metadata TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_history TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE gateway_routing_catalog_head TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_inbox TO :"gateway_role";
@@ -174,3 +197,5 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
     gateway_access_gaps,
     gateway_access_response_slots
 TO :"gateway_role";
+GRANT SELECT, INSERT ON TABLE gateway_access_rollout_receipts TO :"gateway_role";
+GRANT UPDATE (reported_at) ON TABLE gateway_access_rollout_receipts TO :"gateway_role";

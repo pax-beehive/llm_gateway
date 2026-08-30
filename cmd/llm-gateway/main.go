@@ -27,6 +27,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/quota"
@@ -69,6 +70,7 @@ func healthcheck() error {
 }
 
 func run() error {
+	startedAt := time.Now().UTC()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	shutdownTelemetry, err := telemetry.Configure(ctx, envOr("OTEL_SERVICE_NAME", "llm-gateway"))
@@ -102,7 +104,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("GATEWAY_HOME_REGION_URLS_JSON: %w", err)
 	}
-	localRegion := envOr("GATEWAY_LOCAL_REGION", "local")
+	localRegion, err := gatewayLocalRegion()
+	if err != nil {
+		return err
+	}
 	trustedProxyCIDRs, err := parseTrustedProxyCIDRsEnv("GATEWAY_TRUSTED_PROXY_CIDRS")
 	if err != nil {
 		return err
@@ -166,12 +171,73 @@ func run() error {
 		go runAccessProjectionWorker(ctx, projection)
 	}
 	go runRetentionWorker(ctx, responseStore, localRegion)
-	handler := httpapi.New(httpapi.Config{
+	inferenceHandler := httpapi.New(httpapi.Config{
 		Runtime: engine, CapabilityRuntime: capabilityEngine, CapabilityCatalog: router,
 		ModelCatalog: router, Authenticator: authenticator, TenantHomeRegions: homeRegions,
 		TenantExecutionEpochs: executionEpochs, LocalRegion: localRegion, HomeRegionURLs: homeRegionURLs,
 		TrustedProxyCIDRs: trustedProxyCIDRs,
 	})
+	readinessChecks := map[string]operations.Check{
+		"routing_catalog": func(checkCtx context.Context) error {
+			if err := gatewayRoutingReady(router.Revision()); err != nil {
+				return err
+			}
+			if database != nil && os.Getenv("GATEWAY_ROUTING_CATALOG") == "true" {
+				_, err := routingcatalog.LoadProjected(checkCtx, database)
+				return err
+			}
+			return nil
+		},
+		"home_region": func(context.Context) error {
+			if strings.TrimSpace(localRegion) == "" {
+				return errors.New("Home Region is not configured")
+			}
+			return nil
+		},
+	}
+	if database != nil {
+		readinessChecks["authoritative_store"] = func(checkCtx context.Context) error { return database.PingContext(checkCtx) }
+		readinessChecks["schema"] = func(checkCtx context.Context) error {
+			var version int
+			if err := database.QueryRowContext(checkCtx, `SELECT current_version FROM gateway_schema_metadata WHERE component='gateway'`).Scan(&version); err != nil {
+				return err
+			}
+			return gatewaySchemaReady(version)
+		}
+		readinessChecks["durable_outbox_capacity"] = func(checkCtx context.Context) error {
+			var pending int64
+			if err := database.QueryRowContext(checkCtx, `SELECT count(*) FROM transactional_outbox WHERE published_at IS NULL`).Scan(&pending); err != nil {
+				return err
+			}
+			return gatewayOutboxReady(pending, int64(gatewayEnvInt("GATEWAY_OUTBOX_READINESS_MAX_PENDING", 100000)))
+		}
+	}
+	if projection, ok := authenticator.(*accessprojection.Store); ok {
+		readinessChecks["access_projection"] = func(checkCtx context.Context) error {
+			status, err := projection.Status(checkCtx)
+			if err != nil {
+				return err
+			}
+			return gatewayAccessProjectionReady(status)
+		}
+		readinessChecks["execution_epoch_fence"] = func(checkCtx context.Context) error {
+			var violation bool
+			if err := database.QueryRowContext(checkCtx, `SELECT EXISTS(SELECT 1 FROM gateway_access_projection WHERE execution_epoch<=0)`).Scan(&violation); err != nil {
+				return err
+			}
+			return gatewayExecutionEpochReady(violation)
+		}
+	}
+	readiness := operations.NewProbe(750*time.Millisecond, time.Now, readinessChecks)
+	handler := operations.Handler(inferenceHandler, readiness)
+	reporter, err := configureGatewayOperationsReporter()
+	if err != nil {
+		return err
+	}
+	if reporter != nil {
+		go runGatewayOperationsReporter(ctx, reporter, database, router, envOr("GATEWAY_ID", "gateway-local"), localRegion,
+			envOr("GATEWAY_BUILD_SHA", "development"), startedAt)
+	}
 
 	address := envOr("GATEWAY_ADDR", ":8080")
 	server := &http.Server{
@@ -194,6 +260,111 @@ func run() error {
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	}
+}
+
+func gatewayLocalRegion() (string, error) {
+	region := strings.TrimSpace(os.Getenv("GATEWAY_LOCAL_REGION"))
+	if region == "" && os.Getenv("GATEWAY_ENV") == "production" {
+		return "", errors.New("GATEWAY_LOCAL_REGION is required in production")
+	}
+	if region == "" {
+		region = "local"
+	}
+	return region, nil
+}
+
+func gatewayRoutingReady(revision int64) error {
+	if revision <= 0 {
+		return errors.New("Routing Catalog is not initialized")
+	}
+	return nil
+}
+
+func gatewaySchemaReady(version int) error {
+	if !operations.SchemaCompatible(version, operations.MinimumDatabaseSchema, operations.CurrentDatabaseSchema) {
+		return errors.New("unsupported schema")
+	}
+	return nil
+}
+
+func gatewayOutboxReady(pending, maximum int64) error {
+	if pending < 0 || maximum < 0 || pending > maximum {
+		return errors.New("durable outbox capacity exceeded")
+	}
+	return nil
+}
+
+func gatewayAccessProjectionReady(status accessprojection.Status) error {
+	if status.GapCount > 0 {
+		return errors.New("Access Projection has a revision gap")
+	}
+	if status.HeadCount == 0 {
+		return errors.New("Access Projection is not initialized")
+	}
+	return nil
+}
+
+func gatewayExecutionEpochReady(violation bool) error {
+	if violation {
+		return errors.New("execution epoch fence violation")
+	}
+	return nil
+}
+
+func configureGatewayOperationsReporter() (*operations.Reporter, error) {
+	endpoint := strings.TrimSpace(os.Getenv("GATEWAY_OPERATIONS_URL"))
+	if endpoint == "" {
+		if os.Getenv("GATEWAY_ENV") == "production" {
+			return nil, errors.New("production requires GATEWAY_OPERATIONS_URL")
+		}
+		return nil, nil
+	}
+	if os.Getenv("GATEWAY_ENV") == "production" && !strings.HasPrefix(endpoint, "https://") {
+		return nil, errors.New("production GATEWAY_OPERATIONS_URL must use HTTPS")
+	}
+	return operations.NewReporter(endpoint, envOr("GATEWAY_ID", "gateway-local"), envOr("GATEWAY_LOCAL_REGION", "local"),
+		[]byte(os.Getenv("GATEWAY_OPERATIONS_HMAC_KEY")), nil, time.Now)
+}
+
+func runGatewayOperationsReporter(ctx context.Context, reporter *operations.Reporter, database *sql.DB, router *provider.StaticRouter, gatewayID, region, buildSHA string, startedAt time.Time) {
+	if database == nil {
+		return
+	}
+	report := func() {
+		observation, err := operations.ObserveGateway(ctx, database, gatewayID, region, buildSHA, startedAt, router.Revision(), time.Now().UTC())
+		if err == nil {
+			err = reporter.Report(ctx, observation)
+		}
+		if err == nil {
+			err = operations.MarkAccessReceiptsReported(ctx, database, observation, time.Now().UTC())
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("Gateway Operations reporting degraded", "error_code", "operations_report_failed")
+		}
+	}
+	report()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report()
+		}
+	}
+}
+
+func gatewayEnvInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func cacheProtectionModeFromEnv() (string, error) {

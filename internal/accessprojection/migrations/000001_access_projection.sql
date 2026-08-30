@@ -32,6 +32,7 @@ ALTER TABLE gateway_access_projection
 
 CREATE TABLE IF NOT EXISTS gateway_access_inbox (
     event_id           text PRIMARY KEY,
+    delivery_sequence  bigint,
     schema_version     integer NOT NULL CHECK (schema_version > 0),
     aggregate_type     text NOT NULL,
     aggregate_id       text NOT NULL,
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS gateway_access_inbox (
 );
 
 ALTER TABLE gateway_access_inbox
+    ADD COLUMN IF NOT EXISTS delivery_sequence bigint,
     ADD COLUMN IF NOT EXISTS event_type text,
     ADD COLUMN IF NOT EXISTS event_occurred_at timestamptz,
     ADD COLUMN IF NOT EXISTS apply_lag_seconds double precision;
@@ -63,8 +65,41 @@ CREATE TABLE IF NOT EXISTS gateway_access_gaps (
     received_revision bigint NOT NULL CHECK (received_revision > expected_revision),
     detected_at      timestamptz NOT NULL,
     last_event_id    text NOT NULL,
+    delivery_sequence bigint,
+    event_occurred_at timestamptz,
     PRIMARY KEY (aggregate_type, aggregate_id)
 );
+
+ALTER TABLE gateway_access_gaps
+    ADD COLUMN IF NOT EXISTS delivery_sequence bigint,
+    ADD COLUMN IF NOT EXISTS event_occurred_at timestamptz;
+
+CREATE INDEX IF NOT EXISTS gateway_access_inbox_delivery_sequence_idx
+    ON gateway_access_inbox (delivery_sequence)
+    WHERE delivery_sequence IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS gateway_access_inbox_delivery_sequence_unique_idx
+    ON gateway_access_inbox (delivery_sequence)
+    WHERE delivery_sequence IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS gateway_access_rollout_receipts (
+    event_id            text NOT NULL,
+    delivery_sequence   bigint NOT NULL CHECK (delivery_sequence > 0),
+    aggregate_type      text NOT NULL CHECK (aggregate_type IN ('Tenant','GatewayAPIKey')),
+    aggregate_id        text NOT NULL,
+    aggregate_revision  bigint NOT NULL CHECK (aggregate_revision > 0),
+    status              text NOT NULL CHECK (status IN ('applied','rejected')),
+    error_code          text,
+    event_occurred_at   timestamptz NOT NULL,
+    observed_at         timestamptz NOT NULL,
+    reported_at         timestamptz,
+    PRIMARY KEY (event_id,status),
+    UNIQUE (delivery_sequence,status)
+);
+
+CREATE INDEX IF NOT EXISTS gateway_access_rollout_receipts_pending_idx
+    ON gateway_access_rollout_receipts (observed_at,event_id,status)
+    WHERE reported_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS gateway_access_gaps_detected_idx
     ON gateway_access_gaps (detected_at, aggregate_type, aggregate_id);

@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS control_outbox (
     UNIQUE (aggregate_type, aggregate_id, aggregate_revision, event_type)
 );
 
+ALTER TABLE control_outbox
+    ADD COLUMN IF NOT EXISTS delivery_sequence bigserial;
+
+CREATE UNIQUE INDEX IF NOT EXISTS control_outbox_delivery_sequence_idx
+    ON control_outbox (delivery_sequence);
+
 CREATE INDEX IF NOT EXISTS control_outbox_unpublished_idx
     ON control_outbox (occurred_at, event_id) WHERE published_at IS NULL;
 

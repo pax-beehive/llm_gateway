@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -45,5 +46,26 @@ func TestCredentialPepperRingUsesExplicitCurrentVersion(t *testing.T) {
 	}
 	if ring.CurrentVersion != 2 || string(ring.Peppers[1]) != "old-control-pepper" || string(ring.Peppers[2]) != "current-control-pepper" {
 		t.Fatalf("pepper ring = %#v", ring)
+	}
+}
+
+func TestControlPlaneReadinessDependencyStates(t *testing.T) {
+	tests := map[string]struct {
+		ready   error
+		blocked error
+	}{
+		"schema":         {ready: controlSchemaReady(operations.CurrentDatabaseSchema), blocked: controlSchemaReady(operations.CurrentDatabaseSchema - 1)},
+		"outbox":         {ready: controlOutboxReady(10, 10), blocked: controlOutboxReady(11, 10)},
+		"secret custody": {ready: controlSecretCustodyReady(true), blocked: controlSecretCustodyReady(false)},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if test.ready != nil {
+				t.Fatalf("ready state failed: %v", test.ready)
+			}
+			if test.blocked == nil {
+				t.Fatal("unavailable state passed readiness")
+			}
+		})
 	}
 }

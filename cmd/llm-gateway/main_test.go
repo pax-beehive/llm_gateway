@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
+	"github.com/toddzheng/llm-gateway/internal/accessprojection"
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/core"
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
 	"github.com/toddzheng/llm-gateway/internal/provider/anthropic"
 	"github.com/toddzheng/llm-gateway/internal/quota"
@@ -29,6 +31,62 @@ func TestCacheProtectionModeDefaultsOff(t *testing.T) {
 	}
 	if mode != "off" {
 		t.Fatalf("mode = %q, want off", mode)
+	}
+}
+
+func TestGatewayLocalRegionRequiresExplicitProductionConfiguration(t *testing.T) {
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_LOCAL_REGION", "")
+	if _, err := gatewayLocalRegion(); err == nil {
+		t.Fatal("production accepted an implicit Home Region")
+	}
+	t.Setenv("GATEWAY_LOCAL_REGION", "us-west")
+	if got, err := gatewayLocalRegion(); err != nil || got != "us-west" {
+		t.Fatalf("region/error = %q/%v", got, err)
+	}
+}
+
+func TestGatewayLocalRegionDefaultsOnlyOutsideProduction(t *testing.T) {
+	t.Setenv("GATEWAY_ENV", "development")
+	t.Setenv("GATEWAY_LOCAL_REGION", "")
+	if got, err := gatewayLocalRegion(); err != nil || got != "local" {
+		t.Fatalf("region/error = %q/%v", got, err)
+	}
+}
+
+func TestGatewayReadinessDependencyStates(t *testing.T) {
+	tests := map[string]struct {
+		ready   func() error
+		blocked func() error
+	}{
+		"routing catalog": {
+			ready: func() error { return gatewayRoutingReady(1) }, blocked: func() error { return gatewayRoutingReady(0) },
+		},
+		"schema": {
+			ready: func() error { return gatewaySchemaReady(operations.CurrentDatabaseSchema) }, blocked: func() error { return gatewaySchemaReady(operations.CurrentDatabaseSchema - 1) },
+		},
+		"durable outbox": {
+			ready: func() error { return gatewayOutboxReady(10, 10) }, blocked: func() error { return gatewayOutboxReady(11, 10) },
+		},
+		"access projection empty": {
+			ready: func() error { return gatewayAccessProjectionReady(accessprojection.Status{HeadCount: 1}) }, blocked: func() error { return gatewayAccessProjectionReady(accessprojection.Status{}) },
+		},
+		"access projection gap": {
+			ready: func() error { return gatewayAccessProjectionReady(accessprojection.Status{HeadCount: 1}) }, blocked: func() error { return gatewayAccessProjectionReady(accessprojection.Status{HeadCount: 1, GapCount: 1}) },
+		},
+		"execution epoch": {
+			ready: func() error { return gatewayExecutionEpochReady(false) }, blocked: func() error { return gatewayExecutionEpochReady(true) },
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := test.ready(); err != nil {
+				t.Fatalf("ready state failed: %v", err)
+			}
+			if err := test.blocked(); err == nil {
+				t.Fatal("unavailable state passed readiness")
+			}
+		})
 	}
 }
 

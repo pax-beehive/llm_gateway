@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev bootstrap-access repair-access-projection configure-tenant-admin-roles compose-up compose-down
+.PHONY: build test test-race test-integration test-integration-local test-tenant-admin-roles test-openai-sdk-blackbox test-stage-a-blackbox test-tenant-admin-blackbox test-provider-connection-blackbox test-routing-catalog-blackbox test-operations-blackbox test-codex-sandbox-blackbox test-live-providers test-live-provider-tools integration-up integration-down vet run-dev run-control-plane-dev bootstrap-access repair-access-projection configure-tenant-admin-roles compose-up compose-down
 
 GOCACHE ?= /tmp/llm_gateway-go-cache
 
@@ -19,7 +19,8 @@ test-integration:
 	GOCACHE=$(GOCACHE) go test -count=1 -p=1 -tags=integration \
 		./internal/access ./internal/store ./internal/configuration ./internal/cacheprotection \
 		./internal/quota ./internal/httpapi ./internal/tenantadmin ./internal/credentialadmin \
-		./internal/accessprojection ./internal/providerconnection ./internal/routingcatalog ./cmd/llm-gateway
+		./internal/accessprojection ./internal/providerconnection ./internal/routingcatalog \
+		./internal/operations ./cmd/llm-gateway
 	$(MAKE) test-tenant-admin-roles TEST_DATABASE_URL="$(TEST_DATABASE_URL)"
 
 integration-up:
@@ -46,6 +47,9 @@ test-provider-connection-blackbox:
 
 test-routing-catalog-blackbox:
 	python3 tests/blackbox/routing_catalog.py
+
+test-operations-blackbox:
+	python3 tests/blackbox/operations.py
 
 test-codex-sandbox-blackbox:
 	bash tests/blackbox/codex_sandbox_multiturn.sh

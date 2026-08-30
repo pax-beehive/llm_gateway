@@ -8,15 +8,72 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
+
+func TestMachineAuthenticatedGatewayObservationDoesNotUseHumanIAM(t *testing.T) {
+	now := time.Date(2026, 8, 29, 22, 0, 0, 0, time.UTC)
+	called := false
+	handler := controlapi.New(controlapi.Config{
+		GatewayVerifier: gatewayVerifierFunc(func(_ context.Context, authorization, method, path string, body []byte) (operations.GatewayIdentity, error) {
+			if authorization != "Gateway-HMAC signed" || method != http.MethodPost || path != "/internal/v1/operations/gateway-observations" || len(body) == 0 {
+				t.Fatalf("machine assertion request = %q %q %q", authorization, method, path)
+			}
+			return operations.GatewayIdentity{GatewayID: "gateway-a", Region: "us-west"}, nil
+		}),
+		GatewayObservations: observationIngestorFunc(func(_ context.Context, identity operations.GatewayIdentity, observation operations.GatewayObservation) error {
+			called = true
+			if identity.GatewayID != observation.GatewayID || identity.Region != observation.Region {
+				t.Fatalf("identity/observation = %#v / %#v", identity, observation)
+			}
+			return nil
+		}),
+		Verifier: controlapi.IdentityVerifierFunc(func(context.Context, string) (controlapi.VerifiedIdentity, error) {
+			t.Fatal("Gateway observation reached Human IAM")
+			return controlapi.VerifiedIdentity{}, nil
+		}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/operations/gateway-observations", jsonBody(t, operations.GatewayObservation{
+		EventSchemaVersion: 2, GatewayID: "gateway-a", Region: "us-west", BuildSHA: "abc1234",
+		DatabaseSchemaVersion: 21, RoutingCatalogRevision: 7, AccessProjectionRevision: 9,
+		ExecutionEpochFloor: 1, StartedAt: now.Add(-time.Hour), ObservedAt: now,
+		Consumers: []operations.ConsumerObservation{},
+	}))
+	request.Header.Set("Authorization", "Gateway-HMAC signed")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || !called {
+		t.Fatalf("status/called/body = %d/%v/%s", response.Code, called, response.Body.String())
+	}
+}
+
+func TestGatewayObservationRejectsUnknownContentBearingFields(t *testing.T) {
+	called := false
+	handler := controlapi.New(controlapi.Config{
+		GatewayVerifier: gatewayVerifierFunc(func(context.Context, string, string, string, []byte) (operations.GatewayIdentity, error) {
+			return operations.GatewayIdentity{GatewayID: "gateway-a", Region: "us-west"}, nil
+		}),
+		GatewayObservations: observationIngestorFunc(func(context.Context, operations.GatewayIdentity, operations.GatewayObservation) error {
+			called = true
+			return nil
+		}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/operations/gateway-observations", bytes.NewBufferString(`{"gateway_id":"gateway-a","region":"us-west","prompt":"must not enter operations"}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || called {
+		t.Fatalf("status/called/body = %d/%v/%s", response.Code, called, response.Body.String())
+	}
+}
 
 func TestCreateTenantDerivesVerifiedActorAndReturnsVersionHeaders(t *testing.T) {
 	service := &fakeAdministration{}
@@ -478,6 +535,18 @@ func (f *fakeAdministration) ListTenantPolicyRevisions(context.Context, tenantad
 
 func fixedVerifier(identity controlapi.VerifiedIdentity) controlapi.IdentityVerifier {
 	return controlapi.IdentityVerifierFunc(func(context.Context, string) (controlapi.VerifiedIdentity, error) { return identity, nil })
+}
+
+type gatewayVerifierFunc func(context.Context, string, string, string, []byte) (operations.GatewayIdentity, error)
+
+func (function gatewayVerifierFunc) Verify(ctx context.Context, authorization, method, path string, body []byte) (operations.GatewayIdentity, error) {
+	return function(ctx, authorization, method, path, body)
+}
+
+type observationIngestorFunc func(context.Context, operations.GatewayIdentity, operations.GatewayObservation) error
+
+func (function observationIngestorFunc) RecordGatewayObservation(ctx context.Context, identity operations.GatewayIdentity, observation operations.GatewayObservation) error {
+	return function(ctx, identity, observation)
 }
 
 func jsonBody(t *testing.T, value any) *bytes.Reader {

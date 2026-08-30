@@ -21,6 +21,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -48,6 +49,7 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 		t.Fatal(err)
 	}
 	tenantID := fmt.Sprintf("projection-tenant-%d", time.Now().UnixNano())
+	deliveryBase := time.Now().UnixNano()
 	keyID := "gak_" + tenantID
 	rawKey := "gw_projection_" + tenantID
 	digest := hmac.New(sha256.New, pepper)
@@ -74,7 +76,7 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 			eventType = "GatewayAPIKeyRevoked"
 		}
 		return accessprojection.ControlEvent{
-			EventID: id, SchemaVersion: 2, AggregateType: "GatewayAPIKey", AggregateID: keyID,
+			EventID: id, DeliverySequence: deliveryBase + revision, SchemaVersion: 2, AggregateType: "GatewayAPIKey", AggregateID: keyID,
 			AggregateRevision: revision, TenantID: tenantID, EventType: eventType,
 			OccurredAt: now.Add(-time.Second), Payload: payload,
 		}
@@ -92,7 +94,7 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 			t.Fatal(marshalErr)
 		}
 		return accessprojection.ControlEvent{
-			EventID: id, SchemaVersion: 2, AggregateType: "Tenant", AggregateID: tenantID,
+			EventID: id, DeliverySequence: deliveryBase + 100 + revision, SchemaVersion: 2, AggregateType: "Tenant", AggregateID: tenantID,
 			AggregateRevision: revision, TenantID: tenantID, EventType: "TenantChanged",
 			OccurredAt: now.Add(-time.Second), Payload: payload,
 		}
@@ -114,7 +116,9 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 	if err != nil || duplicate.Disposition != accessprojection.DispositionDuplicate {
 		t.Fatalf("duplicate = %#v err=%v", duplicate, err)
 	}
-	stale, err := store.Apply(ctx, event("event-stale-"+tenantID, 1, access.APIKeyActive))
+	staleEvent := event("event-stale-"+tenantID, 1, access.APIKeyActive)
+	staleEvent.DeliverySequence = deliveryBase + 50
+	stale, err := store.Apply(ctx, staleEvent)
 	if err != nil || stale.Disposition != accessprojection.DispositionStale {
 		t.Fatalf("stale = %#v err=%v", stale, err)
 	}
@@ -147,6 +151,10 @@ func TestProjectionDeduplicatesRejectsStaleDetectsGapAndAuthenticatesLocally(t *
 	}
 	if _, err := store.Apply(ctx, event("event-4-"+tenantID, 4, access.APIKeyRevoked)); err != nil {
 		t.Fatal(err)
+	}
+	var gapHistory int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_access_rollout_receipts WHERE event_id=$1`, "event-4-"+tenantID).Scan(&gapHistory); err != nil || gapHistory != 2 {
+		t.Fatalf("gap receipt history/error = %d/%v", gapHistory, err)
 	}
 	revocationStatus, err := store.Status(ctx)
 	if err != nil || revocationStatus.LastRevocationAppliedAt == nil || !revocationStatus.LastRevocationAppliedAt.Equal(now) ||
@@ -416,6 +424,42 @@ func TestControlOutboxEventsBuildLocalProjectionWithoutRuntimeControlPlaneCalls(
 		if result.Scanned == 0 {
 			break
 		}
+	}
+	var desiredSequence, appliedSequence int64
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM control_outbox WHERE tenant_id=$1 AND aggregate_type IN ('Tenant','GatewayAPIKey')`, tenantID).Scan(&desiredSequence); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(max(delivery_sequence),0) FROM gateway_access_inbox WHERE aggregate_id=$1 OR aggregate_id=$2`, tenantID, issued.Credential.ID).Scan(&appliedSequence); err != nil {
+		t.Fatal(err)
+	}
+	if appliedSequence != desiredSequence || desiredSequence == 0 {
+		t.Fatalf("applied/desired Access delivery sequence = %d/%d", appliedSequence, desiredSequence)
+	}
+	var durableReceipts int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_access_rollout_receipts WHERE delivery_sequence<= $1`, desiredSequence).Scan(&durableReceipts); err != nil || durableReceipts == 0 {
+		t.Fatalf("durable Access receipts/error = %d/%v", durableReceipts, err)
+	}
+	now := time.Now().UTC()
+	reported := 0
+	for batches := 0; batches < 10; batches++ {
+		observation, err := operations.ObserveGateway(ctx, db, "gateway-receipt-test", "us-test", "build-receipt-test", now.Add(-time.Minute), 1, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(observation.AccessReceipts) == 0 {
+			break
+		}
+		reported += len(observation.AccessReceipts)
+		if err := operations.MarkAccessReceiptsReported(ctx, db, observation, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reported == 0 {
+		t.Fatal("no durable Access receipts were observed")
+	}
+	var pendingReceipts int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM gateway_access_rollout_receipts WHERE reported_at IS NULL AND aggregate_id IN ($1,$2)`, tenantID, issued.Credential.ID).Scan(&pendingReceipts); err != nil || pendingReceipts != 0 {
+		t.Fatalf("pending receipt acknowledgements/error = %d/%v", pendingReceipts, err)
 	}
 	principal, err := projection.Authenticate(ctx, issued.RawSecret)
 	if err != nil || principal.TenantID != tenantID || principal.APIKeyID != issued.Credential.ID {

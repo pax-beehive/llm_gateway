@@ -17,6 +17,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/access"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
+	"github.com/toddzheng/llm-gateway/internal/operations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
@@ -55,7 +56,14 @@ type Config struct {
 	Credentials         CredentialAdministration
 	ProviderConnections ProviderConnectionAdministration
 	RoutingCatalog      RoutingCatalogAdministration
+	Operations          operations.QueryService
+	GatewayObservations GatewayObservationIngestor
+	GatewayVerifier     operations.GatewayVerifier
 	Verifier            IdentityVerifier
+}
+
+type GatewayObservationIngestor interface {
+	RecordGatewayObservation(context.Context, operations.GatewayIdentity, operations.GatewayObservation) error
 }
 
 type RoutingCatalogAdministration interface {
@@ -102,17 +110,26 @@ type Server struct {
 	credentials         CredentialAdministration
 	providerConnections ProviderConnectionAdministration
 	routingCatalog      RoutingCatalogAdministration
+	operations          operations.QueryService
+	gatewayObservations GatewayObservationIngestor
+	gatewayVerifier     operations.GatewayVerifier
 	verifier            IdentityVerifier
 }
 
 func New(config Config) http.Handler {
 	return &Server{administration: config.Administration, credentials: config.Credentials,
-		providerConnections: config.ProviderConnections, routingCatalog: config.RoutingCatalog, verifier: config.Verifier}
+		providerConnections: config.ProviderConnections, routingCatalog: config.RoutingCatalog,
+		operations: config.Operations, gatewayObservations: config.GatewayObservations,
+		gatewayVerifier: config.GatewayVerifier, verifier: config.Verifier}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if request.URL.Path == "/healthz" && request.Method == http.MethodGet {
 		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	if request.URL.Path == "/internal/v1/operations/gateway-observations" {
+		server.receiveGatewayObservation(writer, request)
 		return
 	}
 	if server.administration == nil || server.verifier == nil {
@@ -133,6 +150,9 @@ func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 }
 
 func (server *Server) route(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) {
+	if server.routeOperations(writer, request, actor) {
+		return
+	}
 	if server.routeRoutingCatalog(writer, request, actor) {
 		return
 	}

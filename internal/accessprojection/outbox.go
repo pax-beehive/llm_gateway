@@ -25,12 +25,12 @@ func (store *Store) ConsumeControlOutboxBatch(ctx context.Context, limit int) (B
 		return BatchResult{}, fmt.Errorf("batch limit must be between 1 and 1000")
 	}
 	rows, err := store.database.QueryContext(ctx, `
-		SELECT event_id, schema_version, aggregate_type, aggregate_id, aggregate_revision,
+		SELECT event_id, delivery_sequence, schema_version, aggregate_type, aggregate_id, aggregate_revision,
 		       tenant_id, event_type, occurred_at, payload
 		FROM control_outbox
 		WHERE aggregate_type IN ('Tenant','GatewayAPIKey') AND schema_version = 2
 		  AND NOT EXISTS (SELECT 1 FROM gateway_access_inbox i WHERE i.event_id = control_outbox.event_id)
-		ORDER BY occurred_at, event_id
+		ORDER BY delivery_sequence
 		LIMIT $1`, limit)
 	if err != nil {
 		return BatchResult{}, err
@@ -39,7 +39,7 @@ func (store *Store) ConsumeControlOutboxBatch(ctx context.Context, limit int) (B
 	for rows.Next() {
 		var event ControlEvent
 		if err := rows.Scan(
-			&event.EventID, &event.SchemaVersion, &event.AggregateType, &event.AggregateID,
+			&event.EventID, &event.DeliverySequence, &event.SchemaVersion, &event.AggregateType, &event.AggregateID,
 			&event.AggregateRevision, &event.TenantID, &event.EventType, &event.OccurredAt, &event.Payload,
 		); err != nil {
 			_ = rows.Close()
@@ -65,6 +65,9 @@ func (store *Store) ConsumeControlOutboxBatch(ctx context.Context, limit int) (B
 		}
 		if err != nil && !errors.Is(err, ErrRevisionGap) {
 			return result, err
+		}
+		if errors.Is(err, ErrRevisionGap) {
+			break
 		}
 	}
 	return result, nil
