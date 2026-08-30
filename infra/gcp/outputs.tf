@@ -41,3 +41,11 @@ output "metering_service_account" {
 output "metering_export_bucket" {
   value = google_storage_bucket.metering_exports.name
 }
+
+output "github_workload_identity_provider" {
+  value = google_iam_workload_identity_pool_provider.github_actions.name
+}
+
+output "deploy_service_account" {
+  value = google_service_account.deploy.email
+}

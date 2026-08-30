@@ -9,3 +9,4 @@ coverage.out
 *.tfstate.*
 infra/gcp/backend.hcl
 infra/gcp/*.auto.tfvars
+gha-creds-*.json

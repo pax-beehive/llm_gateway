@@ -1,3 +1,4 @@
+.gcloudignore
 .git
 .github
 .terraform
@@ -8,3 +9,4 @@
 coverage.out
 docs
 gha-creds-*.json
+/llm-gateway

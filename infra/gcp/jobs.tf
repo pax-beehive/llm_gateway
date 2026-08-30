@@ -45,6 +45,12 @@ resource "google_cloud_run_v2_job" "schema_migrate" {
     google_sql_user.database,
     google_secret_manager_secret_iam_member.database_access,
   ]
+
+  lifecycle {
+    # Terraform bootstraps the Job; the main-branch release workflow owns the
+    # immutable image digest after bootstrap without reading foundation state.
+    ignore_changes = [template[0].template[0].containers[0].image]
+  }
 }
 
 resource "google_cloud_run_v2_job" "role_config" {
@@ -114,4 +120,9 @@ resource "google_cloud_run_v2_job" "role_config" {
     google_sql_user.database,
     google_secret_manager_secret_iam_member.database_access,
   ]
+
+  lifecycle {
+    # Keep release-image ownership out of the foundation state boundary.
+    ignore_changes = [template[0].template[0].containers[0].image]
+  }
 }
