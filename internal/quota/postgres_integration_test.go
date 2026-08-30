@@ -288,7 +288,7 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	response.Status = core.ResponseStatusCompleted
 	if err := responseStore.FinalizeWithUsage(ctx, tenantID, response, 1, core.UsageRecord{
 		ID: "fallback-usage-" + tenantID, TenantID: tenantID, APIKeyID: key.ID, ResponseID: response.ID, AttemptID: "success-attempt", QuotaReservationID: successAttempt.ID,
-		PriceSnapshot: core.PriceSnapshot{ID: "fallback-price-" + tenantID, Provider: "provider", Model: "model", Region: "local", Currency: "USD", EffectiveAt: now.Unix(), Source: "integration-test"},
+		PriceSnapshot: core.PriceSnapshot{ID: "fallback-price-" + tenantID, Provider: "provider-" + tenantID, Model: "model-" + tenantID, Region: "local", Currency: "USD", EffectiveAt: now.Unix(), Source: "integration-test"},
 		ProviderUsage: []byte(`{}`), Usage: core.Usage{InputTokens: 2, OutputTokens: 1, TotalTokens: 3}, AmountMicros: 4, Currency: "USD", CreatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
