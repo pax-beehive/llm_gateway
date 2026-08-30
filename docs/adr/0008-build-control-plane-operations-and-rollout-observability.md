@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Build control-plane Operations around readiness, revision, and lag
@@ -231,5 +231,14 @@ resuming incremental delivery. A live Gateway that discovers it is behind the
 floor withdraws readiness until the same bootstrap succeeds. Durable regional
 Access heads keep desired-versus-applied Operations evidence monotonic after
 outbox deletion. Retention is deliberately not granted to the
-control-plane runtime role. This ADR remains `proposed` until the decision is
-explicitly accepted.
+control-plane runtime role.
+
+## Acceptance
+
+Accepted on 2026-08-30 after the authenticated relay, retained-history floor,
+multi-projection bootstrap, runtime recovery, bounded retention, regional
+Operations evidence, schema and least-privilege gates, local verification, and
+remote CI gates were implemented and independently reviewed. Acceptance makes
+the ownership, consistency, recovery, and operational-proof boundaries in this
+ADR the baseline for subsequent Gateway and control-plane work; it does not by
+itself constitute production deployment evidence.

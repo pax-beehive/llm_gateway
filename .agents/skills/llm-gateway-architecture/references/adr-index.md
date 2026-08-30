@@ -11,7 +11,7 @@ Read only the decisions relevant to the current task.
 | `docs/adr/0005-build-provider-connection-registry.md` | proposed | Provider Connection registry, external secret custody, probes, and discovery | Managing Provider accounts, credentials, health, or upstream inventory |
 | `docs/adr/0006-build-routing-catalog-publication.md` | proposed | Draft, validate, publish, distribute, and observe immutable Routing Catalog revisions | Changing Model Routes, selection policy, Tenant visibility, or route rollout |
 | `docs/adr/0007-build-usage-quota-and-metering-interfaces.md` | proposed | Content-free usage events, outbox/inbox, Metering projections, quota queries, and corrections | Building reporting, exports, Metering, quota status, or future Billing inputs |
-| `docs/adr/0008-build-control-plane-operations-and-rollout-observability.md` | proposed | Liveness/readiness, heartbeats, rollout receipts, lag, jobs, and deployment gates | Building or diagnosing operations and release proof |
+| `docs/adr/0008-build-control-plane-operations-and-rollout-observability.md` | accepted | Liveness/readiness, heartbeats, rollout receipts, lag, jobs, and deployment gates | Building or diagnosing operations and release proof |
 | `docs/adr/0009-expand-capability-specific-inference-interfaces.md` | proposed | Staged embeddings, moderation, rerank, files, batches, media, Realtime, and video interfaces | Adding a non-Responses inference capability |
 
 When two ADRs overlap, preserve the stronger correctness invariant. Propose an explicit superseding ADR instead of quietly weakening an accepted decision.
