@@ -28,9 +28,11 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/httpapi"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/provider"
+	"github.com/toddzheng/llm-gateway/internal/providerconnection"
 	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/runtime"
+	"github.com/toddzheng/llm-gateway/internal/secretcustody"
 	"github.com/toddzheng/llm-gateway/internal/store"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -423,6 +425,9 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 		}
 		return provider.NewVersionedRouter(1, routes), nil
 	}
+	if os.Getenv("GATEWAY_ROUTING_CATALOG") == "true" {
+		return configureManagedRoutingCatalog(ctx, database)
+	}
 	repository := configuration.NewPostgresRepository(database)
 	snapshot, err := repository.Current(ctx, "model_routes")
 	var routes []provider.Route
@@ -477,6 +482,96 @@ func configureRouter(ctx context.Context, database *sql.DB) (*provider.StaticRou
 		}
 	}()
 	return router, nil
+}
+
+func configureManagedRoutingCatalog(ctx context.Context, database *sql.DB) (*provider.StaticRouter, error) {
+	secretStore, err := configureGatewaySecretCustody()
+	if err != nil {
+		return nil, err
+	}
+	resolver, err := providerconnection.NewGatewayResolver(database, secretStore)
+	if err != nil {
+		return nil, err
+	}
+	compiler, err := routingcatalog.NewManagedCompiler(resolver, nil)
+	if err != nil {
+		return nil, err
+	}
+	projected, err := routingcatalog.LoadProjected(ctx, database)
+	var router *provider.StaticRouter
+	if err == nil {
+		compiled, compileErr := compiler.CompileSnapshot(ctx, projected.Document)
+		if compileErr != nil {
+			return nil, fmt.Errorf("compile projected Routing Catalog revision %d: %w", projected.Revision, compileErr)
+		}
+		router = provider.NewVersionedRouterAt(projected.Revision, projected.CreatedAt, compiled.Routes)
+	} else if errors.Is(err, routingcatalog.ErrNotFound) {
+		router = provider.NewVersionedRouterAt(1, time.Now(), nil)
+	} else {
+		return nil, err
+	}
+	gatewayID := envOr("GATEWAY_ID", "gateway-local")
+	region := envOr("GATEWAY_LOCAL_REGION", "local")
+	consumer, err := routingcatalog.NewConsumer(database, compiler, router, gatewayID, region, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	for count := 0; count < 10_000; count++ {
+		worked, err := consumer.RunNext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("catch up Routing Catalog: %w", err)
+		}
+		if !worked {
+			break
+		}
+	}
+	if _, err := routingcatalog.LoadProjected(ctx, database); err != nil {
+		return nil, errors.New("managed Routing Catalog has no valid applied revision")
+	}
+	go runRoutingCatalogConsumer(ctx, consumer)
+	return router, nil
+}
+
+func configureGatewaySecretCustody() (secretcustody.Store, error) {
+	if strings.TrimSpace(os.Getenv("GATEWAY_SECRET_CUSTODY_BACKEND")) != "gcp-secret-manager" {
+		return nil, errors.New("managed Routing Catalog requires GATEWAY_SECRET_CUSTODY_BACKEND=gcp-secret-manager")
+	}
+	projectID := strings.TrimSpace(os.Getenv("GATEWAY_GCP_SECRET_PROJECT"))
+	if projectID == "" {
+		return nil, errors.New("managed Routing Catalog requires GATEWAY_GCP_SECRET_PROJECT")
+	}
+	store, err := secretcustody.NewGCP(secretcustody.GCPConfig{ProjectID: projectID, TokenProvider: secretcustody.NewMetadataTokenProvider()})
+	if err != nil {
+		return nil, fmt.Errorf("configure Gateway Secret Custody: %w", err)
+	}
+	return store, nil
+}
+
+func runRoutingCatalogConsumer(ctx context.Context, consumer *routingcatalog.Consumer) {
+	run := func() {
+		for count := 0; count < 256; count++ {
+			worked, err := consumer.RunNext(ctx)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Warn("Routing Catalog consumer degraded", "error", err)
+				}
+				return
+			}
+			if !worked {
+				return
+			}
+		}
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func publishRoutes(

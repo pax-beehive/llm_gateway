@@ -26,6 +26,15 @@ SELECT EXISTS (
 		'provider_connection_health'::regclass,
 		'provider_model_observations'::regclass,
 		'gateway_provider_connection_resolutions'::regclass,
+		'routing_catalog_drafts'::regclass,
+		'routing_catalog_revisions'::regclass,
+		'routing_catalog_head'::regclass,
+		'routing_publications'::regclass,
+		'routing_rollout_receipts'::regclass,
+		'gateway_routing_catalog_history'::regclass,
+		'gateway_routing_catalog_head'::regclass,
+		'gateway_routing_catalog_inbox'::regclass,
+		'gateway_provider_connection_inbox'::regclass,
         'gateway_access_projection'::regclass,
         'gateway_access_inbox'::regclass,
         'gateway_access_heads'::regclass,
@@ -52,6 +61,15 @@ REVOKE ALL PRIVILEGES ON TABLE
 	provider_connection_health,
 	provider_model_observations,
 	gateway_provider_connection_resolutions,
+	routing_catalog_drafts,
+	routing_catalog_revisions,
+	routing_catalog_head,
+	routing_publications,
+	routing_rollout_receipts,
+	gateway_routing_catalog_history,
+	gateway_routing_catalog_head,
+	gateway_routing_catalog_inbox,
+	gateway_provider_connection_inbox,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
@@ -73,6 +91,15 @@ REVOKE ALL PRIVILEGES ON TABLE
 	provider_connection_health,
 	provider_model_observations,
 	gateway_provider_connection_resolutions,
+	routing_catalog_drafts,
+	routing_catalog_revisions,
+	routing_catalog_head,
+	routing_publications,
+	routing_rollout_receipts,
+	gateway_routing_catalog_history,
+	gateway_routing_catalog_head,
+	gateway_routing_catalog_inbox,
+	gateway_provider_connection_inbox,
     gateway_access_projection,
     gateway_access_inbox,
     gateway_access_heads,
@@ -127,9 +154,19 @@ GRANT SELECT, INSERT ON TABLE provider_connection_health TO :"tenant_admin_role"
 GRANT UPDATE (observed_status, error_code, operation_id, latency_milliseconds, observed_at)
 ON provider_connection_health TO :"tenant_admin_role";
 GRANT SELECT, INSERT ON TABLE provider_model_observations TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE routing_catalog_drafts TO :"tenant_admin_role";
+GRANT SELECT, INSERT ON TABLE routing_catalog_revisions TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE routing_catalog_head TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE routing_publications TO :"tenant_admin_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE routing_rollout_receipts TO :"tenant_admin_role";
+GRANT SELECT ON TABLE gateway_routing_catalog_inbox TO :"tenant_admin_role";
 
 GRANT SELECT ON TABLE control_outbox TO :"gateway_role";
 GRANT SELECT ON TABLE gateway_provider_connection_resolutions TO :"gateway_role";
+GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_history TO :"gateway_role";
+GRANT SELECT, INSERT, UPDATE ON TABLE gateway_routing_catalog_head TO :"gateway_role";
+GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_inbox TO :"gateway_role";
+GRANT SELECT, INSERT ON TABLE gateway_provider_connection_inbox TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
     gateway_access_projection,
     gateway_access_inbox,

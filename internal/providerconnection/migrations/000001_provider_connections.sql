@@ -113,7 +113,9 @@ CREATE INDEX IF NOT EXISTS provider_model_observations_connection_time_idx
 
 CREATE OR REPLACE VIEW gateway_provider_connection_resolutions
 WITH (security_barrier = true) AS
-SELECT id, provider, base_url, region, credential_scope, capability_declaration,
-       revision, credential_version, secret_ref, secret_external_version
-FROM provider_connections
-WHERE administrative_status = 'enabled';
+SELECT c.id, c.provider, c.base_url, c.region, c.credential_scope, c.capability_declaration,
+       c.revision, c.credential_version, c.secret_ref, c.secret_external_version,
+       CASE WHEN h.observed_status IS NULL THEN NULL ELSE h.observed_status = 'healthy' END AS observed_healthy
+FROM provider_connections c
+LEFT JOIN provider_connection_health h ON h.connection_id = c.id
+WHERE c.administrative_status = 'enabled';

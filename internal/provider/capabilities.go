@@ -52,6 +52,7 @@ type CapabilityRouteQuery struct {
 	HomeRegion        string
 	Capability        core.Capability
 	CompatibilityMode core.CompatibilityMode
+	RoutingIdentity   string
 }
 
 type CapabilityRouter interface {
@@ -80,7 +81,7 @@ func (r *StaticRouter) ListCapabilities(_ context.Context, query CapabilityCatal
 	}
 	models := make(map[string]map[string]CapabilitySupport)
 	for _, route := range snapshot.routes {
-		if !route.Healthy || route.Model == "" ||
+		if !route.Healthy || !routeAcceptsNewAssignments(route) || route.Model == "" ||
 			(query.HomeRegion != "" && route.HomeRegion != "" && query.HomeRegion != route.HomeRegion) {
 			continue
 		}
@@ -116,7 +117,7 @@ func (r *StaticRouter) CapabilityCandidates(_ context.Context, query CapabilityR
 	}
 	var candidates []Route
 	for _, route := range snapshot.routes {
-		if !route.Healthy || (query.Model != route.Model && query.Model != route.ID) {
+		if !route.Healthy || !routeAcceptsNewAssignments(route) || (query.Model != route.Model && query.Model != route.ID) {
 			continue
 		}
 		if !routeVisibleToTenant(route, query.TenantID) {
@@ -135,10 +136,42 @@ func (r *StaticRouter) CapabilityCandidates(_ context.Context, query CapabilityR
 	if len(candidates) == 0 {
 		return nil, errors.New("no compatible model route")
 	}
+	weighted := false
+	for _, candidate := range candidates {
+		if candidate.Weight > 0 {
+			weighted = true
+			break
+		}
+	}
 	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority < candidates[j].Priority
+		}
+		if weighted {
+			iScore := weightedCapabilityRouteScore(query, candidates[i])
+			jScore := weightedCapabilityRouteScore(query, candidates[j])
+			if iScore != jScore {
+				return iScore < jScore
+			}
+		}
 		return candidates[i].InputCost+candidates[i].OutputCost < candidates[j].InputCost+candidates[j].OutputCost
 	})
 	return candidates, nil
+}
+
+func weightedCapabilityRouteScore(query CapabilityRouteQuery, route Route) float64 {
+	weight := route.Weight
+	if weight <= 0 {
+		weight = 1
+	}
+	identity := query.RoutingIdentity
+	if identity == "" {
+		identity = strings.Join([]string{query.TenantID, query.Model, query.HomeRegion, string(query.Capability)}, "\x1f")
+	}
+	digest := sha256.Sum256([]byte(identity + "\x1f" + route.ID))
+	value := binary.BigEndian.Uint64(digest[:8])
+	unit := (float64(value) + 1) / (float64(math.MaxUint64) + 1)
+	return -math.Log(unit) / float64(weight)
 }
 
 type DeterministicCapabilityExecutor struct{}

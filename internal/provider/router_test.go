@@ -2,6 +2,7 @@ package provider_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -87,6 +88,79 @@ func TestTenantScopedRoutesAreNotDisclosedOrSelectedCrossTenant(t *testing.T) {
 	})
 	if err != nil || len(routes) != 1 || routes[0].ID != "tenant-only" {
 		t.Fatalf("authorized Tenant routes = %#v, %v", routes, err)
+	}
+}
+
+func TestRouterHonorsAdministrativeStatusPriorityAndPinnedDrainingRoute(t *testing.T) {
+	highPriority := route("priority-10")
+	highPriority.Priority = 10
+	lowPriority := route("priority-20")
+	lowPriority.Priority = 20
+	draining := route("draining")
+	draining.Priority = 1
+	draining.AdministrativeStatus = provider.RouteDraining
+	router := provider.NewVersionedRouter(1, []provider.Route{lowPriority, draining, highPriority})
+
+	routes, err := router.Candidates(context.Background(), core.Request{Model: "model", HomeRegion: "local", RequestedFeatures: []string{"text"}})
+	if err != nil || len(routes) != 2 || routes[0].ID != "priority-10" || routes[1].ID != "priority-20" {
+		t.Fatalf("new assignment routes = %#v / %v", routes, err)
+	}
+	routes, err = router.Candidates(context.Background(), core.Request{
+		Model: "model", HomeRegion: "local", RequestedFeatures: []string{"text"}, PreferredRouteID: "draining",
+	})
+	if err != nil || len(routes) != 3 || routes[0].ID != "draining" {
+		t.Fatalf("pinned routes = %#v / %v", routes, err)
+	}
+}
+
+func TestRouterUsesStableWeightedOrderWithinPriority(t *testing.T) {
+	light := route("light")
+	light.Weight = 1
+	heavy := route("heavy")
+	heavy.Weight = 9
+	router := provider.NewVersionedRouter(1, []provider.Route{light, heavy})
+	heavyFirst := 0
+	for index := range 1_000 {
+		request := core.Request{TenantID: "tenant-a", Model: "model", HomeRegion: "local", RequestedFeatures: []string{"text"}, IdempotencyKey: fmt.Sprintf("request-%d", index)}
+		first, err := router.Candidates(context.Background(), request)
+		if err != nil || len(first) != 2 {
+			t.Fatalf("weighted candidates = %#v / %v", first, err)
+		}
+		second, err := router.Candidates(context.Background(), request)
+		if err != nil || first[0].ID != second[0].ID {
+			t.Fatalf("weighted order is unstable: %#v / %#v / %v", first, second, err)
+		}
+		if first[0].ID == "heavy" {
+			heavyFirst++
+		}
+	}
+	if heavyFirst < 800 {
+		t.Fatalf("heavy route selected first %d times, want weighted majority", heavyFirst)
+	}
+}
+
+func TestStickyEligibleRoutesUseExperimentIdentityForWeightedOrder(t *testing.T) {
+	first := route("first")
+	first.Weight = 1
+	first.StickyRouting = true
+	second := route("second")
+	second.Weight = 1
+	second.StickyRouting = true
+	router := provider.NewVersionedRouter(1, []provider.Route{first, second})
+	var selected string
+	for index := range 100 {
+		candidates, err := router.Candidates(context.Background(), core.Request{
+			TenantID: "tenant-a", Model: "model", HomeRegion: "local", RequestedFeatures: []string{"text"},
+			IdempotencyKey: fmt.Sprintf("request-%d", index), ExperimentIdentity: "conversation-a",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if selected == "" {
+			selected = candidates[0].ID
+		} else if candidates[0].ID != selected {
+			t.Fatalf("sticky order changed from %q to %q", selected, candidates[0].ID)
+		}
 	}
 }
 

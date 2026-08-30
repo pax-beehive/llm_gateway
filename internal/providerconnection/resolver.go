@@ -30,11 +30,12 @@ func (resolver *GatewayResolver) Resolve(ctx context.Context, connectionID strin
 	}
 	var connection ProviderConnection
 	var capability []byte
+	var observedHealthy sql.NullBool
 	err := resolver.database.QueryRowContext(ctx, `SELECT id,provider,base_url,region,credential_scope,
-		capability_declaration,revision,credential_version,secret_ref,secret_external_version
+		capability_declaration,revision,credential_version,secret_ref,secret_external_version,observed_healthy
 		FROM gateway_provider_connection_resolutions WHERE id=$1`, connectionID).Scan(
 		&connection.ID, &connection.Provider, &connection.BaseURL, &connection.Region, &connection.CredentialScope,
-		&capability, &connection.Revision, &connection.CredentialVersion, &connection.SecretRef, &connection.SecretExternalVersion)
+		&capability, &connection.Revision, &connection.CredentialVersion, &connection.SecretRef, &connection.SecretExternalVersion, &observedHealthy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ResolvedConnection{}, ErrNotFound
 	}
@@ -55,5 +56,9 @@ func (resolver *GatewayResolver) Resolve(ctx context.Context, connectionID strin
 		return ResolvedConnection{}, err
 	}
 	connection.AdministrativeStatus = StatusEnabled
-	return ResolvedConnection{Connection: publicConnection(connection), Secret: secret}, nil
+	resolved := ResolvedConnection{Connection: publicConnection(connection), Secret: secret}
+	if observedHealthy.Valid {
+		resolved.ObservedHealthy = &observedHealthy.Bool
+	}
+	return resolved, nil
 }

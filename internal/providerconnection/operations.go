@@ -331,6 +331,9 @@ func (service *Service) completeProbe(ctx context.Context, operation Operation, 
 		operation.ConnectionID, operation.ID, latency, now); err != nil {
 		return err
 	}
+	if err := service.recordHealthObservation(ctx, transaction, operation, "healthy", "", now); err != nil {
+		return err
+	}
 	return completeOperationTx(ctx, transaction, operation.ID, OperationSucceeded, map[string]any{
 		"observed_status": "healthy", "observed_model_count": result.ObservedModelCount,
 		"raw_response_hash": result.RawResponseHash, "latency_milliseconds": latency,
@@ -448,8 +451,28 @@ func (service *Service) failOperation(ctx context.Context, operation Operation, 
 			operation.ConnectionID, code, operation.ID, service.operationLatency(operation), now); err != nil {
 			return err
 		}
+		if err := service.recordHealthObservation(ctx, transaction, operation, "unhealthy", code, now); err != nil {
+			return err
+		}
 	}
 	return completeOperationTx(ctx, transaction, operation.ID, OperationFailed, nil, code, "Provider operation failed", now)
+}
+
+func (service *Service) recordHealthObservation(ctx context.Context, transaction *sql.Tx, operation Operation, status, errorCode string, observedAt time.Time) error {
+	eventID, err := randomID(service.random, "cevt")
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"operation_id": operation.ID, "connection_id": operation.ConnectionID,
+		"connection_revision": operation.ExpectedRevision, "observed_status": status,
+		"error_code": errorCode, "observed_at": observedAt,
+	})
+	_, err = transaction.ExecContext(ctx, `INSERT INTO control_outbox (
+		event_id,schema_version,aggregate_type,aggregate_id,aggregate_revision,tenant_id,event_type,occurred_at,payload
+	) VALUES ($1,2,'ProviderOperation',$2,1,NULL,'ProviderConnectionHealthObserved',$3,$4)`,
+		eventID, operation.ID, observedAt, payload)
+	return err
 }
 
 func (service *Service) finishFailure(ctx context.Context, operation Operation, code string, updateHealth bool) error {

@@ -66,6 +66,11 @@ Selection policy may declare priority, weight within a priority, maximum concurr
 
 Administrative status and observed health remain separate. `draining` stops new assignments but lets pinned or already visible Responses finish. After the first visible Provider event, the existing rule still prohibits transparent fallback.
 
+Provider Connection enabled/disabled state, observed health, and immutable
+credential rotation are operational overlays owned by ADR 0005. Their events may
+recompile the executor/eligibility projection at the same Catalog revision, but
+they do not mutate the published Catalog document or its validation evidence.
+
 ## Validation report
 
 Validation checks at least:
@@ -94,10 +99,19 @@ publication_id
 catalog_revision
 status
 applied_at
+lag_milliseconds
 error_code
 ```
 
 The control plane declares a publication active only after its configured regional quorum reports the revision. Gateway operation continues on the last valid snapshot while a newer publication is missing or invalid.
+
+The initial implementation uses the shared PostgreSQL outbox/inbox transport and
+keys inbox delivery by `gateway_id,event_id`, so multiple Gateway instances do
+not consume one another's receipt. A Gateway writes only its projection inbox;
+a control-plane collector validates and promotes that observation into the
+authoritative rollout receipt and publication status. ADR 0008 replaces this
+transport and Gateway-identity boundary before physical control-plane and
+regional databases are separated.
 
 ## Provider prices
 
@@ -133,3 +147,16 @@ Rejected. It makes change history non-monotonic and complicates consumer fencing
 - Rollout receipts expose regional success, failure, and lag.
 - Tenant model listing honors the published visibility and Home Region rules.
 - Streaming tests retain provider pinning after the first visible event.
+
+## Implementation status (2026-08-29)
+
+The proposed design is implemented behind `GATEWAY_ROUTING_CATALOG=true` with
+control-plane drafts, deterministic validation, delegated asynchronous probes,
+immutable CAS publication and restore, Gateway compilation through Provider
+Connection Secret Custody, monotonic per-Gateway inboxes, regional rollout
+receipts, and last-valid-snapshot behavior. Selection priority, stable weighted
+ordering, maximum concurrency, explicit visibility, active/draining/disabled
+administrative state, and observed health are enforced at runtime. Unit,
+PostgreSQL integration, and control-plane black-box coverage exercise these
+boundaries. The ADR remains proposed until the decision is explicitly accepted;
+the external distribution/readiness work remains owned by ADR 0008.

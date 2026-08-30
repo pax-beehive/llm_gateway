@@ -175,6 +175,7 @@ type OperationError struct {
 func (err *OperationError) Error() string { return err.Code }
 
 type ResolvedConnection struct {
-	Connection ProviderConnection
-	Secret     []byte
+	Connection      ProviderConnection
+	Secret          []byte
+	ObservedHealthy *bool
 }

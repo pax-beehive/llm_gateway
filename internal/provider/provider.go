@@ -2,9 +2,12 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -79,26 +82,39 @@ type CapabilityProfile struct {
 	Features map[string]CapabilitySupport `json:"features"`
 }
 
+type RouteAdministrativeStatus string
+
+const (
+	RouteActive   RouteAdministrativeStatus = "active"
+	RouteDraining RouteAdministrativeStatus = "draining"
+	RouteDisabled RouteAdministrativeStatus = "disabled"
+)
+
 type Route struct {
-	ID                 string
-	Provider           string
-	Model              string
-	Region             string
-	CredentialScope    string
-	HomeRegion         string
-	TenantIDs          []string
-	Healthy            bool
-	InputCost          float64
-	OutputCost         float64
-	Profile            CapabilityProfile
-	Executor           ResponseExecutor
-	EmbeddingExecutor  EmbeddingExecutor
-	ModerationExecutor ModerationExecutor
-	RerankExecutor     RerankExecutor
-	CacheProtector     CacheProtector
-	CacheAnchorBuilder CacheAnchorBuilder
-	PriceSnapshot      core.PriceSnapshot
-	CacheUsageReliable bool
+	ID                   string
+	Provider             string
+	Model                string
+	Region               string
+	CredentialScope      string
+	HomeRegion           string
+	TenantIDs            []string
+	Healthy              bool
+	InputCost            float64
+	OutputCost           float64
+	Profile              CapabilityProfile
+	Executor             ResponseExecutor
+	EmbeddingExecutor    EmbeddingExecutor
+	ModerationExecutor   ModerationExecutor
+	RerankExecutor       RerankExecutor
+	CacheProtector       CacheProtector
+	CacheAnchorBuilder   CacheAnchorBuilder
+	PriceSnapshot        core.PriceSnapshot
+	CacheUsageReliable   bool
+	AdministrativeStatus RouteAdministrativeStatus
+	Priority             int
+	Weight               int
+	MaxConcurrency       int
+	StickyRouting        bool
 }
 
 type Router interface {
@@ -199,6 +215,28 @@ func (r *StaticRouter) UpdateAt(revision int64, createdAt time.Time, routes []Ro
 	}
 }
 
+// ReplaceAt installs a durable published snapshot. It permits replacing an
+// equal-revision legacy bootstrap snapshot when the managed projection is
+// applied for the first time, but never permits revision rollback.
+func (r *StaticRouter) ReplaceAt(revision int64, createdAt time.Time, routes []Route) error {
+	if revision <= 0 {
+		return errors.New("route snapshot revision must be positive")
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	for {
+		current := r.snapshot.Load()
+		if current != nil && revision < current.revision {
+			return errors.New("route snapshot revision must not decrease")
+		}
+		next := &routeSnapshot{revision: revision, created: createdAt.Unix(), routes: append([]Route(nil), routes...)}
+		if r.snapshot.CompareAndSwap(current, next) {
+			return nil
+		}
+	}
+}
+
 func (r *StaticRouter) Revision() int64 {
 	if snapshot := r.snapshot.Load(); snapshot != nil {
 		return snapshot.revision
@@ -213,7 +251,7 @@ func (r *StaticRouter) ListModels(_ context.Context, query ModelCatalogQuery) ([
 	}
 	models := make(map[string]struct{})
 	for _, route := range snapshot.routes {
-		if !route.Healthy || route.Model == "" || route.Profile.Features["text"] != CapabilityNative {
+		if !route.Healthy || !routeAcceptsNewAssignments(route) || route.Model == "" || route.Profile.Features["text"] != CapabilityNative {
 			continue
 		}
 		if !routeVisibleToTenant(route, query.TenantID) {
@@ -263,7 +301,7 @@ func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Ro
 	}
 	var candidates []Route
 	for _, route := range snapshot.routes {
-		if !route.Healthy || (request.Model != route.Model && request.Model != route.ID) {
+		if !route.Healthy || !routeAcceptsRequest(route, request.PreferredRouteID) || (request.Model != route.Model && request.Model != route.ID) {
 			continue
 		}
 		if !routeVisibleToTenant(route, request.TenantID) {
@@ -287,6 +325,13 @@ func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Ro
 	if len(candidates) == 0 {
 		return nil, errors.New("no compatible model route")
 	}
+	weighted := false
+	for _, candidate := range candidates {
+		if candidate.Weight > 0 {
+			weighted = true
+			break
+		}
+	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if request.PreferredRouteID != "" {
 			iPreferred := candidates[i].ID == request.PreferredRouteID
@@ -295,11 +340,59 @@ func (r *StaticRouter) Candidates(_ context.Context, request core.Request) ([]Ro
 				return iPreferred
 			}
 		}
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority < candidates[j].Priority
+		}
+		if weighted {
+			iScore := weightedRouteScore(request, candidates[i])
+			jScore := weightedRouteScore(request, candidates[j])
+			if iScore != jScore {
+				return iScore < jScore
+			}
+		}
 		iCost := candidates[i].InputCost + candidates[i].OutputCost
 		jCost := candidates[j].InputCost + candidates[j].OutputCost
 		return iCost < jCost
 	})
 	return candidates, nil
+}
+
+func weightedRouteScore(request core.Request, route Route) float64 {
+	weight := route.Weight
+	if weight <= 0 {
+		weight = 1
+	}
+	identity := ""
+	if route.StickyRouting && request.ExperimentIdentity != "" {
+		identity = request.ExperimentIdentity
+	}
+	if identity == "" {
+		identity = request.IdempotencyKey
+	}
+	if identity == "" && len(request.RequestHash) > 0 {
+		identity = string(request.RequestHash)
+	}
+	if identity == "" {
+		identity = strings.Join([]string{request.TenantID, request.APIKeyID, request.Model, request.ConversationID, request.ExperimentIdentity}, "\x1f")
+	}
+	digest := sha256.Sum256([]byte(identity + "\x1f" + route.ID))
+	value := binary.BigEndian.Uint64(digest[:8])
+	unit := (float64(value) + 1) / (float64(math.MaxUint64) + 1)
+	return -math.Log(unit) / float64(weight)
+}
+
+func routeAcceptsNewAssignments(route Route) bool {
+	return route.AdministrativeStatus == "" || route.AdministrativeStatus == RouteActive
+}
+
+func routeAcceptsRequest(route Route, preferredRouteID string) bool {
+	if route.AdministrativeStatus == RouteDisabled {
+		return false
+	}
+	if route.AdministrativeStatus == RouteDraining {
+		return preferredRouteID != "" && preferredRouteID == route.ID
+	}
+	return true
 }
 
 func routeVisibleToTenant(route Route, tenantID string) bool {

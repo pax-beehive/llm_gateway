@@ -14,6 +14,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
+	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -235,6 +236,71 @@ func TestProviderConnectionSensitiveMutationsNeverEchoSecrets(t *testing.T) {
 	}
 }
 
+func TestCreateRoutingCatalogDraftUsesVerifiedActorAndVersionHeaders(t *testing.T) {
+	routing := &fakeRoutingCatalogAdministration{}
+	routing.create = func(_ context.Context, actor tenantadmin.ActorEnvelope, key string, command routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error) {
+		if actor.ID != "user-1" || actor.Reason != "prepare routing" || key != "create-routing-draft" || command.ID != "draft-a" {
+			t.Fatalf("actor/key/command = %#v / %q / %#v", actor, key, command)
+		}
+		return routingcatalog.DraftResult{Draft: routingcatalog.Draft{ID: command.ID, BaseRevision: command.BaseRevision, Document: command.Document, Status: routingcatalog.DraftOpen, Revision: 1}}, nil
+	}
+	handler := controlapi.New(controlapi.Config{
+		Administration: &fakeAdministration{}, RoutingCatalog: routing,
+		Verifier: fixedVerifier(controlapi.VerifiedIdentity{ActorType: "human", ActorID: "user-1", Scopes: []string{tenantadmin.ScopePlatformWrite}}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/control/v1/routing-catalog/drafts", jsonBody(t, map[string]any{
+		"id": "draft-a", "base_revision": 3, "document": map[string]any{"routes": []any{}}, "reason": "prepare routing",
+	}))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "create-routing-draft")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` || response.Header().Get("Location") != "/control/v1/routing-catalog/drafts/draft-a" {
+		t.Fatalf("status/headers/body = %d/%#v/%s", response.Code, response.Header(), response.Body.String())
+	}
+}
+
+func TestRoutingCatalogProbeQueuesOneBudgetedOperationPerProviderConnection(t *testing.T) {
+	routing := &fakeRoutingCatalogAdministration{}
+	routing.getDraft = func(_ context.Context, actor tenantadmin.ActorEnvelope, draftID string) (routingcatalog.Draft, error) {
+		if actor.ID != "user-1" || draftID != "draft-a" {
+			t.Fatalf("actor/draft = %#v / %q", actor, draftID)
+		}
+		route := routingcatalog.ManagedRoute{ProviderConnectionID: "pc-openai"}
+		return routingcatalog.Draft{ID: draftID, Revision: 4, Document: routingcatalog.Document{Routes: []routingcatalog.ManagedRoute{route, route}}}, nil
+	}
+	providers := &fakeProviderConnectionAdministration{}
+	providers.get = func(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error) {
+		return providerconnection.ProviderConnection{ID: "pc-openai", Revision: 7}, nil
+	}
+	providers.probe = func(_ context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.OperationCommand) (providerconnection.OperationResult, error) {
+		if actor.Reason != "verify draft providers" || key == "probe-routing-draft" || command.ConnectionID != "pc-openai" || command.ExpectedRevision != 7 {
+			t.Fatalf("actor/key/command = %#v / %q / %#v", actor, key, command)
+		}
+		return providerconnection.OperationResult{Operation: providerconnection.Operation{ID: "pop-probe", ConnectionID: command.ConnectionID, Status: providerconnection.OperationQueued}}, nil
+	}
+	handler := controlapi.New(controlapi.Config{
+		Administration: &fakeAdministration{}, RoutingCatalog: routing, ProviderConnections: providers,
+		Verifier: fixedVerifier(controlapi.VerifiedIdentity{ActorType: "human", ActorID: "user-1", Scopes: []string{tenantadmin.ScopePlatformWrite}}),
+	})
+	request := httptest.NewRequest(http.MethodPost, "/control/v1/routing-catalog/drafts/draft-a/probe", jsonBody(t, map[string]any{
+		"expected_revision": 4, "reason": "verify draft providers",
+	}))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "probe-routing-draft")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status/body = %d/%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data []providerconnection.Operation `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Data) != 1 || body.Data[0].ID != "pop-probe" {
+		t.Fatalf("probe response = %#v / %v", body, err)
+	}
+}
+
 type fakeAdministration struct {
 	create func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.CreateTenantCommand) (tenantadmin.MutationResult, error)
 	update func(context.Context, tenantadmin.ActorEnvelope, string, tenantadmin.UpdateTenantCommand) (tenantadmin.MutationResult, error)
@@ -249,13 +315,51 @@ type fakeCredentialAdministration struct {
 type fakeProviderConnectionAdministration struct {
 	register func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RegisterCommand) (providerconnection.MutationResult, error)
 	rotation func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RotationCommand) (providerconnection.OperationResult, error)
+	get      func(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error)
+	probe    func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error)
+}
+
+type fakeRoutingCatalogAdministration struct {
+	create   func(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error)
+	getDraft func(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Draft, error)
+}
+
+func (fake *fakeRoutingCatalogAdministration) CreateDraft(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error) {
+	return fake.create(ctx, actor, key, command)
+}
+func (fake *fakeRoutingCatalogAdministration) GetDraft(ctx context.Context, actor tenantadmin.ActorEnvelope, draftID string) (routingcatalog.Draft, error) {
+	return fake.getDraft(ctx, actor, draftID)
+}
+func (*fakeRoutingCatalogAdministration) UpdateDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.UpdateDraftCommand) (routingcatalog.DraftResult, error) {
+	panic("unexpected UpdateDraft")
+}
+func (*fakeRoutingCatalogAdministration) ValidateDraft(context.Context, tenantadmin.ActorEnvelope, routingcatalog.ValidateDraftCommand) (routingcatalog.DraftResult, error) {
+	panic("unexpected ValidateDraft")
+}
+func (*fakeRoutingCatalogAdministration) PublishDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.PublishDraftCommand) (routingcatalog.PublicationResult, error) {
+	panic("unexpected PublishDraft")
+}
+func (*fakeRoutingCatalogAdministration) Current(context.Context, tenantadmin.ActorEnvelope) (routingcatalog.Revision, error) {
+	panic("unexpected Current")
+}
+func (*fakeRoutingCatalogAdministration) ListRevisions(context.Context, tenantadmin.ActorEnvelope, int64, int) (routingcatalog.RevisionPage, error) {
+	panic("unexpected ListRevisions")
+}
+func (*fakeRoutingCatalogAdministration) GetRevision(context.Context, tenantadmin.ActorEnvelope, int64) (routingcatalog.Revision, error) {
+	panic("unexpected GetRevision")
+}
+func (*fakeRoutingCatalogAdministration) Restore(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.RestoreCommand) (routingcatalog.PublicationResult, error) {
+	panic("unexpected Restore")
+}
+func (*fakeRoutingCatalogAdministration) GetPublication(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Publication, error) {
+	panic("unexpected GetPublication")
 }
 
 func (fake *fakeProviderConnectionAdministration) Register(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.RegisterCommand) (providerconnection.MutationResult, error) {
 	return fake.register(ctx, actor, key, command)
 }
-func (*fakeProviderConnectionAdministration) Get(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error) {
-	panic("unexpected Get")
+func (fake *fakeProviderConnectionAdministration) Get(ctx context.Context, actor tenantadmin.ActorEnvelope, connectionID string) (providerconnection.ProviderConnection, error) {
+	return fake.get(ctx, actor, connectionID)
 }
 func (*fakeProviderConnectionAdministration) List(context.Context, tenantadmin.ActorEnvelope, providerconnection.ConnectionFilter) (providerconnection.ConnectionPage, error) {
 	panic("unexpected List")
@@ -269,8 +373,8 @@ func (*fakeProviderConnectionAdministration) Enable(context.Context, tenantadmin
 func (*fakeProviderConnectionAdministration) Disable(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.StatusCommand) (providerconnection.MutationResult, error) {
 	panic("unexpected Disable")
 }
-func (*fakeProviderConnectionAdministration) RequestProbe(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error) {
-	panic("unexpected RequestProbe")
+func (fake *fakeProviderConnectionAdministration) RequestProbe(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command providerconnection.OperationCommand) (providerconnection.OperationResult, error) {
+	return fake.probe(ctx, actor, key, command)
 }
 func (*fakeProviderConnectionAdministration) RequestDiscovery(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error) {
 	panic("unexpected RequestDiscovery")

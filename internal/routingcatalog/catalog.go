@@ -1,6 +1,7 @@
-// Package routingcatalog owns validation and assembly of the currently
-// published Model Route snapshot. It deliberately does not implement the ADR
-// 0006 draft/publication workflow.
+// Package routingcatalog owns the ADR 0006 draft, validation, immutable
+// publication, regional projection, and runtime assembly workflow for Model
+// Routes. Legacy environment-backed route parsing remains as a bounded
+// bootstrap compatibility path.
 package routingcatalog
 
 import (
@@ -158,6 +159,10 @@ func Parse(payload []byte) ([]provider.Route, error) {
 }
 
 func buildCapabilityAdapter(config RouteConfig) (*openaicapabilities.Adapter, error) {
+	return buildCapabilityAdapterWithCredential(config, os.Getenv(config.APIKeyEnv))
+}
+
+func buildCapabilityAdapterWithCredential(config RouteConfig, apiKey string) (*openaicapabilities.Adapter, error) {
 	if !declaredCapability(config.Capabilities["embeddings"]) && !declaredCapability(config.Capabilities["moderation"]) && !declaredCapability(config.Capabilities["rerank"]) {
 		return nil, nil
 	}
@@ -169,7 +174,7 @@ func buildCapabilityAdapter(config RouteConfig) (*openaicapabilities.Adapter, er
 	if !ok || profile.CapabilityExecutionSeam != provider.OpenAICompatibleSeam {
 		return nil, errors.New("Provider identity has no conformance-tested Stage A capability seam")
 	}
-	return openaicapabilities.New(openaicapabilities.Config{BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel, Headers: config.Headers, EmbeddingPath: config.EmbeddingPath, ModerationPath: config.ModerationPath, RerankPath: config.RerankPath, DefaultDimensions: config.EmbeddingDimensions})
+	return openaicapabilities.New(openaicapabilities.Config{BaseURL: config.BaseURL, APIKey: apiKey, Model: config.ProviderModel, Headers: config.Headers, EmbeddingPath: config.EmbeddingPath, ModerationPath: config.ModerationPath, RerankPath: config.RerankPath, DefaultDimensions: config.EmbeddingDimensions})
 }
 
 func declaredCapability(support provider.CapabilitySupport) bool {
@@ -177,6 +182,10 @@ func declaredCapability(support provider.CapabilitySupport) bool {
 }
 
 func BuildProviderComponentsWithHTTPClient(config RouteConfig, httpClient *http.Client) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
+	return buildProviderComponentsWithCredential(config, os.Getenv(config.APIKeyEnv), httpClient)
+}
+
+func buildProviderComponentsWithCredential(config RouteConfig, apiKey string, httpClient *http.Client) (provider.ResponseExecutor, provider.CacheProtector, provider.CacheAnchorBuilder, error) {
 	identity, err := provider.ParseIdentity(config.Provider)
 	if err != nil {
 		return nil, nil, nil, err
@@ -216,7 +225,7 @@ func BuildProviderComponentsWithHTTPClient(config RouteConfig, httpClient *http.
 			}
 			writeCostMicros = currencyMicros(cacheWriteCost)
 		}
-		adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), APIVersion: apiVersion, TTL: ttl, Model: config.ProviderModel, RouteID: config.ID, HTTPClient: httpClient, CredentialScope: config.CredentialScope, Region: config.Region, CacheWritePerMillionMicros: writeCostMicros, EnablePromptCaching: config.CacheRefresh != nil})
+		adapter, err := anthropic.NewAdapter(anthropic.AdapterConfig{BaseURL: config.BaseURL, APIKey: apiKey, APIVersion: apiVersion, TTL: ttl, Model: config.ProviderModel, RouteID: config.ID, HTTPClient: httpClient, CredentialScope: config.CredentialScope, Region: config.Region, CacheWritePerMillionMicros: writeCostMicros, EnablePromptCaching: config.CacheRefresh != nil})
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -229,11 +238,11 @@ func BuildProviderComponentsWithHTTPClient(config RouteConfig, httpClient *http.
 		return nil, nil, nil, errors.New("proactive cache refresh is enabled only for conformance-tested direct Anthropic routes")
 	}
 	if profile.ResponseExecutionSeam == provider.OpenAIResponsesSeam {
-		executor, err := openairesponses.New(openairesponses.Config{BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel, HTTPClient: httpClient, Headers: config.Headers})
+		executor, err := openairesponses.New(openairesponses.Config{BaseURL: config.BaseURL, APIKey: apiKey, Model: config.ProviderModel, HTTPClient: httpClient, Headers: config.Headers})
 		return executor, nil, nil, err
 	}
 	if profile.ResponseExecutionSeam == provider.OpenAICompatibleSeam {
-		executor, err := openaicompat.New(openaicompat.Config{BaseURL: config.BaseURL, APIKey: os.Getenv(config.APIKeyEnv), Model: config.ProviderModel, Dialect: openaicompat.Dialect(config.Provider), HTTPClient: httpClient, Headers: config.Headers})
+		executor, err := openaicompat.New(openaicompat.Config{BaseURL: config.BaseURL, APIKey: apiKey, Model: config.ProviderModel, Dialect: openaicompat.Dialect(config.Provider), HTTPClient: httpClient, Headers: config.Headers})
 		return executor, nil, nil, err
 	}
 	return nil, nil, nil, errors.New("Provider identity has no conformance-tested Response execution seam")

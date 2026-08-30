@@ -83,7 +83,7 @@ func (r *Runtime) Embed(ctx context.Context, request core.EmbeddingRequest) (str
 	}
 	routes, err := r.router.CapabilityCandidates(ctx, provider.CapabilityRouteQuery{
 		TenantID: request.TenantID, Model: request.Model, HomeRegion: request.HomeRegion, Capability: core.CapabilityEmbeddings,
-		CompatibilityMode: request.CompatibilityMode,
+		CompatibilityMode: request.CompatibilityMode, RoutingIdentity: operationID,
 	})
 	if err != nil {
 		return operationID, core.EmbeddingResult{}, fmt.Errorf("%w: %v", ErrRouteNotFound, err)
@@ -286,7 +286,7 @@ func (r *Runtime) Moderate(ctx context.Context, request core.ModerationRequest) 
 	}
 	routes, err := r.router.CapabilityCandidates(ctx, provider.CapabilityRouteQuery{
 		TenantID: request.TenantID, Model: request.Model, HomeRegion: request.HomeRegion, Capability: core.CapabilityModeration,
-		CompatibilityMode: request.CompatibilityMode,
+		CompatibilityMode: request.CompatibilityMode, RoutingIdentity: operationID,
 	})
 	if err != nil {
 		return operationID, core.ModerationResult{}, fmt.Errorf("%w: %v", ErrRouteNotFound, err)
@@ -399,7 +399,7 @@ func (r *Runtime) Rerank(ctx context.Context, request core.RerankRequest) (strin
 	}
 	routes, err := r.router.CapabilityCandidates(ctx, provider.CapabilityRouteQuery{
 		TenantID: request.TenantID, Model: request.Model, HomeRegion: request.HomeRegion, Capability: core.CapabilityRerank,
-		CompatibilityMode: request.CompatibilityMode,
+		CompatibilityMode: request.CompatibilityMode, RoutingIdentity: operationID,
 	})
 	if err != nil {
 		return operationID, core.RerankResult{}, fmt.Errorf("%w: %v", ErrRouteNotFound, err)

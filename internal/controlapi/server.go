@@ -18,6 +18,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
+	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
 )
 
@@ -53,7 +54,21 @@ type Config struct {
 	Administration      Administration
 	Credentials         CredentialAdministration
 	ProviderConnections ProviderConnectionAdministration
+	RoutingCatalog      RoutingCatalogAdministration
 	Verifier            IdentityVerifier
+}
+
+type RoutingCatalogAdministration interface {
+	CreateDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error)
+	GetDraft(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Draft, error)
+	UpdateDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.UpdateDraftCommand) (routingcatalog.DraftResult, error)
+	ValidateDraft(context.Context, tenantadmin.ActorEnvelope, routingcatalog.ValidateDraftCommand) (routingcatalog.DraftResult, error)
+	PublishDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.PublishDraftCommand) (routingcatalog.PublicationResult, error)
+	Current(context.Context, tenantadmin.ActorEnvelope) (routingcatalog.Revision, error)
+	ListRevisions(context.Context, tenantadmin.ActorEnvelope, int64, int) (routingcatalog.RevisionPage, error)
+	GetRevision(context.Context, tenantadmin.ActorEnvelope, int64) (routingcatalog.Revision, error)
+	Restore(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.RestoreCommand) (routingcatalog.PublicationResult, error)
+	GetPublication(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Publication, error)
 }
 
 type ProviderConnectionAdministration interface {
@@ -86,12 +101,13 @@ type Server struct {
 	administration      Administration
 	credentials         CredentialAdministration
 	providerConnections ProviderConnectionAdministration
+	routingCatalog      RoutingCatalogAdministration
 	verifier            IdentityVerifier
 }
 
 func New(config Config) http.Handler {
 	return &Server{administration: config.Administration, credentials: config.Credentials,
-		providerConnections: config.ProviderConnections, verifier: config.Verifier}
+		providerConnections: config.ProviderConnections, routingCatalog: config.RoutingCatalog, verifier: config.Verifier}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -117,6 +133,9 @@ func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 }
 
 func (server *Server) route(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) {
+	if server.routeRoutingCatalog(writer, request, actor) {
+		return
+	}
 	if server.routeProviderConnections(writer, request, actor) {
 		return
 	}

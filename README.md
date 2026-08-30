@@ -77,7 +77,10 @@ GATEWAY_LOCAL_REGION=us-west
 GATEWAY_HOME_REGION_URLS_JSON={"us-west":"https://us-west.gateway.example","eu-west":"https://eu-west.gateway.example"}
 GATEWAY_TRUSTED_PROXY_CIDRS=10.0.0.0/8,2001:db8::/32
 GATEWAY_CACHE_PROTECTION_MODE=off
-GATEWAY_ROUTES_JSON=[...]
+GATEWAY_ROUTING_CATALOG=true
+GATEWAY_ID=gateway-us-west-1
+GATEWAY_SECRET_CUSTODY_BACKEND=gcp-secret-manager
+GATEWAY_GCP_SECRET_PROJECT=provider-secret-project
 ```
 
 The Tenant Administration control plane is a separate process and requires a
@@ -99,8 +102,9 @@ CONTROL_GCP_SECRET_PROJECT=provider-secret-project
 Run schema migration as a separate owner job, then apply least-privilege grants
 with `make configure-tenant-admin-roles ADMIN_DATABASE_URL=... TENANT_ADMIN_DB_ROLE=... GATEWAY_DB_ROLE=...`.
 The control-plane runtime refuses in-process production migration and verifies
-its connected role. The Gateway role reads immutable schema-version-2 control
-events and owns only its local Access Projection tables; it receives no read
+its connected role. The Gateway role reads immutable control events and owns
+only its local Access and Routing Catalog projection tables plus rollout
+receipts; it receives no read
 access to authoritative Tenant or Gateway API Key tables. Production refuses to
 start unless `GATEWAY_ACCESS_PROJECTION=true`. Both production processes require
 the transport attestation and reject PostgreSQL configurations that are not
@@ -111,8 +115,9 @@ by ADR 0008; this process does not claim readiness before those checks exist.
 Tenant mutations atomically append `control_outbox`; that is durable enqueue,
 not delivery proof. The initial shared-PostgreSQL consumer applies events through
 an inbox and aggregate revisions, reports gaps and lag in structured logs, and
-supports atomic snapshot repair. External relay delivery, receipts, alerts, and
-readiness gates are implemented by ADR 0008 before physical database separation.
+supports atomic snapshot repair. Authenticated external relay delivery,
+cross-database Gateway identity, alerts, and readiness gates are implemented by
+ADR 0008 before physical database separation.
 
 Provider Connection Administration stores upstream credentials in GCP Secret
 Manager through Workload Identity. PostgreSQL stores only the Secret Manager
@@ -182,18 +187,77 @@ revision, pending delivery lag, and revocation-specific apply time/lag. Producti
 startup fails when either authoritative state or a regional projection still has
 an active key whose digest pepper version is absent from the configured ring.
 
-Each route declares its public model, provider model, execution/home region,
-credential scope, versioned Capability Profile, and prices. Provider Connections
-now own managed upstream credentials; the current pre-ADR-0006 route bootstrap
-still uses `api_key_env` until Routing Catalog publication is migrated to
-connection references. Creating or discovering a Provider Connection never
-makes a model routable. Credentials are read server-side and are never returned
-by the management API. The `provider` value must be one of `openai`, `deepseek`,
-`anthropic`, or `gemini`; route publication fails for any other value.
+Each managed route declares its public/provider model, Provider Connection,
+execution/Home Region, versioned Capability Profile, immutable Provider Cost
+Snapshot, administrative status, selection policy, explicit Tenant visibility,
+and cache policy. Creating or discovering a Provider Connection never makes a
+model routable. Credentials are resolved from Secret Custody at the Gateway and
+are never embedded in a Catalog or returned by the management API. The Provider
+identity must be one of `openai`, `deepseek`, `anthropic`, or `gemini`.
+
+Routing Catalog changes use complete drafts instead of CRUD against active
+routes. `validate` is side-effect free; optional `probe` delegates one
+deduplicated operation per referenced Provider Connection to the separately
+authorized, budgeted Provider operation queue. Publish uses the draft base
+revision as CAS, creates an immutable revision, and emits
+`RoutingCatalogPublished`. Restore copies an old document into a new
+monotonically increasing revision. Gateways compile a complete snapshot before
+atomic replacement, retain the last valid revision on rejection, and write a
+per-Gateway regional inbox observation. A control-plane collector is the only
+component that promotes those observations into authoritative rollout receipts
+and publication status. Within a priority, weight uses stable weighted
+ordering; `max_concurrency` shares one permit pool across the route's Response
+and capability executors. `draining` rejects new assignments while preserving
+explicit pinned execution.
+
+Example managed Catalog document:
+
+```json
+{
+  "routes": [{
+    "route_id": "openai-us-primary",
+    "public_model": "gateway-model",
+    "provider_connection_id": "pc-openai-us",
+    "provider_model": "provider-model-id",
+    "execution_region": "us-west",
+    "home_region": "us-west",
+    "capability_profile_revision": 1,
+    "capabilities": {"text": "native", "streaming": "native"},
+    "provider_cost_snapshot": {
+      "id": "provider-model-usd-2026-08-29",
+      "provider": "openai",
+      "model": "provider-model-id",
+      "region": "us-west",
+      "currency": "USD",
+      "input_per_million_micros": 1000000,
+      "cached_input_per_million_micros": 100000,
+      "cache_write_per_million_micros": 0,
+      "output_per_million_micros": 4000000,
+      "effective_at": 1787961600,
+      "source": "provider-contract-2026-08-29"
+    },
+    "administrative_status": "active",
+    "selection_policy": {"priority": 10, "weight": 100, "max_concurrency": 32, "sticky_routing_eligible": true},
+    "tenant_visibility_policy": {"tenant_ids": ["tenant-a"], "limit_policy_revisions": {"tenant-a": 1}},
+    "cache_usage_reliable": true,
+    "cache_protection_policy": {"enabled": false}
+  }]
+}
+```
+
+Visibility must explicitly declare either `tenant_ids` or `all_tenants: true`;
+each listed Tenant also pins an immutable `limit_policy_revisions` entry.
+Publish revalidates current Provider Connection state so a connection changed
+after draft validation cannot slip into an active revision.
 
 OpenAI uses its native Responses API so Codex fields, reasoning replay, namespace tools, and client-owned tool loops remain lossless. DeepSeek and Gemini use their OpenAI-compatible Chat Completions surfaces behind the shared adapter. Anthropic uses its native Messages API so Claude-specific streaming, usage, and prompt-cache evidence remain explicit.
 
-With PostgreSQL, `model_routes` is loaded from immutable `configuration_history` revisions and projected into an atomic in-process snapshot. Set `GATEWAY_BOOTSTRAP_ROUTES=true` only for the first revision. Later publications require `GATEWAY_PUBLISH_ROUTES=true`, explicit expected/new revisions, and an actor; stale CAS publications fail without replacing the live snapshot.
+When `GATEWAY_ROUTING_CATALOG` is not enabled, the legacy PostgreSQL bootstrap
+still loads `model_routes` from `configuration_history` and uses `api_key_env`.
+Set `GATEWAY_BOOTSTRAP_ROUTES=true` only for its first revision. Later legacy
+publications require `GATEWAY_PUBLISH_ROUTES=true`, explicit expected/new
+revisions, and an actor. This compatibility path is not the managed production
+credential flow.
 
 Example route:
 
@@ -272,7 +336,7 @@ The direct adapter uses one serializer for live execution, Cache Anchors, and ze
 
 Strict compatibility is the default. A feature classified as `translated` is considered only when the request sets `compatibility_mode` to `best_effort`; `unsupported` or undeclared features are rejected instead of silently dropped.
 
-Stage A uses narrow `EmbeddingExecutor`, `ModerationExecutor`, and `RerankExecutor` seams. Route configuration never infers one capability from another: `/v1/capabilities` publishes only healthy, Home Region-compatible declarations usable by the authenticated Tenant. `tenant_ids` is an optional route allowlist; omitting it makes the route available to every Tenant in that Home Region. The production HTTP adapter uses the configured Provider model and paths while returning the public model ID, with a bounded upstream request timeout. Offline conformance tests cover bearer/header forwarding, wire shapes, normalized usage, timeout/error classification, and content-free evidence.
+Stage A uses narrow `EmbeddingExecutor`, `ModerationExecutor`, and `RerankExecutor` seams. Route configuration never infers one capability from another: `/v1/capabilities` publishes only healthy, Home Region-compatible declarations usable by the authenticated Tenant. Managed Catalog visibility is always explicit; only the legacy route format treats omitted `tenant_ids` as global. The production HTTP adapter uses the configured Provider model and paths while returning the public model ID, with a bounded upstream request timeout. Offline conformance tests cover bearer/header forwarding, wire shapes, normalized usage, timeout/error classification, and content-free evidence.
 
 Capability requests reserve RPM and spend before the Provider call. Limit Policies can additionally set `embedding_input_units`, `rerank_documents`, and `capability_spend_micros`; Tenant/key intersection remains most restrictive. `capability_usage_ledger` is an immutable, content-free financial ledger with a separate daily projection. It stores counts, dimensions, document totals, raw Provider usage, price snapshot identity, and spend—but never vectors, moderation inputs/results, rerank queries, or documents. Ambiguous Provider outcomes keep their reservation `uncertain`.
 
@@ -314,6 +378,13 @@ model discovery, credential rotation, operation polling, and secret non-echo:
 
 ```sh
 make test-provider-connection-blackbox
+```
+
+Exercise Routing Catalog draft, deterministic validation, delegated probe,
+immutable publish/history, and restore:
+
+```sh
+make test-routing-catalog-blackbox
 ```
 
 The control-plane development process uses deterministic Secret Custody and

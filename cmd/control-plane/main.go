@@ -24,6 +24,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
 	"github.com/toddzheng/llm-gateway/internal/providerconnection"
+	"github.com/toddzheng/llm-gateway/internal/routingcatalog"
 	"github.com/toddzheng/llm-gateway/internal/secretcustody"
 	"github.com/toddzheng/llm-gateway/internal/telemetry"
 	"github.com/toddzheng/llm-gateway/internal/tenantadmin"
@@ -95,6 +96,9 @@ func run() error {
 		if err := providerconnection.Migrate(ctx, database); err != nil {
 			return err
 		}
+		if err := routingcatalog.Migrate(ctx, database); err != nil {
+			return err
+		}
 	}
 	administration, err := tenantadmin.NewService(database, time.Now)
 	if err != nil {
@@ -135,11 +139,20 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Provider Connection Registry: %w", err)
 	}
+	connectionLookup, err := routingcatalog.NewPostgresConnectionLookup(database)
+	if err != nil {
+		return err
+	}
+	routingCatalog, err := routingcatalog.NewService(database, connectionLookup, time.Now, nil)
+	if err != nil {
+		return fmt.Errorf("configure Routing Catalog Administration: %w", err)
+	}
 	go runGatewayAPIKeyGraceReconciler(ctx, credentials)
 	go runProviderOperationWorker(ctx, providerConnections)
+	go runRoutingCatalogReceiptCollector(ctx, routingCatalog)
 	api := controlapi.New(controlapi.Config{
 		Administration: administration, Credentials: credentials,
-		ProviderConnections: providerConnections, Verifier: verifier,
+		ProviderConnections: providerConnections, RoutingCatalog: routingCatalog, Verifier: verifier,
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/", api)
@@ -227,6 +240,34 @@ func runProviderOperationWorker(ctx context.Context, service *providerconnection
 	}
 	run()
 	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+func runRoutingCatalogReceiptCollector(ctx context.Context, service *routingcatalog.Service) {
+	run := func() {
+		for count := 0; count < 256; count++ {
+			worked, err := service.CollectNextRolloutReceipt(ctx)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Warn("Routing Catalog receipt collection degraded", "error", err)
+				}
+				return
+			}
+			if !worked {
+				return
+			}
+		}
+	}
+	run()
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
