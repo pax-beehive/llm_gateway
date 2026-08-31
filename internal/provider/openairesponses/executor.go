@@ -58,7 +58,7 @@ func New(config Config) (*Executor, error) {
 
 func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.EventStream, error) {
 	payload := map[string]any{
-		"model": e.model, "input": request.Input, "stream": true, "store": false,
+		"model": e.model, "input": providerInput(request.Input), "stream": true, "store": false,
 	}
 	tools, err := normalizeTools(request.Tools)
 	if err != nil {
@@ -133,6 +133,19 @@ func (e *Executor) Execute(ctx context.Context, request core.Request) (provider.
 		return nil, fmt.Errorf("provider status %d: %s", httpResponse.StatusCode, strings.TrimSpace(string(errorBody)))
 	}
 	return newStream(httpResponse.Body), nil
+}
+
+func providerInput(items []core.Item) []core.Item {
+	input := append([]core.Item(nil), items...)
+	for index := range input {
+		// item_* identifiers are Gateway persistence identities. OpenAI validates
+		// input identifiers by item kind, so only provider-originated IDs may cross
+		// this boundary (for example msg_* and fc_* from a previous response).
+		if strings.HasPrefix(input[index].ID, "item_") {
+			input[index].ID = ""
+		}
+	}
+	return input
 }
 
 func copyRaw(payload map[string]any, key string, raw any) {

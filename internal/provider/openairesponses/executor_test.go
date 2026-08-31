@@ -33,8 +33,14 @@ func TestExecutorPreservesCodexResponsesFieldsAndNormalizesEvents(t *testing.T) 
 			t.Fatalf("Codex fields = %#v", payload)
 		}
 		input := payload["input"].([]any)
+		if _, exists := input[0].(map[string]any)["id"]; exists {
+			t.Fatalf("Gateway persistence ID leaked to provider: %#v", input[0])
+		}
 		if input[1].(map[string]any)["arguments"] != `{"path":"state.txt"}` {
 			t.Fatalf("function arguments = %#v", input[1])
+		}
+		if input[1].(map[string]any)["id"] != "fc-upstream" {
+			t.Fatalf("provider-originated ID was not preserved: %#v", input[1])
 		}
 		body := strings.Join([]string{
 			`event: response.created`, `data: {"type":"response.created","response":{"id":"upstream"}}`, ``,
@@ -54,8 +60,8 @@ func TestExecutorPreservesCodexResponsesFieldsAndNormalizesEvents(t *testing.T) 
 	parallel := true
 	stream, err := executor.Execute(context.Background(), core.Request{
 		Input: []core.Item{
-			{Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "inspect"}}},
-			{Type: "function_call", CallID: "old-call", Name: "read", Arguments: json.RawMessage(`{"path":"state.txt"}`)},
+			{ID: "item_gateway-internal", Type: "message", Role: "user", Content: []core.Content{{Type: "input_text", Text: "inspect"}}},
+			{ID: "fc-upstream", Type: "function_call", CallID: "old-call", Name: "read", Arguments: json.RawMessage(`{"path":"state.txt"}`)},
 		},
 		Tools:      []json.RawMessage{json.RawMessage(`{"type":"function","name":"exec_command","parameters":{"type":"object"}}`)},
 		ToolChoice: json.RawMessage(`"auto"`), ParallelToolCalls: &parallel,
