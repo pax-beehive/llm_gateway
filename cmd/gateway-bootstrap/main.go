@@ -95,8 +95,12 @@ func run(parent context.Context) error {
 	}
 	defer cleanupTransport()
 	defer database.Close()
-	database.SetMaxOpenConns(1)
-	database.SetMaxIdleConns(1)
+	// Routing Catalog validation holds a transaction while its Provider
+	// Connection lookup executes through the shared database handle. Keep a
+	// second connection available so the lookup cannot self-deadlock behind the
+	// validating transaction.
+	database.SetMaxOpenConns(2)
+	database.SetMaxIdleConns(2)
 	if err := database.PingContext(ctx); err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
 	}
