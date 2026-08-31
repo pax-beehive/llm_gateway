@@ -15,6 +15,15 @@ Plane and Metering Cloud Run services. The Gateway resource remains gated by
 Tenant, and Gateway API key have been published. This stage does not create
 public DNS or a load balancer.
 
+The services use an isolated regional VPC and Direct VPC egress with
+`ALL_TRAFFIC`. Private Google Access makes same-project Cloud Run calls count
+as internal and keeps Google API access on Google's network; Cloud NAT provides
+the controlled outbound path required by future LLM Provider calls. The
+`10.90.0.0/24` launch subnet covers the bounded first-region revision overlap
+and must be revisited with measured scaling before raising service maxima. NAT
+logs retain errors only so egress failures remain diagnosable without recording
+every Provider connection.
+
 ```sh
 cp infra/gcp/backend.hcl.example infra/gcp/backend.hcl
 terraform -chdir=infra/gcp init -backend-config=backend.hcl

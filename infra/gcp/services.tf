@@ -23,6 +23,15 @@ resource "google_cloud_run_v2_service" "control_plane" {
       max_instance_count = 10
     }
 
+    vpc_access {
+      egress = "ALL_TRAFFIC"
+      network_interfaces {
+        network    = google_compute_network.runtime.name
+        subnetwork = google_compute_subnetwork.runtime.name
+        tags       = ["llm-gateway-control"]
+      }
+    }
+
     containers {
       image = var.control_plane_image
 
@@ -185,6 +194,15 @@ resource "google_cloud_run_v2_service" "metering" {
     scaling {
       min_instance_count = 1
       max_instance_count = 5
+    }
+
+    vpc_access {
+      egress = "ALL_TRAFFIC"
+      network_interfaces {
+        network    = google_compute_network.runtime.name
+        subnetwork = google_compute_subnetwork.runtime.name
+        tags       = ["llm-gateway-metering"]
+      }
     }
 
     containers {
@@ -355,6 +373,15 @@ resource "google_cloud_run_v2_service" "gateway" {
     scaling {
       min_instance_count = 3
       max_instance_count = 30
+    }
+
+    vpc_access {
+      egress = "ALL_TRAFFIC"
+      network_interfaces {
+        network    = google_compute_network.runtime.name
+        subnetwork = google_compute_subnetwork.runtime.name
+        tags       = ["llm-gateway-data-plane"]
+      }
     }
 
     containers {
