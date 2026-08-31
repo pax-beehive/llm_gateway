@@ -146,7 +146,7 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 		var homeRegion string
 		var executionEpoch int64
 		if err := tx.QueryRowContext(ctx, `
-			SELECT home_region, execution_epoch FROM tenants WHERE id = $1 FOR SHARE`, request.TenantID).Scan(
+			SELECT home_region, execution_epoch FROM gateway_lock_tenant_fence($1)`, request.TenantID).Scan(
 			&homeRegion, &executionEpoch,
 		); errors.Is(err, sql.ErrNoRows) {
 			return Reservation{}, errors.New("capability quota writer fencing conflict")

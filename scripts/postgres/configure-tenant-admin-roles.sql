@@ -51,7 +51,8 @@ SELECT EXISTS (
         'gateway_access_heads'::regclass,
         'gateway_access_gaps'::regclass,
         'gateway_access_rollout_receipts'::regclass,
-        'gateway_access_response_slots'::regclass
+        'gateway_access_response_slots'::regclass,
+        'gateway_tenant_fences'::regclass
     ) AND owner.rolname = :'gateway_role'
 ) AS gateway_owns_control_tables \gset
 \if :gateway_owns_control_tables
@@ -146,6 +147,38 @@ FROM :"tenant_admin_role", :"gateway_role";
 REVOKE ALL PRIVILEGES ON SEQUENCE control_outbox_delivery_sequence_seq
 FROM PUBLIC, :"tenant_admin_role", :"gateway_role";
 
+REVOKE ALL PRIVILEGES ON TABLE
+    conversations,
+    responses,
+    response_events,
+    conversation_items,
+    idempotency_keys,
+    provider_price_snapshots,
+    usage_ledger,
+    cache_leases,
+    cache_refresh_intents,
+    savings_ledger,
+    transactional_outbox,
+    cache_refresh_usage_ledger,
+    cache_refresh_continuation_budgets,
+    tenant_response_slots,
+    tenant_quota_counters,
+    api_key_quota_counters,
+    quota_reservations,
+    tenant_usage_daily,
+    api_key_usage_daily,
+    api_key_refresh_usage_daily,
+    capability_usage_ledger,
+    capability_usage_daily,
+    gateway_tenant_fences
+FROM PUBLIC, :"tenant_admin_role", :"gateway_role";
+
+REVOKE ALL PRIVILEGES ON SEQUENCE transactional_outbox_id_seq
+FROM PUBLIC, :"tenant_admin_role", :"gateway_role";
+
+REVOKE ALL PRIVILEGES ON FUNCTION gateway_lock_tenant_fence(text)
+FROM PUBLIC, :"tenant_admin_role", :"gateway_role";
+
 GRANT SELECT, INSERT ON TABLE tenants TO :"tenant_admin_role";
 GRANT UPDATE (
     display_name,
@@ -211,6 +244,33 @@ FROM PUBLIC, :"tenant_admin_role";
 GRANT SELECT ON TABLE tenant_quota_counters,api_key_quota_counters,quota_reservations TO :"tenant_admin_role";
 
 GRANT SELECT ON TABLE gateway_schema_metadata TO :"gateway_role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+    conversations,
+    responses,
+    response_events,
+    conversation_items,
+    idempotency_keys,
+    provider_price_snapshots,
+    usage_ledger,
+    cache_leases,
+    cache_refresh_intents,
+    savings_ledger,
+    transactional_outbox,
+    cache_refresh_usage_ledger,
+    cache_refresh_continuation_budgets,
+    tenant_response_slots,
+    tenant_quota_counters,
+    api_key_quota_counters,
+    quota_reservations,
+    tenant_usage_daily,
+    api_key_usage_daily,
+    api_key_refresh_usage_daily,
+    capability_usage_ledger,
+    capability_usage_daily
+TO :"gateway_role";
+GRANT SELECT ON TABLE gateway_tenant_fences TO :"gateway_role";
+GRANT EXECUTE ON FUNCTION gateway_lock_tenant_fence(text) TO :"gateway_role";
+GRANT USAGE, SELECT ON SEQUENCE transactional_outbox_id_seq TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_history TO :"gateway_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE gateway_routing_catalog_head TO :"gateway_role";
 GRANT SELECT, INSERT ON TABLE gateway_routing_catalog_inbox TO :"gateway_role";

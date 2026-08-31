@@ -114,8 +114,8 @@ func (s *PostgresResponseStore) AssertCapabilityWriter(ctx context.Context, tena
 	var exists bool
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM tenants
-			WHERE id = $1 AND home_region = $2 AND execution_epoch = $3
+			SELECT 1 FROM gateway_tenant_fences
+			WHERE tenant_id = $1 AND home_region = $2 AND execution_epoch = $3
 		)`, tenantID, homeRegion, executionEpoch).Scan(&exists); err != nil {
 		return err
 	}
@@ -370,7 +370,7 @@ func (s *PostgresResponseStore) getResponse(ctx context.Context, tenantID, respo
 		result, err := tx.ExecContext(ctx, `
 			UPDATE responses SET revision = $4, payload = $5, updated_at = now()
 			WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
-			  AND EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND home_region = $6)`,
+			  AND EXISTS (SELECT 1 FROM gateway_tenant_fences WHERE tenant_id = $1 AND home_region = $6)`,
 			tenantID, responseID, response.Revision, redacted.Revision, redactedPayload, scrubRegion)
 		if err != nil {
 			return core.Response{}, err
@@ -430,7 +430,7 @@ func (s *PostgresResponseStore) ScrubExpiredContent(ctx context.Context, homeReg
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.tenant_id, r.id
 		FROM responses r
-		JOIN tenants t ON t.id = r.tenant_id AND t.home_region = $1
+		JOIN gateway_tenant_fences t ON t.tenant_id = r.tenant_id AND t.home_region = $1
 		WHERE r.deleted_at IS NULL
 		  AND r.status IN ('completed', 'failed', 'cancelled')
 		  AND r.payload ? 'content_expires_at'
@@ -484,7 +484,7 @@ func (s *PostgresResponseStore) Update(ctx context.Context, tenantID string, res
 		SET status = $4, revision = $5, payload = $6, updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
 		  AND execution_epoch = $7
-		  AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = $1 AND t.home_region = $8 AND t.execution_epoch = $7)`,
+		  AND EXISTS (SELECT 1 FROM gateway_tenant_fences t WHERE t.tenant_id = $1 AND t.home_region = $8 AND t.execution_epoch = $7)`,
 		tenantID, response.ID, expectedRevision, response.Status, response.Revision, payload,
 		response.ExecutionEpoch, response.HomeRegion,
 	)
@@ -536,7 +536,7 @@ func (s *PostgresResponseStore) FinalizeWithUsage(ctx context.Context, tenantID 
 		SET status = $4, revision = $5, payload = $6, updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
 		  AND execution_epoch = $7
-		  AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = $1 AND t.home_region = $8 AND t.execution_epoch = $7)`,
+		  AND EXISTS (SELECT 1 FROM gateway_tenant_fences t WHERE t.tenant_id = $1 AND t.home_region = $8 AND t.execution_epoch = $7)`,
 		tenantID, response.ID, expectedRevision, response.Status, response.Revision, payload,
 		response.ExecutionEpoch, response.HomeRegion,
 	)
@@ -891,7 +891,7 @@ func (s *PostgresResponseStore) Delete(ctx context.Context, tenantID, responseID
 		UPDATE responses
 		SET status = $4, revision = $5, payload = $6, deleted_at = now(), updated_at = now()
 		WHERE tenant_id = $1 AND id = $2 AND revision = $3 AND deleted_at IS NULL
-		  AND execution_epoch = (SELECT execution_epoch FROM tenants WHERE id = $1)`,
+		  AND execution_epoch = (SELECT execution_epoch FROM gateway_tenant_fences WHERE tenant_id = $1)`,
 		tenantID, responseID, expectedRevision, core.ResponseStatusDeleted, newRevision, payload,
 	)
 	if err != nil {
@@ -1119,7 +1119,7 @@ func lockConversation(ctx context.Context, tx *sql.Tx, tenantID, conversationID 
 		SELECT c.id, extract(epoch FROM c.created_at)::bigint, c.home_region, c.execution_epoch, c.revision,
 		       COALESCE(c.active_response_id, ''), c.metadata
 		FROM conversations c
-		JOIN tenants t ON t.id = c.tenant_id AND t.home_region = c.home_region AND t.execution_epoch = c.execution_epoch
+		JOIN gateway_tenant_fences t ON t.tenant_id = c.tenant_id AND t.home_region = c.home_region AND t.execution_epoch = c.execution_epoch
 		WHERE c.tenant_id = $1 AND c.id = $2 AND c.deleted_at IS NULL
 		FOR UPDATE`, tenantID, conversationID).Scan(
 		&conversation.ID, &conversation.CreatedAt, &conversation.HomeRegion, &conversation.ExecutionEpoch, &conversation.Revision,
@@ -1160,7 +1160,7 @@ func assertTenantWriter(ctx context.Context, tx *sql.Tx, tenantID, homeRegion st
 	var currentHomeRegion string
 	var currentExecutionEpoch int64
 	if err := tx.QueryRowContext(ctx, `
-		SELECT home_region, execution_epoch FROM tenants WHERE id = $1 FOR SHARE`, tenantID).Scan(
+		SELECT home_region, execution_epoch FROM gateway_lock_tenant_fence($1)`, tenantID).Scan(
 		&currentHomeRegion, &currentExecutionEpoch,
 	); errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: tenant home-region writer fencing conflict", ErrConflict)

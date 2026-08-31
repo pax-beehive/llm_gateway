@@ -13,6 +13,11 @@ INSERT INTO control_outbox (
 ) VALUES ('role-test-region-head',2,'Tenant','role-test-tenant',1,NULL,'TenantCreated',now(),'{"home_region":"role-test-region"}');
 RESET ROLE;
 
+SET LOCAL ROLE llm_gateway_runtime_test;
+SELECT home_region, execution_epoch
+FROM gateway_lock_tenant_fence('role-test-tenant');
+RESET ROLE;
+
 DO $$
 BEGIN
     IF NOT has_table_privilege('llm_gateway_tenant_admin_test', 'tenants', 'INSERT')
@@ -42,6 +47,15 @@ BEGIN
 	   OR has_table_privilege('llm_gateway_runtime_test', 'operations_metering_heartbeats', 'SELECT')
 	   OR has_table_privilege('llm_gateway_runtime_test', 'operations_access_rollout_receipts', 'INSERT')
 	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_schema_metadata', 'SELECT')
+	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_tenant_fences', 'SELECT')
+	   OR NOT has_function_privilege('llm_gateway_runtime_test', 'gateway_lock_tenant_fence(text)', 'EXECUTE')
+	   OR has_function_privilege('llm_gateway_tenant_admin_test', 'gateway_lock_tenant_fence(text)', 'EXECUTE')
+	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'responses', 'INSERT')
+	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'responses', 'UPDATE')
+	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'quota_reservations', 'SELECT')
+	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'quota_reservations', 'INSERT')
+	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'transactional_outbox', 'INSERT')
+	   OR NOT has_sequence_privilege('llm_gateway_runtime_test', 'transactional_outbox_id_seq', 'USAGE')
 	   OR NOT has_table_privilege('llm_gateway_runtime_test', 'gateway_routing_catalog_inbox', 'INSERT')
 	   OR has_table_privilege('llm_gateway_runtime_test', 'gateway_routing_catalog_inbox', 'UPDATE')
 	   OR has_table_privilege('llm_gateway_runtime_test', 'gateway_routing_catalog_inbox', 'DELETE')

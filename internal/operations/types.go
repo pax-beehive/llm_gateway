@@ -12,8 +12,8 @@ const (
 	CurrentObservationVersion         = 3
 	MinimumObservationVersion         = 2
 	CurrentMeteringObservationVersion = 1
-	CurrentDatabaseSchema             = 24
-	MinimumDatabaseSchema             = 23
+	CurrentDatabaseSchema             = 25
+	MinimumDatabaseSchema             = 24
 )
 
 type CheckResult struct {

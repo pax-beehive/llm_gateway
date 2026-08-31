@@ -111,7 +111,7 @@ func ObserveGateway(ctx context.Context, database *sql.DB, gatewayID, region, bu
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM cache_refresh_intents WHERE status='planned' AND scheduled_for<=now()`).Scan(&observation.Backlogs.CacheRefreshDueBacklog); err != nil {
 		return GatewayObservation{}, err
 	}
-	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM responses r JOIN tenants t ON t.id=r.tenant_id AND t.home_region=$1
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM responses r JOIN gateway_tenant_fences t ON t.tenant_id=r.tenant_id AND t.home_region=$1
 		WHERE r.deleted_at IS NULL AND r.status IN ('completed','failed','cancelled') AND r.payload?'content_expires_at'
 		AND (r.payload->>'content_expires_at')::bigint<=extract(epoch FROM now())::bigint`, region).Scan(&observation.Backlogs.RetentionScrubBacklog); err != nil {
 		return GatewayObservation{}, err
