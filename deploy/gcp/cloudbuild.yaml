@@ -10,6 +10,8 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args: ["build", "--target", "service", "--build-arg", "SERVICE=provider-bootstrap", "--build-arg", "SOURCE_REVISION=${_SOURCE_REVISION}", "--tag", "${_REPOSITORY}/provider-bootstrap:${_SOURCE_REVISION}", "."]
   - name: gcr.io/cloud-builders/docker
+    args: ["build", "--target", "service", "--build-arg", "SERVICE=gateway-bootstrap", "--build-arg", "SOURCE_REVISION=${_SOURCE_REVISION}", "--tag", "${_REPOSITORY}/gateway-bootstrap:${_SOURCE_REVISION}", "."]
+  - name: gcr.io/cloud-builders/docker
     args: ["build", "--target", "role-config", "--tag", "${_REPOSITORY}/role-config:${_SOURCE_REVISION}", "."]
 images:
   - "${_REPOSITORY}/gateway:${_SOURCE_REVISION}"
@@ -17,6 +19,7 @@ images:
   - "${_REPOSITORY}/metering:${_SOURCE_REVISION}"
   - "${_REPOSITORY}/schema-migrate:${_SOURCE_REVISION}"
   - "${_REPOSITORY}/provider-bootstrap:${_SOURCE_REVISION}"
+  - "${_REPOSITORY}/gateway-bootstrap:${_SOURCE_REVISION}"
   - "${_REPOSITORY}/role-config:${_SOURCE_REVISION}"
 options:
   logging: CLOUD_LOGGING_ONLY

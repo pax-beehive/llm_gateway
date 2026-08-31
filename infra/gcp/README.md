@@ -24,6 +24,16 @@ and must be revisited with measured scaling before raising service maxima. NAT
 logs retain errors only so egress failures remain diagnosable without recording
 every Provider connection.
 
+Before setting `gateway_service_enabled=true`, run the immutable
+`gateway-bootstrap` image as a one-shot private Cloud Run Job with the Control
+Plane service account and database role. It creates the bounded
+`tenant-gateway-canary` Tenant, issues a one-time Gateway API key into a
+pre-created Secret Manager secret, and publishes the single-Tenant
+`gpt-5.6-luna` Routing Catalog revision. The canary limits each request to
+4,096 input tokens, 256 output tokens, and USD 0.005, with USD 0.10 daily and
+USD 1.00 monthly spend ceilings. The Job is idempotent and refuses to replace
+an unrelated active Routing Catalog.
+
 ```sh
 cp infra/gcp/backend.hcl.example infra/gcp/backend.hcl
 terraform -chdir=infra/gcp init -backend-config=backend.hcl

@@ -109,6 +109,7 @@ control_plane_digest=$(resolve_digest control-plane)
 metering_digest=$(resolve_digest metering)
 schema_migrate_digest=$(resolve_digest schema-migrate)
 provider_bootstrap_digest=$(resolve_digest provider-bootstrap)
+gateway_bootstrap_digest=$(resolve_digest gateway-bootstrap)
 role_config_digest=$(resolve_digest role-config)
 
 schema_migrate_image="$GCP_ARTIFACT_REPOSITORY/schema-migrate@$schema_migrate_digest"
@@ -193,6 +194,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'metering_digest=%s\n' "$metering_digest"
     printf 'schema_migrate_digest=%s\n' "$schema_migrate_digest"
     printf 'provider_bootstrap_digest=%s\n' "$provider_bootstrap_digest"
+    printf 'gateway_bootstrap_digest=%s\n' "$gateway_bootstrap_digest"
     printf 'role_config_digest=%s\n' "$role_config_digest"
     printf 'migration_execution=%s\n' "$migration_execution"
     printf 'role_config_execution=%s\n' "$role_config_execution"
@@ -213,6 +215,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "- Metering: \`$metering_digest\`"
     echo "- Schema migration: \`$schema_migrate_digest\`"
     echo "- Provider bootstrap: \`$provider_bootstrap_digest\`"
+    echo "- Gateway bootstrap: \`$gateway_bootstrap_digest\`"
     echo "- Role configuration: \`$role_config_digest\`"
     echo "- Migration execution: \`$migration_execution\`"
     echo "- Role configuration execution: \`$role_config_execution\`"
