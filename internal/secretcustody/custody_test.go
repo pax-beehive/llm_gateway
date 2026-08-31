@@ -49,13 +49,15 @@ func TestGCPSecretManagerStoresAndAccessesVersionWithoutLeakingErrorBodies(t *te
 				t.Fatalf("version payload = %s", body)
 			}
 			secretName := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/v1/"), ":addVersion")
-			return response(request, http.StatusOK, `{"name":"`+secretName+`/versions/7"}`), nil
+			responseName := strings.Replace(secretName, "projects/project-a", "projects/1033887361474", 1)
+			return response(request, http.StatusOK, `{"name":"`+responseName+`/versions/7"}`), nil
 		case 3:
 			if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/versions/7:access") {
 				t.Fatalf("access request = %s %s", request.Method, request.URL.String())
 			}
 			secretName := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, "/v1/"), "/versions/7:access")
-			return response(request, http.StatusOK, `{"name":"`+secretName+`/versions/7","payload":{"data":"`+base64.StdEncoding.EncodeToString(material)+`"}}`), nil
+			responseName := strings.Replace(secretName, "projects/project-a", "projects/1033887361474", 1)
+			return response(request, http.StatusOK, `{"name":"`+responseName+`/versions/7","payload":{"data":"`+base64.StdEncoding.EncodeToString(material)+`"}}`), nil
 		default:
 			t.Fatalf("unexpected request %s", request.URL.String())
 			return nil, nil
@@ -71,6 +73,9 @@ func TestGCPSecretManagerStoresAndAccessesVersionWithoutLeakingErrorBodies(t *te
 	reference, err := store.Put(context.Background(), "stable-key", material)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.HasPrefix(reference.Name, "projects/project-a/secrets/") || reference.Version != "7" {
+		t.Fatalf("canonical reference = %#v", reference)
 	}
 	got, err := store.Access(context.Background(), reference)
 	if err != nil || string(got) != string(material) {

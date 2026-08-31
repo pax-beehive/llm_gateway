@@ -159,15 +159,34 @@ func (store *GCP) access(ctx context.Context, reference Reference) (Reference, [
 
 func immutableReference(secretName, versionName string) (Reference, error) {
 	prefix := secretName + "/versions/"
-	if !strings.HasPrefix(versionName, prefix) {
-		return Reference{}, ErrNotFound
+	version := ""
+	if strings.HasPrefix(versionName, prefix) {
+		version = strings.TrimPrefix(versionName, prefix)
+	} else {
+		secretIndex := strings.Index(secretName, "/secrets/")
+		projectPrefix := "projects/"
+		if secretIndex < len(projectPrefix) || !strings.HasPrefix(versionName, projectPrefix) {
+			return Reference{}, ErrNotFound
+		}
+		projectEnd := strings.IndexByte(versionName[len(projectPrefix):], '/')
+		if projectEnd <= 0 {
+			return Reference{}, ErrNotFound
+		}
+		projectEnd += len(projectPrefix)
+		if !resourceNamePart(versionName[len(projectPrefix):projectEnd]) {
+			return Reference{}, ErrNotFound
+		}
+		suffix := secretName[secretIndex:] + "/versions/"
+		if !strings.HasPrefix(versionName[projectEnd:], suffix) {
+			return Reference{}, ErrNotFound
+		}
+		version = strings.TrimPrefix(versionName[projectEnd:], suffix)
 	}
-	version := strings.TrimPrefix(versionName, prefix)
 	value, err := strconv.ParseUint(version, 10, 64)
 	if err != nil || value == 0 || strconv.FormatUint(value, 10) != version {
 		return Reference{}, ErrNotFound
 	}
-	return Reference{Name: versionName, Version: version}, nil
+	return Reference{Name: prefix + version, Version: version}, nil
 }
 
 func (store *GCP) request(ctx context.Context, method, resource string, body any, destination any) (int, error) {
