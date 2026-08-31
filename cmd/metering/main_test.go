@@ -26,10 +26,22 @@ func TestConfigureOperationsReporterRequiresProductionEndpointAndHTTPS(t *testin
 		t.Fatal("production accepted plaintext Operations endpoint")
 	}
 	t.Setenv("METERING_OPERATIONS_URL", "https://control.example")
+	t.Setenv("METERING_CLOUD_RUN_AUDIENCE", "https://control.example")
 	t.Setenv("METERING_OPERATIONS_HMAC_KEY", "metering-observation-hmac-key-00001")
 	t.Setenv("METERING_ID", "metering-a")
 	t.Setenv("METERING_REGION", "us-west1")
 	if _, err := configureOperationsReporter(false); err != nil {
 		t.Fatalf("production reporter: %v", err)
+	}
+}
+
+func TestProductionVerifierSupportsExplicitDenyAllBootstrap(t *testing.T) {
+	t.Setenv("METERING_IAM_DENY_ALL", "true")
+	verifier, err := configureVerifier(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(context.Background(), "Bearer anything"); err == nil {
+		t.Fatal("deny-all production verifier accepted a human assertion")
 	}
 }

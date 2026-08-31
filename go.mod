@@ -3,6 +3,7 @@ module github.com/toddzheng/llm-gateway
 go 1.26.0
 
 require (
+	cloud.google.com/go/auth v0.22.0
 	cloud.google.com/go/cloudsqlconn v1.25.2
 	github.com/jackc/pgx/v5 v5.10.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0
@@ -16,7 +17,6 @@ require (
 )
 
 require (
-	cloud.google.com/go/auth v0.22.0 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	cloud.google.com/go/sql v0.1.0 // indirect

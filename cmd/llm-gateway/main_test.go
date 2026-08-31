@@ -63,6 +63,7 @@ func TestProductionControlRelayRequiresHTTPSAndGatewayIdentityKey(t *testing.T) 
 		t.Fatal("production accepted an unencrypted Control Event relay")
 	}
 	t.Setenv("GATEWAY_CONTROL_RELAY_URL", "https://control.example.test")
+	t.Setenv("GATEWAY_CLOUD_RUN_AUDIENCE", "https://control.example.test")
 	if _, err := configureGatewayControlRelayClient(); err != nil {
 		t.Fatalf("production HTTPS Control Event relay: %v", err)
 	}

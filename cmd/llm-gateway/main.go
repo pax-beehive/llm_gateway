@@ -23,6 +23,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/accessprojection"
 	"github.com/toddzheng/llm-gateway/internal/cacheprotection"
 	"github.com/toddzheng/llm-gateway/internal/capability"
+	"github.com/toddzheng/llm-gateway/internal/cloudrunidentity"
 	"github.com/toddzheng/llm-gateway/internal/configuration"
 	"github.com/toddzheng/llm-gateway/internal/controlevent"
 	"github.com/toddzheng/llm-gateway/internal/controlrelay"
@@ -43,6 +44,8 @@ import (
 )
 
 type routeConfig = routingcatalog.RouteConfig
+
+var buildSHA = "development"
 
 type cacheRefreshConfig = routingcatalog.CacheRefreshConfig
 
@@ -276,7 +279,7 @@ func run() error {
 	}
 	if reporter != nil {
 		go runGatewayOperationsReporter(ctx, reporter, database, router, envOr("GATEWAY_ID", "gateway-local"), localRegion,
-			envOr("GATEWAY_BUILD_SHA", "development"), startedAt)
+			envOr("GATEWAY_BUILD_SHA", buildSHA), startedAt)
 	}
 
 	address := envOr("GATEWAY_ADDR", ":8080")
@@ -362,8 +365,12 @@ func configureGatewayOperationsReporter() (*operations.Reporter, error) {
 	if os.Getenv("GATEWAY_ENV") == "production" && !strings.HasPrefix(endpoint, "https://") {
 		return nil, errors.New("production GATEWAY_OPERATIONS_URL must use HTTPS")
 	}
+	client, err := gatewayInternalHTTPClient(endpoint)
+	if err != nil {
+		return nil, err
+	}
 	return operations.NewReporter(endpoint, envOr("GATEWAY_ID", "gateway-local"), envOr("GATEWAY_LOCAL_REGION", "local"),
-		[]byte(os.Getenv("GATEWAY_OPERATIONS_HMAC_KEY")), nil, time.Now)
+		[]byte(os.Getenv("GATEWAY_OPERATIONS_HMAC_KEY")), client, time.Now)
 }
 
 func runGatewayOperationsReporter(ctx context.Context, reporter *operations.Reporter, database *sql.DB, router *provider.StaticRouter, gatewayID, region, buildSHA string, startedAt time.Time) {
@@ -784,7 +791,25 @@ func configureGatewayControlRelayClient() (*controlrelay.Client, error) {
 	if key == "" {
 		key = os.Getenv("GATEWAY_OPERATIONS_HMAC_KEY")
 	}
-	return controlrelay.NewClient(endpoint, envOr("GATEWAY_ID", "gateway-local"), []byte(key), nil, time.Now)
+	client, err := gatewayInternalHTTPClient(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return controlrelay.NewClient(endpoint, envOr("GATEWAY_ID", "gateway-local"), []byte(key), client, time.Now)
+}
+
+func gatewayInternalHTTPClient(endpoint string) (*http.Client, error) {
+	audience := strings.TrimSpace(os.Getenv("GATEWAY_CLOUD_RUN_AUDIENCE"))
+	if audience == "" {
+		if os.Getenv("GATEWAY_ENV") == "production" {
+			return nil, errors.New("production internal calls require GATEWAY_CLOUD_RUN_AUDIENCE")
+		}
+		return nil, nil
+	}
+	if audience != strings.TrimRight(endpoint, "/") {
+		return nil, errors.New("GATEWAY_CLOUD_RUN_AUDIENCE must equal the internal service URL")
+	}
+	return cloudrunidentity.NewClient(audience)
 }
 
 func configureControlEventRelay(ctx context.Context, database *sql.DB, authenticator httpapi.Authenticator, router *provider.StaticRouter, region string) (*controlEventRelayRuntime, error) {

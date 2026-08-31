@@ -49,3 +49,24 @@ output "github_workload_identity_provider" {
 output "deploy_service_account" {
   value = google_service_account.deploy.email
 }
+
+output "control_plane_service" {
+  value = {
+    name = google_cloud_run_v2_service.control_plane.name
+    uri  = google_cloud_run_v2_service.control_plane.uri
+  }
+}
+
+output "metering_service" {
+  value = {
+    name = google_cloud_run_v2_service.metering.name
+    uri  = google_cloud_run_v2_service.metering.uri
+  }
+}
+
+output "gateway_service" {
+  value = var.gateway_service_enabled ? {
+    name = google_cloud_run_v2_service.gateway[0].name
+    uri  = google_cloud_run_v2_service.gateway[0].uri
+  } : null
+}

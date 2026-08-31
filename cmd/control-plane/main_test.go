@@ -37,6 +37,18 @@ func TestProductionIdentityVerifierFailsClosedWithoutIAMConfiguration(t *testing
 	}
 }
 
+func TestProductionIdentityVerifierSupportsExplicitDenyAllBootstrap(t *testing.T) {
+	t.Setenv("CONTROL_PLANE_DEV_MODE", "false")
+	t.Setenv("CONTROL_IAM_DENY_ALL", "true")
+	verifier, err := configureIdentityVerifier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(context.Background(), "Bearer anything"); err == nil {
+		t.Fatal("deny-all production verifier accepted a human assertion")
+	}
+}
+
 func TestCredentialPepperRingUsesExplicitCurrentVersion(t *testing.T) {
 	t.Setenv("CONTROL_API_KEY_PEPPERS_JSON", `{"1":"old-control-pepper","2":"current-control-pepper"}`)
 	t.Setenv("CONTROL_API_KEY_CURRENT_DIGEST_VERSION", "2")

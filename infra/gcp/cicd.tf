@@ -40,7 +40,7 @@ resource "google_project_iam_custom_role" "release_deployer" {
   project     = var.project_id
   role_id     = "llmGatewayReleaseDeployer"
   title       = "LLM Gateway Release Deployer"
-  description = "Submit and observe builds, update existing release Jobs, and execute their gates."
+  description = "Submit and observe builds, execute release Jobs, and update existing private services."
   permissions = [
     "cloudbuild.builds.create",
     "cloudbuild.builds.get",
@@ -50,6 +50,10 @@ resource "google_project_iam_custom_role" "release_deployer" {
     "run.jobs.run",
     "run.jobs.update",
     "run.operations.get",
+    "run.revisions.get",
+    "run.revisions.list",
+    "run.services.get",
+    "run.services.update",
   ]
 }
 
@@ -74,6 +78,9 @@ resource "google_service_account_iam_member" "github_actions_deploy" {
 resource "google_service_account_iam_member" "release_act_as" {
   for_each = {
     build       = google_service_account.build.name
+    control     = google_service_account.control.name
+    gateway     = google_service_account.gateway.name
+    metering    = google_service_account.metering.name
     migration   = google_service_account.migration.name
     role_config = google_service_account.role_config.name
   }

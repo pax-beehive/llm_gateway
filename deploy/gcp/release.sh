@@ -31,6 +31,9 @@ fi
 BUILD_POLL_SECONDS=${BUILD_POLL_SECONDS:-15}
 MIGRATION_JOB=${MIGRATION_JOB:-llm-gateway-prod-schema-migrate}
 ROLE_CONFIG_JOB=${ROLE_CONFIG_JOB:-llm-gateway-prod-role-config}
+CONTROL_PLANE_SERVICE=${CONTROL_PLANE_SERVICE:-llm-gateway-prod-control-plane}
+METERING_SERVICE=${METERING_SERVICE:-llm-gateway-prod-metering}
+GATEWAY_SERVICE=${GATEWAY_SERVICE:-llm-gateway-prod-gateway}
 
 case "$GCP_BUILD_SERVICE_ACCOUNT" in
   projects/*/serviceAccounts/*)
@@ -109,6 +112,9 @@ role_config_digest=$(resolve_digest role-config)
 
 schema_migrate_image="$GCP_ARTIFACT_REPOSITORY/schema-migrate@$schema_migrate_digest"
 role_config_image="$GCP_ARTIFACT_REPOSITORY/role-config@$role_config_digest"
+gateway_image="$GCP_ARTIFACT_REPOSITORY/gateway@$gateway_digest"
+control_plane_image="$GCP_ARTIFACT_REPOSITORY/control-plane@$control_plane_digest"
+metering_image="$GCP_ARTIFACT_REPOSITORY/metering@$metering_digest"
 
 gcloud run jobs update "$MIGRATION_JOB" \
   --project="$GCP_PROJECT_ID" \
@@ -132,6 +138,52 @@ role_config_execution=$(gcloud run jobs execute "$ROLE_CONFIG_JOB" \
   --wait \
   --format='value(metadata.name)')
 
+service_exists() {
+  gcloud run services describe "$1" \
+    --project="$GCP_PROJECT_ID" \
+    --region="$GCP_REGION" \
+    --format='value(metadata.name)' >/dev/null 2>&1
+}
+
+update_service() {
+  service_name=$1
+  service_image=$2
+  echo "Updating private Cloud Run service $service_name" >&2
+  gcloud run services update "$service_name" \
+    --project="$GCP_PROJECT_ID" \
+    --region="$GCP_REGION" \
+    --image="$service_image" \
+    --quiet \
+    --format=none
+  latest_created=$(gcloud run services describe "$service_name" \
+    --project="$GCP_PROJECT_ID" \
+    --region="$GCP_REGION" \
+    --format='value(status.latestCreatedRevisionName)')
+  latest_ready=$(gcloud run services describe "$service_name" \
+    --project="$GCP_PROJECT_ID" \
+    --region="$GCP_REGION" \
+    --format='value(status.latestReadyRevisionName)')
+  if [ -z "$latest_ready" ] || [ "$latest_created" != "$latest_ready" ]; then
+    echo "$service_name did not converge to a ready revision" >&2
+    exit 1
+  fi
+  printf '%s' "$latest_ready"
+}
+
+control_plane_revision="not-provisioned"
+metering_revision="not-provisioned"
+gateway_revision="blocked-on-provider-and-routing-bootstrap"
+
+if service_exists "$CONTROL_PLANE_SERVICE"; then
+  control_plane_revision=$(update_service "$CONTROL_PLANE_SERVICE" "$control_plane_image")
+fi
+if service_exists "$METERING_SERVICE"; then
+  metering_revision=$(update_service "$METERING_SERVICE" "$metering_image")
+fi
+if service_exists "$GATEWAY_SERVICE"; then
+  gateway_revision=$(update_service "$GATEWAY_SERVICE" "$gateway_image")
+fi
+
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     printf 'build_id=%s\n' "$build_id"
@@ -142,6 +194,9 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'role_config_digest=%s\n' "$role_config_digest"
     printf 'migration_execution=%s\n' "$migration_execution"
     printf 'role_config_execution=%s\n' "$role_config_execution"
+    printf 'control_plane_revision=%s\n' "$control_plane_revision"
+    printf 'metering_revision=%s\n' "$metering_revision"
+    printf 'gateway_revision=%s\n' "$gateway_revision"
   } >>"$GITHUB_OUTPUT"
 fi
 
@@ -158,8 +213,11 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "- Role configuration: \`$role_config_digest\`"
     echo "- Migration execution: \`$migration_execution\`"
     echo "- Role configuration execution: \`$role_config_execution\`"
+    echo "- Control Plane revision: \`$control_plane_revision\`"
+    echo "- Metering revision: \`$metering_revision\`"
+    echo "- Gateway revision: \`$gateway_revision\`"
     echo
-    echo 'Long-running Cloud Run services and public traffic are outside this release stage.'
+    echo 'Services remain IAM-protected behind internal-and-load-balancer ingress; this workflow does not create public traffic.'
   } >>"$GITHUB_STEP_SUMMARY"
 fi
 

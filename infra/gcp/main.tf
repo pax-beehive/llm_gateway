@@ -29,6 +29,15 @@ locals {
     control_runtime  = [google_secret_manager_secret.control_database.id, google_service_account.control.email]
     metering_runtime = [google_secret_manager_secret.metering_database.id, google_service_account.metering.email]
   }
+  runtime_secret_access = {
+    control_peppers       = [google_secret_manager_secret.api_key_peppers.id, google_service_account.control.email]
+    control_gateway_hmac  = [google_secret_manager_secret.control_gateway_hmac_keys.id, google_service_account.control.email]
+    control_metering_hmac = [google_secret_manager_secret.control_metering_hmac_keys.id, google_service_account.control.email]
+    gateway_peppers       = [google_secret_manager_secret.api_key_peppers.id, google_service_account.gateway.email]
+    gateway_control_hmac  = [google_secret_manager_secret.gateway_control_hmac.id, google_service_account.gateway.email]
+    metering_operations   = [google_secret_manager_secret.metering_operations_hmac.id, google_service_account.metering.email]
+    metering_signing      = [google_secret_manager_secret.metering_export_signing.id, google_service_account.metering.email]
+  }
 }
 
 data "google_project" "current" {
@@ -294,9 +303,29 @@ resource "google_secret_manager_secret" "gateway_control_hmac" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_secret_manager_secret" "control_gateway_hmac_keys" {
+  project   = var.project_id
+  secret_id = "${local.prefix}-control-gateway-hmac-keys-json"
+  labels    = local.labels
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
 resource "google_secret_manager_secret" "metering_operations_hmac" {
   project   = var.project_id
   secret_id = "${local.prefix}-metering-operations-hmac"
+  labels    = local.labels
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "control_metering_hmac_keys" {
+  project   = var.project_id
+  secret_id = "${local.prefix}-control-metering-hmac-keys-json"
   labels    = local.labels
   replication {
     auto {}
@@ -344,9 +373,19 @@ resource "google_secret_manager_secret_version" "gateway_control_hmac" {
   secret_data = random_password.gateway_control_hmac.result
 }
 
+resource "google_secret_manager_secret_version" "control_gateway_hmac_keys" {
+  secret      = google_secret_manager_secret.control_gateway_hmac_keys.id
+  secret_data = jsonencode({ "gateway-us-west" = random_password.gateway_control_hmac.result })
+}
+
 resource "google_secret_manager_secret_version" "metering_operations_hmac" {
   secret      = google_secret_manager_secret.metering_operations_hmac.id
   secret_data = random_password.metering_operations_hmac.result
+}
+
+resource "google_secret_manager_secret_version" "control_metering_hmac_keys" {
+  secret      = google_secret_manager_secret.control_metering_hmac_keys.id
+  secret_data = jsonencode({ "metering-us-west1" = random_password.metering_operations_hmac.result })
 }
 
 resource "google_secret_manager_secret_version" "metering_export_signing" {
@@ -419,6 +458,14 @@ resource "google_storage_bucket_iam_member" "build_source" {
 
 resource "google_secret_manager_secret_iam_member" "database_access" {
   for_each  = local.database_secret_access
+  project   = var.project_id
+  secret_id = each.value[0]
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${each.value[1]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "runtime_access" {
+  for_each  = local.runtime_secret_access
   project   = var.project_id
   secret_id = each.value[0]
   role      = "roles/secretmanager.secretAccessor"

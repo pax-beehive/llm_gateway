@@ -471,6 +471,11 @@ func configureIdentityVerifier() (controlapi.IdentityVerifier, error) {
 			}, nil
 		}), nil
 	}
+	if os.Getenv("CONTROL_IAM_DENY_ALL") == "true" {
+		return controlapi.IdentityVerifierFunc(func(context.Context, string) (controlapi.VerifiedIdentity, error) {
+			return controlapi.VerifiedIdentity{}, errors.New("human IAM is not enabled")
+		}), nil
+	}
 	jwksURL := strings.TrimSpace(os.Getenv("CONTROL_IAM_JWKS_URL"))
 	issuer := strings.TrimSpace(os.Getenv("CONTROL_IAM_ISSUER"))
 	audience := strings.TrimSpace(os.Getenv("CONTROL_IAM_AUDIENCE"))

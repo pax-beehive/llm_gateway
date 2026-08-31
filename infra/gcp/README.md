@@ -9,14 +9,17 @@ The first apply creates the isolated foundation: required APIs, Artifact
 Registry, build and Metering buckets, service accounts, least-privilege IAM,
 Secret Manager entries, and a regional HA Cloud SQL instance. After the
 release images exist, the same stack creates schema-migration and database-role
-configuration Cloud Run Jobs pinned by digest. It does not create public DNS,
-a load balancer, or long-running Cloud Run services.
+configuration Cloud Run Jobs pinned by digest, followed by private Control
+Plane and Metering Cloud Run services. The Gateway resource remains gated by
+`gateway_service_enabled=false` until a Provider Connection, Routing Catalog,
+Tenant, and Gateway API key have been published. This stage does not create
+public DNS or a load balancer.
 
 ```sh
 cp infra/gcp/backend.hcl.example infra/gcp/backend.hcl
 terraform -chdir=infra/gcp init -backend-config=backend.hcl
 cp infra/gcp/terraform.tfvars.example infra/gcp/release.auto.tfvars
-# Replace both example image values with immutable Artifact Registry digests.
+# Replace all example image values with immutable Artifact Registry digests.
 terraform -chdir=infra/gcp plan -out=/tmp/llm-gateway-foundation.tfplan
 terraform -chdir=infra/gcp apply /tmp/llm-gateway-foundation.tfplan
 ```
@@ -36,8 +39,9 @@ provider, and a dedicated release service account. Trust is restricted to the
 immutable `pax-beehive/llm_gateway` repository and owner IDs on
 `refs/heads/main`. The release identity can submit and observe Cloud Builds,
 read image metadata, update the two existing Cloud Run Jobs, execute them, and
-act as their exact service accounts. It cannot read Terraform state or Secret
-Manager payloads.
+update existing private services by immutable digest. It can act only as the
+build, Job, and runtime service accounts. It cannot read Terraform state or
+Secret Manager payloads, create a service, change service IAM, or open ingress.
 
 GitHub's `production` environment must require a reviewer and permit only the
 `main` deployment branch. Configure these non-secret repository variables from
@@ -57,10 +61,22 @@ After CI succeeds for a push to `main`, `.github/workflows/deploy-gcp.yml`
 waits for production approval, checks out the exact tested SHA, authenticates
 without a service-account key, builds all release images once, resolves their
 digests, updates and runs schema migration, and then updates and runs database
-role configuration. The workflow records source, build, digest, and execution
-evidence in the GitHub job summary.
+role configuration. It then rolls Control Plane, Metering, and—once
+provisioned—Gateway, requiring each new revision to become Ready. The workflow
+records source, build, digest, execution, and revision evidence in the GitHub
+job summary.
 
-Long-running Gateway, Control Plane, and Metering services remain outside this
-release stage until their Terraform resources and readiness/bootstrap gates are
-implemented. Their images are built and recorded, but no service traffic is
-changed by this workflow.
+All three services use `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`; no direct
+public `run.app` bypass is accepted. Control Plane grants `roles/run.invoker`
+only to the exact Gateway and Metering identities. Those callers also attach
+their existing application HMAC in `Authorization` and an ADC-backed Cloud Run
+ID token in `X-Serverless-Authorization`.
+
+Before the Cloudflare Access identity adapter is configured, Control Plane and
+Metering set their human IAM verifier to explicit deny-all. Their health and
+readiness endpoints remain available to Cloud Run, while every human
+management assertion fails closed. Provider live operations also remain
+disabled, so this stage cannot spend against an LLM Provider.
+
+The initial max-instance and concurrency settings are protective launch bounds,
+not capacity claims. Replace them only with load-test and budget evidence.

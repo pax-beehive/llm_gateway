@@ -83,3 +83,39 @@ variable "role_config_image" {
     error_message = "role_config_image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>."
   }
 }
+
+variable "gateway_image" {
+  description = "Immutable Gateway service image reference, including an Artifact Registry sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^[:space:]]+@sha256:[0-9a-f]{64}$", var.gateway_image))
+    error_message = "gateway_image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "control_plane_image" {
+  description = "Immutable Control Plane service image reference, including an Artifact Registry sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^[:space:]]+@sha256:[0-9a-f]{64}$", var.control_plane_image))
+    error_message = "control_plane_image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "metering_image" {
+  description = "Immutable Metering service image reference, including an Artifact Registry sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^[:space:]]+@sha256:[0-9a-f]{64}$", var.metering_image))
+    error_message = "metering_image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "gateway_service_enabled" {
+  description = "Create the Gateway only after a Provider Connection, Routing Catalog, Tenant, and API key are published."
+  type        = bool
+  default     = false
+}

@@ -16,6 +16,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/toddzheng/llm-gateway/internal/cloudrunidentity"
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
 	"github.com/toddzheng/llm-gateway/internal/metering"
@@ -199,8 +200,22 @@ func configureOperationsReporter(devMode bool) (*operations.MeteringReporter, er
 	if devMode && len(key) == 0 {
 		key = []byte("local-development-metering-hmac-key-001")
 	}
+	var client *http.Client
+	audience := strings.TrimSpace(os.Getenv("METERING_CLOUD_RUN_AUDIENCE"))
+	if audience != "" {
+		if audience != strings.TrimRight(endpoint, "/") {
+			return nil, errors.New("METERING_CLOUD_RUN_AUDIENCE must equal the internal service URL")
+		}
+		var err error
+		client, err = cloudrunidentity.NewClient(audience)
+		if err != nil {
+			return nil, err
+		}
+	} else if !devMode {
+		return nil, errors.New("production internal calls require METERING_CLOUD_RUN_AUDIENCE")
+	}
 	return operations.NewMeteringReporter(endpoint, envOr("METERING_ID", "metering-local"),
-		envOr("METERING_REGION", "local"), key, nil, time.Now)
+		envOr("METERING_REGION", "local"), key, client, time.Now)
 }
 
 func runOperationsReporter(ctx context.Context, reporter *operations.MeteringReporter, service *metering.Service, startedAt time.Time) {
@@ -239,6 +254,11 @@ func configureVerifier(devMode bool) (metering.IdentityVerifier, error) {
 				return metering.Identity{}, errors.New("invalid token")
 			}
 			return metering.Identity{ActorID: "local-metering-admin", Scopes: []string{metering.ScopePlatformRead, metering.ScopePlatformWrite}}, nil
+		}), nil
+	}
+	if os.Getenv("METERING_IAM_DENY_ALL") == "true" {
+		return metering.IdentityVerifierFunc(func(context.Context, string) (metering.Identity, error) {
+			return metering.Identity{}, errors.New("human IAM is not enabled")
 		}), nil
 	}
 	verifier, err := controlapi.NewJWKSVerifier(controlapi.JWKSVerifierConfig{URL: os.Getenv("METERING_IAM_JWKS_URL"), Issuer: os.Getenv("METERING_IAM_ISSUER"), Audience: os.Getenv("METERING_IAM_AUDIENCE"), Now: time.Now})
