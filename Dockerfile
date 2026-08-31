@@ -7,7 +7,7 @@ COPY . .
 ARG SERVICE=llm-gateway
 ARG SOURCE_REVISION=development
 RUN case "$SERVICE" in \
-      llm-gateway|control-plane|metering|schema-migrate) ;; \
+      llm-gateway|control-plane|metering|schema-migrate|provider-bootstrap) ;; \
       *) echo "unsupported SERVICE: $SERVICE" >&2; exit 2 ;; \
     esac && \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildSHA=$SOURCE_REVISION" -o /out/service "./cmd/$SERVICE"

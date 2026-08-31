@@ -87,5 +87,18 @@ readiness endpoints remain available to Cloud Run, while every human
 management assertion fails closed. Provider live operations also remain
 disabled, so this stage cannot spend against an LLM Provider.
 
+## Provider credential bootstrap
+
+The first production Provider credentials enter through the one-shot
+`provider-bootstrap` image. An operator creates a temporary Secret Manager
+bundle containing exactly the four allowlisted Provider keys, runs an ephemeral
+Cloud Run Job as the Control Plane service account on the runtime VPC, and then
+deletes both the Job and temporary bundle. The command registers four disabled
+Provider Connections through the normal audited domain service, enables only
+the explicitly selected canary, and performs one zero-spend-bounded model-list
+probe. The resulting `llm-gateway-pc-*` secrets use immutable versions and are
+the only credentials retained after cleanup. Never pass the bundle as a plain
+environment value, command argument, Terraform value, or CI output.
+
 The initial max-instance and concurrency settings are protective launch bounds,
 not capacity claims. Replace them only with load-test and budget evidence.
