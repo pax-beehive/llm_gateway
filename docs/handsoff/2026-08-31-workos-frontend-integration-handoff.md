@@ -25,8 +25,7 @@
 
 ### 尚未完成
 
-- WorkOS AuthKit 尚未接入 BFF 或前端。
-- BFF 目前没有浏览器 session 验证；本地开发配置会注入固定的开发 token。
+- 已发布的生产版本尚未包含 WorkOS BFF/前端改动，也尚未启用浏览器 session 验证。
 - BFF/SPA 尚未作为生产 Cloud Run 服务部署。
 - `llm-api.paxtech.net` 和 `llm-console.paxtech.net` 当前没有 DNS 记录。
 - Control Plane 生产环境仍为 `CONTROL_IAM_DENY_ALL=true`。
@@ -37,8 +36,33 @@
 当前工作树已经补齐 React session/permission UI 和 Go BFF 的 WorkOS AuthKit
 实现，包括 PKCE、加密 HttpOnly session cookie、过期 session refresh、单一
 operator organization 限制、同源 mutation 检查，以及 BFF 业务路由权限守卫。
-这些改动已通过本地 fake WorkOS 测试，但尚未配置真实 WorkOS project/secret，
-也尚未部署；上面的“当前事实”仍描述已发布 SHA 的生产状态。
+这些改动已通过本地 fake WorkOS 测试。真实 WorkOS project、AuthKit URL、
+organization 和 RBAC 已配置，但 API key、cookie password、operator 用户和生产
+BFF 部署仍未完成；上面的“当前事实”仍描述已发布 SHA 的生产状态。
+
+### WorkOS 控制面状态（已配置，尚未部署）
+
+独立项目：`LLM Gateway`（`project_01M1DGMA7D6KG6FQH4D14W58MT`）。
+
+| 配置 | Staging | Production |
+| --- | --- | --- |
+| Environment ID | `environment_01M1DGMA7P0D0YE2E7C91YZBG2` | `environment_01M1DGMAX9ST1GKYDGMFEXAHJE` |
+| Client ID | `client_01M1DGMAP4NTQBTJKSM82D7M73` | `client_01M1DGMB23EB15CDTND3GG84NA` |
+| Operator organization ID | `org_01M1DGRHCZ4TPH3KSJE7V7QNA3` | `org_01M1DGSFPJREACZ25VMYSRWK36` |
+| Redirect URI | `http://localhost:5173/api/auth/callback` | `https://llm-console.paxtech.net/api/auth/callback` |
+| Logout URI | `http://localhost:5173/` | `https://llm-console.paxtech.net/` |
+| Open sign-up | disabled | disabled |
+| MFA | optional | required |
+
+两个环境都已创建代码所需的 11 个自定义 permission，以及：
+
+- `operator-admin`：完整 Ops Console 权限，包括 Playground 和所有 mutation。
+- `operator-viewer`：只读权限，不包括 Playground。
+
+两个 Operator organization 当前都没有用户。为避免自动外发邀请邮件，尚未邀请
+`toddzheng@paxtech.net`。WorkOS MCP 不返回或生成可供 BFF 使用的 secret；仍需从
+WorkOS Dashboard 创建/取得环境 API key，并直接写入本地 secret store 或 GCP
+Secret Manager，不要写入仓库或交接文档。
 
 生产 BFF 需要同时配置：
 
