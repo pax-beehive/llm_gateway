@@ -58,7 +58,7 @@ resource "google_cloud_run_v2_service" "control_plane" {
         period_seconds        = 5
         failure_threshold     = 48
         http_get {
-          path = "/ready"
+          path = "/readyz"
           port = 8080
         }
       }
@@ -69,7 +69,7 @@ resource "google_cloud_run_v2_service" "control_plane" {
         period_seconds        = 10
         failure_threshold     = 3
         http_get {
-          path = "/health"
+          path = "/healthz"
           port = 8080
         }
       }
@@ -634,7 +634,7 @@ resource "google_cloud_run_v2_service" "bff" {
         period_seconds    = 5
         failure_threshold = 24
         http_get {
-          path = "/readyz"
+          path = "/ready"
           port = 8080
         }
       }
@@ -645,7 +645,7 @@ resource "google_cloud_run_v2_service" "bff" {
         period_seconds        = 10
         failure_threshold     = 3
         http_get {
-          path = "/healthz"
+          path = "/health"
           port = 8080
         }
       }
