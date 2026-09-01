@@ -114,6 +114,42 @@ variable "metering_image" {
   }
 }
 
+variable "bff_image" {
+  description = "Immutable BFF console image reference. Required when bff_service_enabled is true."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.bff_image == null || can(regex("^[^[:space:]]+@sha256:[0-9a-f]{64}$", var.bff_image))
+    error_message = "bff_image must be null or an immutable image reference ending in @sha256:<64 lowercase hex characters>."
+  }
+}
+
+variable "bff_service_enabled" {
+  description = "Create the public WorkOS-authenticated BFF console after its Production API key secret has a version."
+  type        = bool
+  default     = false
+}
+
+variable "bff_public_url" {
+  description = "Browser-visible HTTPS origin registered as the WorkOS callback and logout URL."
+  type        = string
+  default     = ""
+}
+
+variable "workos_client_id" {
+  description = "WorkOS Production AuthKit client ID; not a secret."
+  type        = string
+  default     = ""
+}
+
+variable "workos_operator_organization_id" {
+  description = "Only this WorkOS organization may use the operator console; not a secret."
+  type        = string
+  default     = ""
+}
+
 variable "gateway_service_enabled" {
   description = "Create the Gateway only after a Provider Connection, Routing Catalog, Tenant, and API key are published."
   type        = bool

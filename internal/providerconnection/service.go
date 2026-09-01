@@ -295,7 +295,7 @@ func authorizeMutation(actor tenantadmin.ActorEnvelope) error {
 		return fmt.Errorf("%w: mutation Actor Envelope is incomplete", ErrInvalidArgument)
 	}
 	for _, scope := range actor.Scopes {
-		if scope == tenantadmin.ScopePlatformWrite {
+		if scope == ScopePlatformWrite || scope == tenantadmin.ScopePlatformWrite {
 			return nil
 		}
 	}

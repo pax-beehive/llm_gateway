@@ -681,7 +681,7 @@ func canRead(actor tenantadmin.ActorEnvelope) bool {
 		return false
 	}
 	for _, scope := range actor.Scopes {
-		if scope == tenantadmin.ScopePlatformRead || scope == tenantadmin.ScopePlatformWrite {
+		if scope == ScopePlatformRead || scope == tenantadmin.ScopePlatformRead || scope == tenantadmin.ScopePlatformWrite {
 			return true
 		}
 	}

@@ -81,6 +81,7 @@ resource "google_service_account_iam_member" "release_act_as" {
     control     = google_service_account.control.name
     gateway     = google_service_account.gateway.name
     metering    = google_service_account.metering.name
+    bff         = google_service_account.bff.name
     migration   = google_service_account.migration.name
     role_config = google_service_account.role_config.name
   }

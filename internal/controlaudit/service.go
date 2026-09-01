@@ -17,6 +17,8 @@ type Service struct {
 	database *sql.DB
 }
 
+const scopeOperationsRead = "platform:operations:read"
+
 type cursor struct {
 	OccurredAt time.Time `json:"occurred_at"`
 	ID         string    `json:"id"`
@@ -30,7 +32,7 @@ func NewService(database *sql.DB) (*Service, error) {
 }
 
 func (service *Service) List(ctx context.Context, actor tenantadmin.ActorEnvelope, filter Filter) (Page, error) {
-	platform := hasScope(actor, tenantadmin.ScopePlatformRead) || hasScope(actor, tenantadmin.ScopePlatformWrite)
+	platform := hasScope(actor, scopeOperationsRead) || hasScope(actor, tenantadmin.ScopePlatformRead) || hasScope(actor, tenantadmin.ScopePlatformWrite)
 	tenant := hasScope(actor, tenantadmin.ScopeTenantRead) || hasScope(actor, tenantadmin.ScopeTenantWrite)
 	if actor.Type == "" || actor.ID == "" || !platform && (!tenant || actor.ActingTenantID == "") {
 		return Page{}, ErrPolicyDenied

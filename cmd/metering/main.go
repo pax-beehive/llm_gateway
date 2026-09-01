@@ -261,7 +261,17 @@ func configureVerifier(devMode bool) (metering.IdentityVerifier, error) {
 			return metering.Identity{}, errors.New("human IAM is not enabled")
 		}), nil
 	}
-	verifier, err := controlapi.NewJWKSVerifier(controlapi.JWKSVerifierConfig{URL: os.Getenv("METERING_IAM_JWKS_URL"), Issuer: os.Getenv("METERING_IAM_ISSUER"), Audience: os.Getenv("METERING_IAM_AUDIENCE"), Now: time.Now})
+	var verifier controlapi.IdentityVerifier
+	var err error
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("METERING_IAM_PROVIDER")), "workos") {
+		verifier, err = controlapi.NewWorkOSVerifier(controlapi.WorkOSVerifierConfig{
+			JWKSURL: os.Getenv("METERING_IAM_JWKS_URL"), Issuer: os.Getenv("METERING_IAM_ISSUER"),
+			Audience: os.Getenv("METERING_IAM_AUDIENCE"), AllowedOrganizationID: os.Getenv("METERING_IAM_ALLOWED_ORGANIZATION_ID"),
+			Now: time.Now, ClockSkew: 30 * time.Second,
+		})
+	} else {
+		verifier, err = controlapi.NewJWKSVerifier(controlapi.JWKSVerifierConfig{URL: os.Getenv("METERING_IAM_JWKS_URL"), Issuer: os.Getenv("METERING_IAM_ISSUER"), Audience: os.Getenv("METERING_IAM_AUDIENCE"), Now: time.Now})
+	}
 	if err != nil {
 		return nil, err
 	}

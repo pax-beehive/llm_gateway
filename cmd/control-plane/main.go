@@ -482,6 +482,19 @@ func configureIdentityVerifier() (controlapi.IdentityVerifier, error) {
 			return controlapi.VerifiedIdentity{}, errors.New("human IAM is not enabled")
 		}), nil
 	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("CONTROL_IAM_PROVIDER")), "workos") {
+		clientID := strings.TrimSpace(os.Getenv("CONTROL_IAM_AUDIENCE"))
+		issuer := strings.TrimSpace(os.Getenv("CONTROL_IAM_ISSUER"))
+		jwksURL := strings.TrimSpace(os.Getenv("CONTROL_IAM_JWKS_URL"))
+		organizationID := strings.TrimSpace(os.Getenv("CONTROL_IAM_ALLOWED_ORGANIZATION_ID"))
+		if jwksURL == "" || issuer == "" || clientID == "" || organizationID == "" {
+			return nil, errors.New("WorkOS IAM requires CONTROL_IAM_JWKS_URL, CONTROL_IAM_ISSUER, CONTROL_IAM_AUDIENCE, and CONTROL_IAM_ALLOWED_ORGANIZATION_ID")
+		}
+		return controlapi.NewWorkOSVerifier(controlapi.WorkOSVerifierConfig{
+			JWKSURL: jwksURL, Issuer: issuer, Audience: clientID,
+			AllowedOrganizationID: organizationID, ClockSkew: 30 * time.Second,
+		})
+	}
 	jwksURL := strings.TrimSpace(os.Getenv("CONTROL_IAM_JWKS_URL"))
 	issuer := strings.TrimSpace(os.Getenv("CONTROL_IAM_ISSUER"))
 	audience := strings.TrimSpace(os.Getenv("CONTROL_IAM_AUDIENCE"))

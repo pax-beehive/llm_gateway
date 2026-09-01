@@ -622,14 +622,14 @@ func recordCatalogCommand(ctx context.Context, transaction *sql.Tx, actor tenant
 }
 
 func authorizeCatalogWrite(actor tenantadmin.ActorEnvelope) error {
-	if actor.Type == "" || actor.ID == "" || actor.RequestID == "" || strings.TrimSpace(actor.Reason) == "" || !actorHasScope(actor, tenantadmin.ScopePlatformWrite) {
+	if actor.Type == "" || actor.ID == "" || actor.RequestID == "" || strings.TrimSpace(actor.Reason) == "" || !actorHasAnyScope(actor, ScopePlatformWrite, tenantadmin.ScopePlatformWrite) {
 		return ErrPolicyDenied
 	}
 	return nil
 }
 
 func authorizeCatalogRead(actor tenantadmin.ActorEnvelope) error {
-	if actor.Type == "" || actor.ID == "" || !actorHasScope(actor, tenantadmin.ScopePlatformRead) && !actorHasScope(actor, tenantadmin.ScopePlatformWrite) {
+	if actor.Type == "" || actor.ID == "" || !actorHasAnyScope(actor, ScopePlatformRead, ScopePlatformWrite, ScopeGatewayModels, tenantadmin.ScopePlatformRead, tenantadmin.ScopePlatformWrite) {
 		return ErrPolicyDenied
 	}
 	return nil
@@ -638,6 +638,15 @@ func authorizeCatalogRead(actor tenantadmin.ActorEnvelope) error {
 func actorHasScope(actor tenantadmin.ActorEnvelope, wanted string) bool {
 	for _, scope := range actor.Scopes {
 		if scope == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func actorHasAnyScope(actor tenantadmin.ActorEnvelope, wanted ...string) bool {
+	for _, scope := range wanted {
+		if actorHasScope(actor, scope) {
 			return true
 		}
 	}

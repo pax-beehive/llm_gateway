@@ -1,9 +1,20 @@
 package bff
 
 import (
+	"context"
 	"net/http"
 	"strings"
 )
+
+type sessionContextKey struct{}
+
+func accessTokenFromContext(ctx context.Context) string {
+	session, _ := ctx.Value(sessionContextKey{}).(*sessionView)
+	if session == nil {
+		return ""
+	}
+	return session.accessToken
+}
 
 type permissionRequirement struct {
 	Any []string
@@ -29,7 +40,7 @@ func authorizeBusinessRequest(auth *authService, next http.Handler) http.Handler
 			writeError(w, http.StatusForbidden, "permission_denied", "You do not have permission to perform this action")
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, session)))
 	})
 }
 

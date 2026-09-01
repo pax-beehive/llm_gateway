@@ -16,15 +16,18 @@ import (
 type Config struct {
 	Addr string
 
-	GatewayURL         string
-	GatewayAPIKey      string
-	GatewayConfigured  bool
-	ControlPlaneURL    string
-	ControlPlaneToken  string
-	ControlConfigured  bool
-	MeteringURL        string
-	MeteringToken      string
-	MeteringConfigured bool
+	GatewayURL               string
+	GatewayAPIKey            string
+	GatewayConfigured        bool
+	GatewayCloudRunAudience  string
+	ControlPlaneURL          string
+	ControlPlaneToken        string
+	ControlConfigured        bool
+	ControlCloudRunAudience  string
+	MeteringURL              string
+	MeteringToken            string
+	MeteringConfigured       bool
+	MeteringCloudRunAudience string
 
 	// DevAuth enables the development auth mode: /api/auth/session returns a
 	// fixed dev session. Never enable in production. DevAuthPermissions, when
@@ -74,12 +77,15 @@ func ConfigFromEnv(lookup LookupEnv) Config {
 		return fallback, true
 	}
 	cfg := Config{
-		Addr:            value("BFF_ADDR", ":8090"),
-		GatewayURL:      value("BFF_GATEWAY_URL", "http://localhost:8080"),
-		ControlPlaneURL: value("BFF_CONTROL_PLANE_URL", "http://localhost:8081"),
-		MeteringURL:     value("BFF_METERING_URL", "http://localhost:8082"),
-		PublicURL:       strings.TrimRight(value("BFF_PUBLIC_URL", "http://localhost:5173"), "/"),
-		WebDist:         value("BFF_WEB_DIST", "web/dist"),
+		Addr:                     value("BFF_ADDR", ":8090"),
+		GatewayURL:               value("BFF_GATEWAY_URL", "http://localhost:8080"),
+		GatewayCloudRunAudience:  strings.TrimSpace(value("BFF_GATEWAY_CLOUD_RUN_AUDIENCE", "")),
+		ControlPlaneURL:          value("BFF_CONTROL_PLANE_URL", "http://localhost:8081"),
+		ControlCloudRunAudience:  strings.TrimSpace(value("BFF_CONTROL_PLANE_CLOUD_RUN_AUDIENCE", "")),
+		MeteringURL:              value("BFF_METERING_URL", "http://localhost:8082"),
+		MeteringCloudRunAudience: strings.TrimSpace(value("BFF_METERING_CLOUD_RUN_AUDIENCE", "")),
+		PublicURL:                strings.TrimRight(value("BFF_PUBLIC_URL", "http://localhost:5173"), "/"),
+		WebDist:                  value("BFF_WEB_DIST", "web/dist"),
 	}
 	cfg.GatewayAPIKey, cfg.GatewayConfigured = token("BFF_GATEWAY_API_KEY", "dev-token")
 	cfg.ControlPlaneToken, cfg.ControlConfigured = token("BFF_CONTROL_PLANE_TOKEN", "local-control-admin-token")

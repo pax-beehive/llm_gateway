@@ -38,6 +38,10 @@ output "metering_service_account" {
   value = google_service_account.metering.email
 }
 
+output "bff_service_account" {
+  value = google_service_account.bff.email
+}
+
 output "metering_export_bucket" {
   value = google_storage_bucket.metering_exports.name
 }
@@ -68,5 +72,12 @@ output "gateway_service" {
   value = var.gateway_service_enabled ? {
     name = google_cloud_run_v2_service.gateway[0].name
     uri  = google_cloud_run_v2_service.gateway[0].uri
+  } : null
+}
+
+output "bff_service" {
+  value = var.bff_service_enabled ? {
+    name = google_cloud_run_v2_service.bff[0].name
+    uri  = google_cloud_run_v2_service.bff[0].uri
   } : null
 }

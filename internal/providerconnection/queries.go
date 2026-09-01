@@ -68,7 +68,7 @@ func authorizeRead(actor tenantadmin.ActorEnvelope) error {
 		return ErrInvalidArgument
 	}
 	for _, scope := range actor.Scopes {
-		if scope == tenantadmin.ScopePlatformRead || scope == tenantadmin.ScopePlatformWrite {
+		if scope == ScopePlatformRead || scope == ScopePlatformWrite || scope == ScopeRoutingRead || scope == ScopeGatewayModels || scope == tenantadmin.ScopePlatformRead || scope == tenantadmin.ScopePlatformWrite {
 			return nil
 		}
 	}

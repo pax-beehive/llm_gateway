@@ -37,6 +37,8 @@ locals {
     gateway_control_hmac  = [google_secret_manager_secret.gateway_control_hmac.id, google_service_account.gateway.email]
     metering_operations   = [google_secret_manager_secret.metering_operations_hmac.id, google_service_account.metering.email]
     metering_signing      = [google_secret_manager_secret.metering_export_signing.id, google_service_account.metering.email]
+    bff_cookie            = [google_secret_manager_secret.bff_cookie.id, google_service_account.bff.email]
+    bff_workos            = [google_secret_manager_secret.bff_workos_api_key.id, google_service_account.bff.email]
   }
 }
 
@@ -165,6 +167,11 @@ resource "random_password" "metering_operations_hmac" {
 
 resource "random_password" "metering_export_signing" {
   length  = 48
+  special = false
+}
+
+resource "random_password" "bff_cookie" {
+  length  = 64
   special = false
 }
 
@@ -343,6 +350,31 @@ resource "google_secret_manager_secret" "metering_export_signing" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_secret_manager_secret" "bff_cookie" {
+  project   = var.project_id
+  secret_id = "${local.prefix}-bff-cookie-password"
+  labels    = local.labels
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
+resource "google_secret_manager_secret" "bff_workos_api_key" {
+  project   = var.project_id
+  secret_id = "${local.prefix}-bff-workos-api-key"
+  labels    = local.labels
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.required]
+}
+
+data "google_secret_manager_secret" "bff_gateway_api_key" {
+  project   = var.project_id
+  secret_id = "${local.prefix}-canary-api-key"
+}
+
 resource "google_secret_manager_secret_version" "admin_database" {
   secret      = google_secret_manager_secret.admin_database.id
   secret_data = local.database_urls.admin
@@ -393,6 +425,11 @@ resource "google_secret_manager_secret_version" "metering_export_signing" {
   secret_data = random_password.metering_export_signing.result
 }
 
+resource "google_secret_manager_secret_version" "bff_cookie" {
+  secret      = google_secret_manager_secret.bff_cookie.id
+  secret_data = random_password.bff_cookie.result
+}
+
 resource "google_service_account" "build" {
   project      = var.project_id
   account_id   = "${local.prefix}-build"
@@ -427,6 +464,19 @@ resource "google_service_account" "metering" {
   project      = var.project_id
   account_id   = "${local.prefix}-metering"
   display_name = "LLM Gateway ${var.environment} Metering"
+}
+
+resource "google_service_account" "bff" {
+  project      = var.project_id
+  account_id   = "${local.prefix}-bff"
+  display_name = "LLM Gateway ${var.environment} WorkOS console BFF"
+}
+
+resource "google_secret_manager_secret_iam_member" "bff_gateway_api_key" {
+  project   = var.project_id
+  secret_id = data.google_secret_manager_secret.bff_gateway_api_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.bff.email}"
 }
 
 resource "google_project_iam_member" "cloud_sql_client" {

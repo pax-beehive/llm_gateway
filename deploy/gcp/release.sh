@@ -34,6 +34,7 @@ ROLE_CONFIG_JOB=${ROLE_CONFIG_JOB:-llm-gateway-prod-role-config}
 CONTROL_PLANE_SERVICE=${CONTROL_PLANE_SERVICE:-llm-gateway-prod-control-plane}
 METERING_SERVICE=${METERING_SERVICE:-llm-gateway-prod-metering}
 GATEWAY_SERVICE=${GATEWAY_SERVICE:-llm-gateway-prod-gateway}
+BFF_SERVICE=${BFF_SERVICE:-llm-gateway-prod-console}
 
 case "$GCP_BUILD_SERVICE_ACCOUNT" in
   projects/*/serviceAccounts/*)
@@ -107,6 +108,7 @@ resolve_digest() {
 gateway_digest=$(resolve_digest gateway)
 control_plane_digest=$(resolve_digest control-plane)
 metering_digest=$(resolve_digest metering)
+bff_digest=$(resolve_digest bff)
 schema_migrate_digest=$(resolve_digest schema-migrate)
 provider_bootstrap_digest=$(resolve_digest provider-bootstrap)
 gateway_bootstrap_digest=$(resolve_digest gateway-bootstrap)
@@ -117,6 +119,7 @@ role_config_image="$GCP_ARTIFACT_REPOSITORY/role-config@$role_config_digest"
 gateway_image="$GCP_ARTIFACT_REPOSITORY/gateway@$gateway_digest"
 control_plane_image="$GCP_ARTIFACT_REPOSITORY/control-plane@$control_plane_digest"
 metering_image="$GCP_ARTIFACT_REPOSITORY/metering@$metering_digest"
+bff_image="$GCP_ARTIFACT_REPOSITORY/bff@$bff_digest"
 
 gcloud run jobs update "$MIGRATION_JOB" \
   --project="$GCP_PROJECT_ID" \
@@ -175,6 +178,7 @@ update_service() {
 control_plane_revision="not-provisioned"
 metering_revision="not-provisioned"
 gateway_revision="blocked-on-provider-and-routing-bootstrap"
+bff_revision="not-provisioned"
 
 if service_exists "$CONTROL_PLANE_SERVICE"; then
   control_plane_revision=$(update_service "$CONTROL_PLANE_SERVICE" "$control_plane_image")
@@ -185,6 +189,9 @@ fi
 if service_exists "$GATEWAY_SERVICE"; then
   gateway_revision=$(update_service "$GATEWAY_SERVICE" "$gateway_image")
 fi
+if service_exists "$BFF_SERVICE"; then
+  bff_revision=$(update_service "$BFF_SERVICE" "$bff_image")
+fi
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
@@ -192,6 +199,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'gateway_digest=%s\n' "$gateway_digest"
     printf 'control_plane_digest=%s\n' "$control_plane_digest"
     printf 'metering_digest=%s\n' "$metering_digest"
+    printf 'bff_digest=%s\n' "$bff_digest"
     printf 'schema_migrate_digest=%s\n' "$schema_migrate_digest"
     printf 'provider_bootstrap_digest=%s\n' "$provider_bootstrap_digest"
     printf 'gateway_bootstrap_digest=%s\n' "$gateway_bootstrap_digest"
@@ -201,6 +209,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'control_plane_revision=%s\n' "$control_plane_revision"
     printf 'metering_revision=%s\n' "$metering_revision"
     printf 'gateway_revision=%s\n' "$gateway_revision"
+    printf 'bff_revision=%s\n' "$bff_revision"
   } >>"$GITHUB_OUTPUT"
 fi
 
@@ -213,6 +222,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "- Gateway: \`$gateway_digest\`"
     echo "- Control Plane: \`$control_plane_digest\`"
     echo "- Metering: \`$metering_digest\`"
+    echo "- BFF console: \`$bff_digest\`"
     echo "- Schema migration: \`$schema_migrate_digest\`"
     echo "- Provider bootstrap: \`$provider_bootstrap_digest\`"
     echo "- Gateway bootstrap: \`$gateway_bootstrap_digest\`"
@@ -222,8 +232,9 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "- Control Plane revision: \`$control_plane_revision\`"
     echo "- Metering revision: \`$metering_revision\`"
     echo "- Gateway revision: \`$gateway_revision\`"
+    echo "- BFF console revision: \`$bff_revision\`"
     echo
-    echo 'Services remain IAM-protected behind internal-and-load-balancer ingress; this workflow does not create public traffic.'
+    echo 'Gateway, Control Plane, and Metering remain IAM-protected behind internal-and-load-balancer ingress. The WorkOS-authenticated BFF console is public only when separately provisioned by Terraform.'
   } >>"$GITHUB_STEP_SUMMARY"
 fi
 

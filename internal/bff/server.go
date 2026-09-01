@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/toddzheng/llm-gateway/internal/cloudrunidentity"
 )
 
 const maxLLMRequestBody = 1 << 20 // 1 MiB
@@ -40,17 +42,30 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := os.Stat(filepath.Join(cfg.WebDist, "index.html")); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "web_dist_missing", "web console build is unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
 
 	registerAuthRoutes(mux, auth)
 
 	// Gateway LLM endpoints: /api/llm/X → /v1/X, except healthz/readyz which
 	// pass through unchanged. No Idempotency-Key is added here; the gateway
 	// owns request identity for Responses.
-	gateway := newUpstreamProxy(gatewayURL, cfg.GatewayAPIKey, "/api/llm", func(req *http.Request) {
+	gateway, err := newUpstreamProxy(gatewayURL, cfg.GatewayAPIKey, false, cfg.GatewayCloudRunAudience, "/api/llm", func(req *http.Request) {
 		if req.URL.Path != "/healthz" && req.URL.Path != "/readyz" {
 			req.URL.Path = "/v1" + req.URL.Path
 		}
 	})
+	if err != nil {
+		return nil, fmt.Errorf("BFF_GATEWAY_CLOUD_RUN_AUDIENCE: %w", err)
+	}
 	if !cfg.GatewayConfigured {
 		gateway = nil
 	}
@@ -66,21 +81,27 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	// Control plane: strip /api, inject admin token, add Idempotency-Key on
 	// mutations that do not already carry one. Health endpoints live at the
 	// server root, not under /control, so remap them after the /api strip.
-	control := newUpstreamProxy(controlURL, cfg.ControlPlaneToken, "/api", func(req *http.Request) {
+	control, err := newUpstreamProxy(controlURL, cfg.ControlPlaneToken, true, cfg.ControlCloudRunAudience, "/api", func(req *http.Request) {
 		if req.URL.Path == "/control/healthz" || req.URL.Path == "/control/readyz" {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/control")
 		}
 		ensureIdempotencyKey(req)
 	})
+	if err != nil {
+		return nil, fmt.Errorf("BFF_CONTROL_PLANE_CLOUD_RUN_AUDIENCE: %w", err)
+	}
 	mux.Handle("/api/control/", authorizeBusinessRequest(auth, upstreamOrUnconfigured("/api/control/", control, cfg.ControlConfigured)))
 
 	// Metering: strip /api, inject admin token. Health endpoints live at the
 	// server root, not under /metering.
-	metering := newUpstreamProxy(meteringURL, cfg.MeteringToken, "/api", func(req *http.Request) {
+	metering, err := newUpstreamProxy(meteringURL, cfg.MeteringToken, true, cfg.MeteringCloudRunAudience, "/api", func(req *http.Request) {
 		if req.URL.Path == "/metering/healthz" || req.URL.Path == "/metering/readyz" {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/metering")
 		}
 	})
+	if err != nil {
+		return nil, fmt.Errorf("BFF_METERING_CLOUD_RUN_AUDIENCE: %w", err)
+	}
 	mux.Handle("/api/metering/", authorizeBusinessRequest(auth, upstreamOrUnconfigured("/api/metering/", metering, cfg.MeteringConfigured)))
 
 	mux.Handle("/", spaHandler(cfg.WebDist))
@@ -104,9 +125,17 @@ func newTransport() *http.Transport {
 // injecting the upstream bearer token. stripPrefix is removed from the request
 // path before joining it with the target path. mutate may adjust the outbound
 // request (e.g. add Idempotency-Key).
-func newUpstreamProxy(target *url.URL, token, stripPrefix string, mutate func(*http.Request)) *httputil.ReverseProxy {
+func newUpstreamProxy(target *url.URL, token string, useSessionToken bool, cloudRunAudience, stripPrefix string, mutate func(*http.Request)) (*httputil.ReverseProxy, error) {
+	var transport http.RoundTripper = newTransport()
+	if cloudRunAudience != "" {
+		var err error
+		transport, err = cloudrunidentity.NewTransport(cloudRunAudience, transport)
+		if err != nil {
+			return nil, err
+		}
+	}
 	proxy := &httputil.ReverseProxy{
-		Transport:     newTransport(),
+		Transport:     transport,
 		FlushInterval: -1, // flush each upstream write immediately (SSE correctness)
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
@@ -115,8 +144,12 @@ func newUpstreamProxy(target *url.URL, token, stripPrefix string, mutate func(*h
 			req.Host = target.Host
 			req.Header.Del("Authorization")
 			req.Header.Del("Cookie")
-			if token != "" {
-				req.Header.Set("Authorization", "Bearer "+token)
+			upstreamToken := token
+			if useSessionToken && accessTokenFromContext(req.Context()) != "" {
+				upstreamToken = accessTokenFromContext(req.Context())
+			}
+			if upstreamToken != "" {
+				req.Header.Set("Authorization", "Bearer "+upstreamToken)
 			}
 			if mutate != nil {
 				mutate(req)
@@ -138,7 +171,7 @@ func newUpstreamProxy(target *url.URL, token, stripPrefix string, mutate func(*h
 			writeError(w, http.StatusBadGateway, "upstream_unavailable", "upstream request failed")
 		},
 	}
-	return proxy
+	return proxy, nil
 }
 
 func joinPath(base, p string) string {

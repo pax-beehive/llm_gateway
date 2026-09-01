@@ -18,11 +18,21 @@ const authorizationHeader = "X-Serverless-Authorization"
 // NewClient returns an HTTP client that attaches an ADC-backed Cloud Run ID
 // token whose audience is the receiving service URL.
 func NewClient(audience string) (*http.Client, error) {
+	transport, err := NewTransport(audience, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: transport}, nil
+}
+
+// NewTransport attaches an ADC-backed Cloud Run identity token while
+// preserving the application Authorization header and transport behavior.
+func NewTransport(audience string, base http.RoundTripper) (http.RoundTripper, error) {
 	audience = strings.TrimSpace(audience)
 	if audience == "" {
 		return nil, errors.New("Cloud Run identity audience is required")
 	}
-	return &http.Client{Transport: &transport{tokens: &lazyTokenProvider{audience: audience}}}, nil
+	return &transport{tokens: &lazyTokenProvider{audience: audience}, base: base}, nil
 }
 
 type lazyTokenProvider struct {

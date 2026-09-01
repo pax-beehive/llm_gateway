@@ -40,6 +40,7 @@ type sessionView struct {
 	Organization  sessionOrg  `json:"organization"`
 	Role          string      `json:"role"`
 	Permissions   []string    `json:"permissions"`
+	accessToken   string
 }
 
 type sessionUser struct {
@@ -369,6 +370,7 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 		Organization: sessionOrg{ID: result.OrganizationID, Name: organizationName},
 		Role:         result.Role,
 		Permissions:  append([]string(nil), result.Permissions...),
+		accessToken:  data.AccessToken,
 	}
 	return &view, nil
 }
