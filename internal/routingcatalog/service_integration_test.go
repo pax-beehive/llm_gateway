@@ -57,6 +57,46 @@ func TestValidatedDraftPublishesOneImmutableRoutingCatalogRevision(t *testing.T)
 	}
 }
 
+func TestDraftListUsesStableDescendingCursorAndStatusFilter(t *testing.T) {
+	ctx, _, service, actor := newIntegrationService(t)
+	prefix := fmt.Sprintf("rcd-list-%d", time.Now().UnixNano())
+	wanted := map[string]bool{}
+	for index := 0; index < 3; index++ {
+		id := fmt.Sprintf("%s-%d", prefix, index)
+		if _, err := service.CreateDraft(ctx, actor, "create-"+id, routingcatalog.CreateDraftCommand{ID: id, Document: validDocument()}); err != nil {
+			t.Fatal(err)
+		}
+		wanted[id] = true
+	}
+	visited := map[string]bool{}
+	found := map[string]bool{}
+	cursor := ""
+	for pageNumber := 0; pageNumber < 100 && len(found) < len(wanted); pageNumber++ {
+		page, err := service.ListDrafts(ctx, actor, routingcatalog.DraftFilter{Status: routingcatalog.DraftOpen, Cursor: cursor, Limit: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, draft := range page.Data {
+			if visited[draft.ID] {
+				t.Fatalf("draft %s repeated across cursor pages", draft.ID)
+			}
+			visited[draft.ID] = true
+			if wanted[draft.ID] {
+				found[draft.ID] = true
+			}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	for id := range wanted {
+		if !found[id] {
+			t.Fatalf("draft %s was not reachable through stable pagination", id)
+		}
+	}
+}
+
 func TestConcurrentDraftPublicationsFromOneBaseHaveOneWinner(t *testing.T) {
 	ctx, _, service, actor := newIntegrationService(t)
 	base := int64(0)

@@ -146,6 +146,12 @@ closed. Grant the Metering identity only `storage.buckets.get`,
 `storage.objects.create`, and `storage.objects.get` on that bucket. The
 filesystem adapter and `METERING_EXPORT_DIRECTORY` are development-only.
 
+Platform Metering identities may omit `tenant_id` from usage summary and
+time-series requests to receive an all-Tenant aggregate. Quota admission
+failures are emitted by the Gateway as content-free outbox evidence and queried
+through `GET /metering/v1/quota-denials`; Tenant identities remain forced to
+their verified Tenant and platform identities may query across Tenants.
+
 Run the Metering schema as an owner job, then apply its runtime boundary with
 `make configure-metering-role ADMIN_DATABASE_URL=... METERING_DB_ROLE=...`.
 That role can consume usage outbox rows but cannot read `responses` or any

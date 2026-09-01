@@ -94,7 +94,7 @@ func (r *Runtime) Embed(ctx context.Context, request core.EmbeddingRequest) (str
 	}
 	estimatedInputUnits := estimateEmbeddingInputUnits(request.Input)
 	if limits.EmbeddingInputUnits != nil && estimatedInputUnits > *limits.EmbeddingInputUnits {
-		return operationID, core.EmbeddingResult{}, fmt.Errorf("%w: embedding input units", ErrQuotaExceeded)
+		return operationID, core.EmbeddingResult{}, r.quotaDenied(ctx, request.CapabilityPrincipal, operationID, core.CapabilityEmbeddings, request.Model, "", "effective_policy", "embedding_input_units", "")
 	}
 	if err := r.assertWriter(ctx, request.CapabilityPrincipal); err != nil {
 		return operationID, core.EmbeddingResult{}, err
@@ -110,10 +110,10 @@ func (r *Runtime) Embed(ctx context.Context, request core.EmbeddingRequest) (str
 		}
 		reservedSpend := perMillionCost(estimatedInputUnits, route.PriceSnapshot.EmbeddingInputPerMillionMicros)
 		if exceeds(limits.CapabilitySpendMicros, reservedSpend) || exceeds(limits.MaxCostMicros, reservedSpend) {
-			return operationID, core.EmbeddingResult{}, fmt.Errorf("%w: capability spend", ErrQuotaExceeded)
+			return operationID, core.EmbeddingResult{}, r.quotaDenied(ctx, request.CapabilityPrincipal, operationID, core.CapabilityEmbeddings, request.Model, route.ID, "effective_policy", "capability_spend", route.PriceSnapshot.Currency)
 		}
 		reservation, reserveErr := r.reserve(ctx, request.CapabilityPrincipal, attemptOperationID(operationID, attempt), core.CapabilityEmbeddings,
-			reservedSpend, route.PriceSnapshot.Currency, estimatedInputUnits, 0)
+			request.Model, route.ID, reservedSpend, route.PriceSnapshot.Currency, estimatedInputUnits, 0)
 		if reserveErr != nil {
 			if errors.Is(reserveErr, quota.ErrExceeded) {
 				return operationID, core.EmbeddingResult{}, fmt.Errorf("%w: %v", ErrQuotaExceeded, reserveErr)
@@ -183,6 +183,8 @@ func (r *Runtime) reserve(
 	principal core.CapabilityPrincipal,
 	operationID string,
 	capability core.Capability,
+	publicModel string,
+	routeID string,
 	spendMicros int64,
 	currency string,
 	embeddingInputUnits int64,
@@ -197,6 +199,7 @@ func (r *Runtime) reserve(
 	}
 	reservation, err := r.quota.Reserve(ctx, quota.ReservationRequest{
 		TenantID: principal.TenantID, APIKeyID: principal.APIKeyID, CapabilityOperationID: operationID, Capability: capability,
+		PublicModel: publicModel, RouteID: routeID, Region: principal.HomeRegion,
 		HomeRegion: principal.HomeRegion, ExecutionEpoch: principal.ExecutionEpoch,
 		TenantPolicyRevision: principal.TenantPolicy.Revision, APIKeyPolicyRevision: principal.APIKeyPolicy.Revision,
 		TenantLimits: principal.TenantPolicy.Limits, APIKeyLimits: principal.APIKeyPolicy.Limits,
@@ -208,6 +211,39 @@ func (r *Runtime) reserve(
 		return nil, err
 	}
 	return providerattempt.New(r.quota, &reservation), nil
+}
+
+func (r *Runtime) quotaDenied(
+	ctx context.Context,
+	principal core.CapabilityPrincipal,
+	operationID string,
+	capability core.Capability,
+	publicModel string,
+	routeID string,
+	scope string,
+	dimension string,
+	currency string,
+) error {
+	denial := fmt.Errorf("%w: %s", ErrQuotaExceeded, dimension)
+	recorder, ok := r.quota.(quota.DenialRecorder)
+	if !ok || principal.APIKeyID == "" {
+		return denial
+	}
+	event := quota.DenialEvent{
+		TenantID: principal.TenantID, APIKeyID: principal.APIKeyID, OperationID: operationID,
+		Capability: string(capability), PublicModel: publicModel, RouteID: routeID, Region: principal.HomeRegion,
+		Scope: scope, Dimension: dimension, Currency: currency,
+	}
+	if principal.TenantPolicy != nil {
+		event.TenantPolicyRevision = principal.TenantPolicy.Revision
+	}
+	if principal.APIKeyPolicy != nil {
+		event.APIKeyPolicyRevision = principal.APIKeyPolicy.Revision
+	}
+	if err := recorder.RecordDenial(context.WithoutCancel(ctx), event); err != nil {
+		return errors.Join(denial, fmt.Errorf("record quota denial evidence: %w", err))
+	}
+	return denial
 }
 
 func (r *Runtime) assertWriter(ctx context.Context, principal core.CapabilityPrincipal) error {
@@ -310,10 +346,10 @@ func (r *Runtime) Moderate(ctx context.Context, request core.ModerationRequest) 
 		}
 		reservedSpend := perMillionCost(estimatedInputUnits, route.PriceSnapshot.ModerationInputPerMillionMicros)
 		if exceeds(limits.CapabilitySpendMicros, reservedSpend) || exceeds(limits.MaxCostMicros, reservedSpend) {
-			return operationID, core.ModerationResult{}, fmt.Errorf("%w: capability spend", ErrQuotaExceeded)
+			return operationID, core.ModerationResult{}, r.quotaDenied(ctx, request.CapabilityPrincipal, operationID, core.CapabilityModeration, request.Model, route.ID, "effective_policy", "capability_spend", route.PriceSnapshot.Currency)
 		}
 		reservation, reserveErr := r.reserve(ctx, request.CapabilityPrincipal, attemptOperationID(operationID, attempt), core.CapabilityModeration,
-			reservedSpend, route.PriceSnapshot.Currency, 0, 0)
+			request.Model, route.ID, reservedSpend, route.PriceSnapshot.Currency, 0, 0)
 		if reserveErr != nil {
 			if errors.Is(reserveErr, quota.ErrExceeded) {
 				return operationID, core.ModerationResult{}, fmt.Errorf("%w: %v", ErrQuotaExceeded, reserveErr)
@@ -410,7 +446,7 @@ func (r *Runtime) Rerank(ctx context.Context, request core.RerankRequest) (strin
 	}
 	documents := int64(len(request.Documents))
 	if limits.RerankDocuments != nil && documents > *limits.RerankDocuments {
-		return operationID, core.RerankResult{}, fmt.Errorf("%w: rerank documents", ErrQuotaExceeded)
+		return operationID, core.RerankResult{}, r.quotaDenied(ctx, request.CapabilityPrincipal, operationID, core.CapabilityRerank, request.Model, "", "effective_policy", "rerank_documents", "")
 	}
 	if err := r.assertWriter(ctx, request.CapabilityPrincipal); err != nil {
 		return operationID, core.RerankResult{}, err
@@ -426,10 +462,10 @@ func (r *Runtime) Rerank(ctx context.Context, request core.RerankRequest) (strin
 		}
 		reservedSpend := perThousandCost(documents, route.PriceSnapshot.RerankDocumentPerThousandMicros)
 		if exceeds(limits.CapabilitySpendMicros, reservedSpend) || exceeds(limits.MaxCostMicros, reservedSpend) {
-			return operationID, core.RerankResult{}, fmt.Errorf("%w: capability spend", ErrQuotaExceeded)
+			return operationID, core.RerankResult{}, r.quotaDenied(ctx, request.CapabilityPrincipal, operationID, core.CapabilityRerank, request.Model, route.ID, "effective_policy", "capability_spend", route.PriceSnapshot.Currency)
 		}
 		reservation, reserveErr := r.reserve(ctx, request.CapabilityPrincipal, attemptOperationID(operationID, attempt), core.CapabilityRerank,
-			reservedSpend, route.PriceSnapshot.Currency, 0, documents)
+			request.Model, route.ID, reservedSpend, route.PriceSnapshot.Currency, 0, documents)
 		if reserveErr != nil {
 			if errors.Is(reserveErr, quota.ErrExceeded) {
 				return operationID, core.RerankResult{}, fmt.Errorf("%w: %v", ErrQuotaExceeded, reserveErr)

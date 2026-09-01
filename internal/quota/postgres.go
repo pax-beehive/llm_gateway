@@ -21,6 +21,9 @@ type ReservationRequest struct {
 	ResponseAttemptID           string
 	CapabilityOperationID       string
 	Capability                  core.Capability
+	PublicModel                 string
+	RouteID                     string
+	Region                      string
 	HomeRegion                  string
 	ExecutionEpoch              int64
 	TenantPolicyRevision        int64
@@ -115,19 +118,19 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 		return Reservation{}, errors.New("quota reservation currency does not match policy")
 	}
 	if exceeds(effective.MaxInputTokens, request.ReservedInputTokens) {
-		return Reservation{}, fmt.Errorf("%w: max input tokens", ErrExceeded)
+		return c.rejectReservation(ctx, request, "effective_policy", fmt.Errorf("%w: max input tokens", ErrExceeded))
 	}
 	if exceeds(effective.MaxOutputTokens, request.ReservedOutputTokens) {
-		return Reservation{}, fmt.Errorf("%w: max output tokens", ErrExceeded)
+		return c.rejectReservation(ctx, request, "effective_policy", fmt.Errorf("%w: max output tokens", ErrExceeded))
 	}
 	if exceeds(effective.MaxCostMicros, request.ReservedSpendMicros) {
-		return Reservation{}, fmt.Errorf("%w: max request cost", ErrExceeded)
+		return c.rejectReservation(ctx, request, "effective_policy", fmt.Errorf("%w: max request cost", ErrExceeded))
 	}
 	if exceeds(effective.EmbeddingInputUnits, request.ReservedEmbeddingInputUnits) {
-		return Reservation{}, fmt.Errorf("%w: embedding input units", ErrExceeded)
+		return c.rejectReservation(ctx, request, "effective_policy", fmt.Errorf("%w: embedding input units", ErrExceeded))
 	}
 	if exceeds(effective.RerankDocuments, request.ReservedRerankDocuments) {
-		return Reservation{}, fmt.Errorf("%w: rerank documents", ErrExceeded)
+		return c.rejectReservation(ctx, request, "effective_policy", fmt.Errorf("%w: rerank documents", ErrExceeded))
 	}
 	now := c.now().UTC()
 	minuteStart := now.Truncate(time.Minute)
@@ -163,10 +166,18 @@ func (c *PostgresController) Reserve(ctx context.Context, request ReservationReq
 	tokens := request.ReservedInputTokens + request.ReservedOutputTokens
 	if err := reserveScope(ctx, tx, counterScope{tenantID: request.TenantID}, request.TenantLimits,
 		request.Requests, tokens, request.ReservedSpendMicros, request.Currency, minuteStart, dayStart, monthStart); err != nil {
+		if errors.Is(err, ErrExceeded) {
+			_ = tx.Rollback()
+			return c.rejectReservation(ctx, request, "tenant", err)
+		}
 		return Reservation{}, err
 	}
 	if err := reserveScope(ctx, tx, counterScope{tenantID: request.TenantID, apiKeyID: request.APIKeyID}, effective,
 		request.Requests, tokens, request.ReservedSpendMicros, request.Currency, minuteStart, dayStart, monthStart); err != nil {
+		if errors.Is(err, ErrExceeded) {
+			_ = tx.Rollback()
+			return c.rejectReservation(ctx, request, "api_key", err)
+		}
 		return Reservation{}, err
 	}
 	kind := "response"
@@ -235,10 +246,18 @@ func (c *PostgresController) ReserveRefresh(ctx context.Context, request Refresh
 	}
 	if err := reserveRefreshScope(ctx, tx, counterScope{tenantID: request.TenantID}, request.TenantLimits,
 		request.ReservedSpendMicros, request.Currency, dayStart, monthStart); err != nil {
+		if errors.Is(err, ErrExceeded) {
+			_ = tx.Rollback()
+			return c.rejectRefreshReservation(ctx, request, "tenant", err)
+		}
 		return Reservation{}, err
 	}
 	if err := reserveRefreshScope(ctx, tx, counterScope{tenantID: request.TenantID, apiKeyID: request.APIKeyID}, effective,
 		request.ReservedSpendMicros, request.Currency, dayStart, monthStart); err != nil {
+		if errors.Is(err, ErrExceeded) {
+			_ = tx.Rollback()
+			return c.rejectRefreshReservation(ctx, request, "api_key", err)
+		}
 		return Reservation{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `

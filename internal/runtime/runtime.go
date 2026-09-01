@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"math/bits"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,6 +155,9 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	}
 	admittedCtx, release, err := r.admit(ctx, request)
 	if err != nil {
+		if errors.Is(err, ErrQuotaExceeded) {
+			r.recordQuotaDenial(ctx, request, quota.DenialEvent{Scope: "gateway", Dimension: "concurrent_responses"})
+		}
 		return core.Response{}, err
 	}
 	defer release()
@@ -215,6 +219,7 @@ func (r *Runtime) execute(ctx context.Context, request core.Request, emit func(c
 	}
 	if err := quota.ApplyRequestLimits(&request, effectiveLimits); err != nil {
 		if errors.Is(err, quota.ErrExceeded) {
+			r.recordQuotaDenial(ctx, request, quota.DenialEvent{Scope: "effective_policy", Dimension: quotaDenialDimension(err)})
 			return core.Response{}, fmt.Errorf("%w: %v", ErrQuotaExceeded, err)
 		}
 		return core.Response{}, err
@@ -518,6 +523,7 @@ func (r *Runtime) reserveResponseAttempt(
 	}
 	reserved, err := r.quotaController.Reserve(ctx, quota.ReservationRequest{
 		TenantID: request.TenantID, APIKeyID: request.APIKeyID, ResponseID: responseID, ResponseAttemptID: attemptID,
+		PublicModel: request.Model, RouteID: route.ID, Region: route.Region,
 		TenantPolicyRevision: tenantPolicy.Revision, APIKeyPolicyRevision: apiKeyPolicy.Revision,
 		TenantLimits: tenantPolicy.Limits, APIKeyLimits: apiKeyPolicy.Limits,
 		Requests: 1, ReservedInputTokens: estimate.InputTokens, ReservedOutputTokens: estimate.OutputTokens,
@@ -527,6 +533,31 @@ func (r *Runtime) reserveResponseAttempt(
 		return nil, err
 	}
 	return providerattempt.New(r.quotaController, &reserved), nil
+}
+
+func (r *Runtime) recordQuotaDenial(ctx context.Context, request core.Request, event quota.DenialEvent) {
+	recorder, ok := r.quotaController.(quota.DenialRecorder)
+	if !ok || request.APIKeyID == "" {
+		return
+	}
+	event.TenantID = request.TenantID
+	event.APIKeyID = request.APIKeyID
+	event.PublicModel = request.Model
+	event.Region = request.HomeRegion
+	if policy, exists := r.tenantPolicy(request); exists {
+		event.TenantPolicyRevision = policy.Revision
+	}
+	if request.APIKeyPolicy != nil {
+		event.APIKeyPolicyRevision = request.APIKeyPolicy.Revision
+	}
+	if err := recorder.RecordDenial(context.WithoutCancel(ctx), event); err != nil && r.coordinationError != nil {
+		r.coordinationError(fmt.Errorf("record quota denial evidence: %w", err))
+	}
+}
+
+func quotaDenialDimension(err error) string {
+	message := strings.TrimPrefix(err.Error(), quota.ErrExceeded.Error()+": ")
+	return strings.ReplaceAll(strings.TrimSpace(message), " ", "_")
 }
 
 func (r *Runtime) settleIncompleteAttempt(reservation *providerattempt.Attempt) {

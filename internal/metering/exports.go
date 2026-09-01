@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -89,6 +90,9 @@ func (store *FileExportStore) Get(_ context.Context, key string) ([]byte, error)
 }
 
 func (service *Service) RequestExport(ctx context.Context, filter Filter) (Export, error) {
+	if filter.TenantID == "" || filter.AllTenants {
+		return Export{}, fmt.Errorf("%w: exports require Tenant scope", ErrInvalidArgument)
+	}
 	if _, _, err := filterSQL(filter, "", 1); err != nil {
 		return Export{}, err
 	}

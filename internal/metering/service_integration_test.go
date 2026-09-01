@@ -19,6 +19,7 @@ import (
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/metering"
 	"github.com/toddzheng/llm-gateway/internal/migrations"
+	"github.com/toddzheng/llm-gateway/internal/quota"
 	"github.com/toddzheng/llm-gateway/internal/store"
 )
 
@@ -50,6 +51,7 @@ func TestRelayDeduplicatesCorrectsRebuildsAndIsolatesTenants(t *testing.T) {
 	t.Cleanup(func() {
 		for _, tenant := range []string{tenantA, tenantB} {
 			_, _ = database.ExecContext(context.Background(), `DELETE FROM metering_exports WHERE tenant_id=$1`, tenant)
+			_, _ = database.ExecContext(context.Background(), `DELETE FROM metering_quota_denials WHERE tenant_id=$1`, tenant)
 			_, _ = database.ExecContext(context.Background(), `DELETE FROM metering_usage_daily WHERE tenant_id=$1`, tenant)
 			_, _ = database.ExecContext(context.Background(), `DELETE FROM metering_usage_facts WHERE tenant_id=$1`, tenant)
 			_, _ = database.ExecContext(context.Background(), `DELETE FROM metering_inbox WHERE tenant_id=$1`, tenant)
@@ -58,7 +60,7 @@ func TestRelayDeduplicatesCorrectsRebuildsAndIsolatesTenants(t *testing.T) {
 		}
 	})
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
-	event := metering.UsageEvent{SchemaVersion: 1, Type: metering.EventUsageRecorded, UsageID: prefix + "-usage", TenantID: tenantA, APIKeyID: "key-a", ResponseID: "response-a", AttemptID: "attempt-a", RouteID: "route-a", Provider: "openai", PublicModel: "gateway-model", ProviderModel: "gpt-test", Region: "test", PriceSnapshotID: "price-a", InputTokens: 10, OutputTokens: 5, AmountMicros: 25, Currency: "USD", Outcome: "committed", OccurredAt: now}
+	event := metering.UsageEvent{SchemaVersion: 1, Type: metering.EventUsageRecorded, UsageID: prefix + "-usage", TenantID: tenantA, APIKeyID: "key-a", ResponseID: "response-a", AttemptID: "attempt-a", RouteID: prefix + "-route", Provider: "openai", PublicModel: "gateway-model", ProviderModel: "gpt-test", Region: "test", PriceSnapshotID: "price-a", InputTokens: 10, OutputTokens: 5, AmountMicros: 25, Currency: "USD", Outcome: "committed", OccurredAt: now}
 	payload, _ := json.Marshal(event)
 	var outboxID int64
 	if err := database.QueryRowContext(ctx, `INSERT INTO transactional_outbox(tenant_id,aggregate_type,aggregate_id,aggregate_revision,event_type,payload,created_at) VALUES($1,'usage',$2,1,'usage.recorded',$3,$4) RETURNING id`, tenantA, event.UsageID, payload, now).Scan(&outboxID); err != nil {
@@ -93,6 +95,43 @@ func TestRelayDeduplicatesCorrectsRebuildsAndIsolatesTenants(t *testing.T) {
 	}
 	if len(other.Totals) != 0 {
 		t.Fatalf("cross-Tenant usage=%#v", other)
+	}
+	tenantBEvent := event
+	tenantBEvent.UsageID = prefix + "-usage-tenant-b"
+	tenantBEvent.TenantID = tenantB
+	tenantBEvent.APIKeyID = "key-b"
+	tenantBEvent.ResponseID = "response-tenant-b"
+	tenantBEvent.AttemptID = "attempt-tenant-b"
+	tenantBPayload, _ := json.Marshal(tenantBEvent)
+	if _, err := database.ExecContext(ctx, `INSERT INTO transactional_outbox(tenant_id,aggregate_type,aggregate_id,aggregate_revision,event_type,payload,created_at) VALUES($1,'usage',$2,1,'usage.recorded',$3,$4)`, tenantB, tenantBEvent.UsageID, tenantBPayload, now); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := service.ConsumeOutboxBatch(ctx, prefix+"-worker", 1000, time.Minute); err != nil || processed < 1 {
+		t.Fatalf("consume Tenant B usage=%d/%v", processed, err)
+	}
+	platformSummary, err := service.Summary(ctx, metering.Filter{AllTenants: true, RouteID: event.RouteID})
+	if err != nil || len(platformSummary.Totals) != 1 || platformSummary.Totals[0].OperationCount != 2 || platformSummary.Totals[0].AmountMicros != 50 {
+		t.Fatalf("platform summary=%#v/%v", platformSummary, err)
+	}
+	platformSeries, err := service.TimeSeries(ctx, metering.Filter{AllTenants: true, RouteID: event.RouteID, From: now.Add(-time.Hour), Through: now.Add(time.Hour)}, "hour")
+	if err != nil || len(platformSeries) != 1 || platformSeries[0].Totals.OperationCount != 2 {
+		t.Fatalf("platform timeseries=%#v/%v", platformSeries, err)
+	}
+	denialRoute := prefix + "-denied-route"
+	quotaController := quota.NewPostgresController(database, func() time.Time { return now.Add(2 * time.Hour) })
+	if err := quotaController.RecordDenial(ctx, quota.DenialEvent{
+		TenantID: tenantA, APIKeyID: "key-a", ResponseID: "response-denied", AttemptID: "attempt-denied",
+		PublicModel: "gateway-model", RouteID: denialRoute, Region: "test", Scope: "api_key", Dimension: "requests",
+		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := service.ConsumeOutboxBatch(ctx, prefix+"-worker", 1000, time.Minute); err != nil || processed < 1 {
+		t.Fatalf("consume quota denial=%d/%v", processed, err)
+	}
+	denials, err := service.QuotaDenials(ctx, metering.QuotaDenialFilter{Filter: metering.Filter{AllTenants: true, RouteID: denialRoute}, Scope: "api_key", Limit: 10})
+	if err != nil || len(denials.Data) != 1 || denials.Data[0].Dimension != "requests" || denials.Data[0].TenantID != tenantA {
+		t.Fatalf("quota denial query=%#v/%v", denials, err)
 	}
 	events, err := service.Events(ctx, metering.Filter{TenantID: tenantA}, "", 10)
 	if err != nil {
@@ -139,7 +178,7 @@ func TestRelayDeduplicatesCorrectsRebuildsAndIsolatesTenants(t *testing.T) {
 	if _, err := database.ExecContext(ctx, `INSERT INTO transactional_outbox(tenant_id,aggregate_type,aggregate_id,aggregate_revision,event_type,payload,created_at) VALUES($1,'usage',$2,1,'usage.recorded',$3,$4)`, tenantA, second.UsageID, secondPayload, now); err != nil {
 		t.Fatal(err)
 	}
-	if processed, err := service.ConsumeOutboxBatch(ctx, prefix+"-worker", 1000, time.Minute); err != nil || processed != 1 {
+	if processed, err := service.ConsumeOutboxBatch(ctx, prefix+"-worker", 1000, time.Minute); err != nil || processed < 1 {
 		t.Fatalf("consume second currency=%d/%v", processed, err)
 	}
 	mixed, err := service.Summary(ctx, metering.Filter{TenantID: tenantA})
@@ -194,7 +233,7 @@ func TestRelayDeduplicatesCorrectsRebuildsAndIsolatesTenants(t *testing.T) {
 	if _, err := database.ExecContext(ctx, `INSERT INTO transactional_outbox(tenant_id,aggregate_type,aggregate_id,aggregate_revision,event_type,payload,created_at) VALUES($1,'usage',$2,1,'usage.recorded',$3,$4)`, tenantA, late.UsageID, latePayload, late.OccurredAt); err != nil {
 		t.Fatal(err)
 	}
-	if processed, err := exportService.ConsumeOutboxBatch(ctx, prefix+"-worker", 1000, time.Minute); err != nil || processed != 1 {
+	if processed, err := exportService.ConsumeOutboxBatch(ctx, prefix+"-worker", 1000, time.Minute); err != nil || processed < 1 {
 		t.Fatalf("consume late usage=%d/%v", processed, err)
 	}
 	if _, err := database.ExecContext(ctx, `UPDATE metering_inbox i SET consumed_at=$3 FROM metering_usage_facts f WHERE f.event_id=i.event_id AND f.tenant_id=$1 AND f.usage_id=$2`, tenantA, late.UsageID, exportCutoff.Add(time.Minute)); err != nil {
@@ -268,7 +307,7 @@ func TestControlledLedgerBackfillIsIdempotent(t *testing.T) {
 		t.Fatalf("backfilled=%d", count)
 	}
 	processed, err := service.ConsumeOutboxBatch(ctx, tenantID+"-worker", 100, time.Minute)
-	if err != nil || processed != 1 {
+	if err != nil || processed < 1 {
 		t.Fatalf("relay after ledger bootstrap=%d/%v", processed, err)
 	}
 	count, err = service.BackfillTenantLedger(ctx, tenantID, 100)

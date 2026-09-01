@@ -1,0 +1,60 @@
+/* Design tokens — Universal LLM Gateway Operations console.
+ * Light theme is the default on :root; dark theme activates via
+ * body[data-theme="dark"] (toggled from the header, persisted to localStorage).
+ * Values mirror docs/design/fe1.html exactly.
+ */
+:root {
+  --bg: #f3f4f6;
+  --panel: #ffffff;
+  --ink: #1a2230;
+  --ink2: #5a6474;
+  --ink3: #8a94a3;
+  --line: #e4e7ec;
+  --chip: #eef0f4;
+
+  --blue: #2b5fd9;
+  --blue-bg: #e9effc;
+  --green: #177a45;
+  --green-bg: #e6f4ec;
+  --amber: #96600a;
+  --amber-bg: #fdf3df;
+  --red: #c03a30;
+  --red-bg: #fdecea;
+  --purple: #6d4fc4;
+  --purple-bg: #f0edfb;
+
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+
+  --font-ui: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 10px;
+  --radius-pill: 99px;
+
+  --sidebar-w: 218px;
+  --sidebar-w-collapsed: 56px;
+  --header-h: 52px;
+}
+
+body[data-theme="dark"] {
+  --bg: #0c1017;
+  --panel: #141a24;
+  --ink: #e7ebf2;
+  --ink2: #9aa5b5;
+  --ink3: #6b7688;
+  --line: #28303e;
+  --chip: #232b39;
+
+  --blue: #84a7f2;
+  --blue-bg: #1d2a47;
+  --green: #5cc088;
+  --green-bg: #143020;
+  --amber: #dfa63f;
+  --amber-bg: #382b10;
+  --red: #ee8078;
+  --red-bg: #3c1b18;
+  --purple: #ab97e9;
+  --purple-bg: #2b2347;
+}

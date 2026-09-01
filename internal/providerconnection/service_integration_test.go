@@ -311,6 +311,18 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 	if err != nil || stillEnabled.AdministrativeStatus != providerconnection.StatusEnabled {
 		t.Fatalf("failed probe changed administrative intent = %#v err=%v", stillEnabled, err)
 	}
+	firstOperations, err := service.ListOperations(ctx, actor, providerconnection.OperationFilter{ConnectionID: id, Limit: 2})
+	if err != nil || len(firstOperations.Data) != 2 || firstOperations.NextCursor == "" {
+		t.Fatalf("first operation page = %#v err=%v", firstOperations, err)
+	}
+	secondOperations, err := service.ListOperations(ctx, actor, providerconnection.OperationFilter{ConnectionID: id, Cursor: firstOperations.NextCursor, Limit: 2})
+	if err != nil || len(secondOperations.Data) == 0 || secondOperations.Data[0].ID == firstOperations.Data[1].ID {
+		t.Fatalf("second operation page = %#v err=%v", secondOperations, err)
+	}
+	failedOnly, err := service.ListOperations(ctx, actor, providerconnection.OperationFilter{ConnectionID: id, Status: providerconnection.OperationFailed, Limit: 10})
+	if err != nil || len(failedOnly.Data) != 1 || failedOnly.Data[0].ID != failed.ID {
+		t.Fatalf("failed operation page = %#v err=%v", failedOnly, err)
+	}
 }
 
 type fakeProviderOperator struct {

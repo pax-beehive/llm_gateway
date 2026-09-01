@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
 type Service struct {
@@ -77,7 +79,7 @@ func (service *Service) claim(ctx context.Context, workerID string, limit int, l
 		FROM transactional_outbox o
 		LEFT JOIN metering_outbox_claims c ON c.source_outbox_id=o.id AND (c.lease_expires_at>now() OR c.poisoned)
 		WHERE o.published_at IS NULL AND c.source_outbox_id IS NULL
-		  AND o.event_type IN ('usage.recorded','capability.usage_recorded','cache_refresh.usage_recorded')
+		  AND o.event_type IN ('usage.recorded','capability.usage_recorded','cache_refresh.usage_recorded','quota.denied')
 		ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -129,6 +131,15 @@ func (service *Service) consumeOne(ctx context.Context, workerID string, claimed
 		}
 		return tx.Commit()
 	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return fmt.Errorf("decode Metering event envelope: %w", err)
+	}
+	if envelope.Type == quota.DenialEventType {
+		return service.consumeQuotaDenial(ctx, tx, workerID, claimed, payload)
+	}
 	var event UsageEvent
 	if err := json.Unmarshal(payload, &event); err != nil {
 		return fmt.Errorf("decode Metering event: %w", err)
@@ -168,10 +179,58 @@ func (service *Service) consumeOne(ctx context.Context, workerID string, claimed
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE transactional_outbox SET published_at=COALESCE(published_at,now()) WHERE id=$1`, claimed.OutboxID); err != nil {
+	return finishClaim(ctx, tx, workerID, claimed.OutboxID)
+}
+
+func (service *Service) consumeQuotaDenial(ctx context.Context, tx *sql.Tx, workerID string, claimed claimedEvent, payload []byte) error {
+	var event quota.DenialEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return fmt.Errorf("decode quota denial event: %w", err)
+	}
+	if event.EventID == "" {
+		event.EventID = claimed.EventID
+	}
+	if event.OccurredAt.IsZero() {
+		event.OccurredAt = claimed.Created.UTC()
+	}
+	if err := event.Validate(); err != nil {
+		return fmt.Errorf("validate quota denial event: %w", err)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM metering_outbox_claims WHERE source_outbox_id=$1 AND worker_id=$2`, claimed.OutboxID, workerID); err != nil {
+	insert, err := tx.ExecContext(ctx, `INSERT INTO metering_inbox(
+		event_id,source_outbox_id,schema_version,event_type,tenant_id,occurred_at,payload)
+		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(event_id) DO NOTHING`,
+		event.EventID, claimed.OutboxID, event.SchemaVersion, event.Type, event.TenantID, event.OccurredAt, encoded)
+	if err != nil {
+		return err
+	}
+	rows, err := insert.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 1 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO metering_quota_denials(
+			event_id,tenant_id,api_key_id,response_id,attempt_id,operation_id,capability,public_model,route_id,region,
+			denial_scope,dimension,currency,tenant_policy_revision,api_key_policy_revision,occurred_at)
+			VALUES($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),
+			NULLIF($9,''),NULLIF($10,''),$11,$12,NULLIF($13,''),NULLIF($14,0),NULLIF($15,0),$16)`,
+			event.EventID, event.TenantID, event.APIKeyID, event.ResponseID, event.AttemptID, event.OperationID,
+			event.Capability, event.PublicModel, event.RouteID, event.Region, event.Scope, event.Dimension,
+			event.Currency, event.TenantPolicyRevision, event.APIKeyPolicyRevision, event.OccurredAt); err != nil {
+			return err
+		}
+	}
+	return finishClaim(ctx, tx, workerID, claimed.OutboxID)
+}
+
+func finishClaim(ctx context.Context, tx *sql.Tx, workerID string, outboxID int64) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE transactional_outbox SET published_at=COALESCE(published_at,now()) WHERE id=$1`, outboxID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM metering_outbox_claims WHERE source_outbox_id=$1 AND worker_id=$2`, outboxID, workerID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -352,19 +411,22 @@ func (service *Service) Events(ctx context.Context, filter Filter, cursor string
 }
 
 func filterSQL(filter Filter, prefix string, firstPlaceholder int) (string, []any, error) {
-	if filter.TenantID == "" {
+	if filter.TenantID == "" && !filter.AllTenants {
 		return "", nil, fmt.Errorf("%w: Tenant scope is required", ErrInvalidArgument)
 	}
 	if !filter.From.IsZero() && !filter.Through.IsZero() && filter.Through.Before(filter.From) {
 		return "", nil, fmt.Errorf("%w: invalid time range", ErrInvalidArgument)
 	}
-	where := []string{fmt.Sprintf("%stenant_id=$%d", prefix, firstPlaceholder)}
-	args := []any{filter.TenantID}
-	placeholder := func() int { return firstPlaceholder + len(args) }
+	where := []string{"TRUE"}
+	args := []any{}
+	if filter.TenantID != "" {
+		args = append(args, filter.TenantID)
+		where = append(where, fmt.Sprintf("%stenant_id=$%d", prefix, firstPlaceholder+len(args)-1))
+	}
 	add := func(column, value string) {
 		if value != "" {
 			args = append(args, value)
-			where = append(where, fmt.Sprintf("%s%s=$%d", prefix, column, placeholder()-1))
+			where = append(where, fmt.Sprintf("%s%s=$%d", prefix, column, firstPlaceholder+len(args)-1))
 		}
 	}
 	add("api_key_id", filter.APIKeyID)
@@ -501,7 +563,7 @@ func (service *Service) Status(ctx context.Context) (Status, error) {
 	if err := service.database.QueryRowContext(ctx, `SELECT id,source_cutoff FROM metering_projection_generations WHERE status='active'`).Scan(&result.ProjectionGeneration, &result.ProjectionCutoff); err != nil {
 		return Status{}, err
 	}
-	if err := service.database.QueryRowContext(ctx, `SELECT count(*),min(created_at) FROM transactional_outbox WHERE published_at IS NULL AND event_type IN ('usage.recorded','capability.usage_recorded','cache_refresh.usage_recorded')`).Scan(&result.PendingEvents, &result.OldestPendingAt); err != nil {
+	if err := service.database.QueryRowContext(ctx, `SELECT count(*),min(created_at) FROM transactional_outbox WHERE published_at IS NULL AND event_type IN ('usage.recorded','capability.usage_recorded','cache_refresh.usage_recorded','quota.denied')`).Scan(&result.PendingEvents, &result.OldestPendingAt); err != nil {
 		return Status{}, err
 	}
 	if err := service.database.QueryRowContext(ctx, `SELECT count(*) FROM metering_outbox_claims WHERE poisoned`).Scan(&result.PoisonEvents); err != nil {

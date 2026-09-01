@@ -95,6 +95,17 @@ type RevisionPage struct {
 	NextCursor int64      `json:"next_cursor,omitempty"`
 }
 
+type DraftFilter struct {
+	Status DraftStatus
+	Cursor string
+	Limit  int
+}
+
+type DraftPage struct {
+	Data       []Draft `json:"data"`
+	NextCursor string  `json:"next_cursor,omitempty"`
+}
+
 type CreateDraftCommand struct {
 	ID           string
 	BaseRevision int64

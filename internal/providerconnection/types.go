@@ -139,6 +139,19 @@ type OperationResult struct {
 	Replay    bool      `json:"replay,omitempty"`
 }
 
+type OperationFilter struct {
+	ConnectionID string
+	Type         OperationType
+	Status       OperationStatus
+	Cursor       string
+	Limit        int
+}
+
+type OperationPage struct {
+	Data       []Operation `json:"data"`
+	NextCursor string      `json:"next_cursor,omitempty"`
+}
+
 type OperationCommand struct {
 	ConnectionID     string
 	ExpectedRevision int64

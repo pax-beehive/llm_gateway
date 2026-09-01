@@ -9,6 +9,9 @@ BEGIN
        OR NOT has_column_privilege('llm_gateway_metering_test','transactional_outbox','published_at','UPDATE')
        OR has_column_privilege('llm_gateway_metering_test','transactional_outbox','payload','UPDATE')
        OR NOT has_table_privilege('llm_gateway_metering_test','metering_inbox','INSERT')
+       OR NOT has_table_privilege('llm_gateway_metering_test','metering_quota_denials','SELECT')
+       OR NOT has_table_privilege('llm_gateway_metering_test','metering_quota_denials','INSERT')
+       OR has_table_privilege('llm_gateway_metering_test','metering_quota_denials','DELETE')
        OR has_table_privilege('llm_gateway_metering_test','usage_ledger','SELECT')
        OR has_table_privilege('llm_gateway_metering_test','responses','SELECT')
        OR has_table_privilege('llm_gateway_metering_test','metering_usage_facts','DELETE') THEN

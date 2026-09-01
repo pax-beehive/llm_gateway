@@ -78,8 +78,12 @@ func (server *Server) routeRoutingCatalog(writer http.ResponseWriter, request *h
 
 func (server *Server) routeRoutingDrafts(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, tail []string) {
 	if len(tail) == 0 {
+		if request.Method == http.MethodGet {
+			server.listRoutingDrafts(writer, request, actor)
+			return
+		}
 		if request.Method != http.MethodPost {
-			methodNotAllowed(writer, http.MethodPost)
+			methodNotAllowed(writer, http.MethodGet, http.MethodPost)
 			return
 		}
 		var input struct {
@@ -191,6 +195,22 @@ func (server *Server) routeRoutingDrafts(writer http.ResponseWriter, request *ht
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
 	}
+}
+
+func (server *Server) listRoutingDrafts(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) {
+	limit, err := optionalInt(request.URL.Query().Get("limit"))
+	if err != nil {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be an integer")
+		return
+	}
+	page, err := server.routingCatalog.ListDrafts(request.Context(), actor, routingcatalog.DraftFilter{
+		Status: routingcatalog.DraftStatus(request.URL.Query().Get("status")), Cursor: request.URL.Query().Get("cursor"), Limit: limit,
+	})
+	if err != nil {
+		writeRoutingCatalogError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, page)
 }
 
 func (server *Server) probeRoutingDraft(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope, draftID string, expectedRevision int64) {

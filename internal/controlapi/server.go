@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/toddzheng/llm-gateway/internal/access"
+	"github.com/toddzheng/llm-gateway/internal/controlaudit"
 	"github.com/toddzheng/llm-gateway/internal/core"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/operations"
@@ -64,6 +65,11 @@ type Config struct {
 	MeteringVerifier     operations.MeteringVerifier
 	Verifier             IdentityVerifier
 	QuotaSnapshots       QuotaSnapshotQuery
+	Audit                AuditQuery
+}
+
+type AuditQuery interface {
+	List(context.Context, tenantadmin.ActorEnvelope, controlaudit.Filter) (controlaudit.Page, error)
 }
 
 type QuotaSnapshotQuery interface {
@@ -80,6 +86,7 @@ type MeteringObservationIngestor interface {
 
 type RoutingCatalogAdministration interface {
 	CreateDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error)
+	ListDrafts(context.Context, tenantadmin.ActorEnvelope, routingcatalog.DraftFilter) (routingcatalog.DraftPage, error)
 	GetDraft(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Draft, error)
 	UpdateDraft(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.UpdateDraftCommand) (routingcatalog.DraftResult, error)
 	ValidateDraft(context.Context, tenantadmin.ActorEnvelope, routingcatalog.ValidateDraftCommand) (routingcatalog.DraftResult, error)
@@ -102,6 +109,7 @@ type ProviderConnectionAdministration interface {
 	RequestDiscovery(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error)
 	RequestRotation(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RotationCommand) (providerconnection.OperationResult, error)
 	GetOperation(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.Operation, error)
+	ListOperations(context.Context, tenantadmin.ActorEnvelope, providerconnection.OperationFilter) (providerconnection.OperationPage, error)
 }
 
 type CredentialAdministration interface {
@@ -129,6 +137,7 @@ type Server struct {
 	meteringVerifier     operations.MeteringVerifier
 	verifier             IdentityVerifier
 	quotaSnapshots       QuotaSnapshotQuery
+	audit                AuditQuery
 }
 
 func New(config Config) http.Handler {
@@ -136,7 +145,8 @@ func New(config Config) http.Handler {
 		providerConnections: config.ProviderConnections, routingCatalog: config.RoutingCatalog,
 		operations: config.Operations, gatewayObservations: config.GatewayObservations,
 		gatewayVerifier: config.GatewayVerifier, meteringObservations: config.MeteringObservations,
-		meteringVerifier: config.MeteringVerifier, verifier: config.Verifier, quotaSnapshots: config.QuotaSnapshots}
+		meteringVerifier: config.MeteringVerifier, verifier: config.Verifier, quotaSnapshots: config.QuotaSnapshots,
+		audit: config.Audit}
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -170,6 +180,9 @@ func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 }
 
 func (server *Server) route(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) {
+	if server.routeAudit(writer, request, actor) {
+		return
+	}
 	if server.routeOperations(writer, request, actor) {
 		return
 	}

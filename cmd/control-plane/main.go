@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/toddzheng/llm-gateway/internal/controlapi"
+	"github.com/toddzheng/llm-gateway/internal/controlaudit"
 	"github.com/toddzheng/llm-gateway/internal/controlrelay"
 	"github.com/toddzheng/llm-gateway/internal/credentialadmin"
 	"github.com/toddzheng/llm-gateway/internal/dbtransport"
@@ -159,6 +160,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Operations: %w", err)
 	}
+	auditService, err := controlaudit.NewService(database)
+	if err != nil {
+		return fmt.Errorf("configure Control Audit: %w", err)
+	}
 	gatewayVerifier, err := configureGatewayVerifier(devMode)
 	if err != nil {
 		return err
@@ -203,6 +208,7 @@ func run() error {
 		MeteringObservations: operationsService, MeteringVerifier: meteringVerifier,
 		Verifier:       verifier,
 		QuotaSnapshots: quota.NewPostgresController(database, time.Now),
+		Audit:          auditService,
 	})
 	readiness := operations.NewProbe(750*time.Millisecond, time.Now, map[string]operations.Check{
 		"database": func(checkCtx context.Context) error { return database.PingContext(checkCtx) },

@@ -423,19 +423,24 @@ type fakeCredentialAdministration struct {
 }
 
 type fakeProviderConnectionAdministration struct {
-	register func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RegisterCommand) (providerconnection.MutationResult, error)
-	rotation func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RotationCommand) (providerconnection.OperationResult, error)
-	get      func(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error)
-	probe    func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error)
+	register       func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RegisterCommand) (providerconnection.MutationResult, error)
+	rotation       func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RotationCommand) (providerconnection.OperationResult, error)
+	get            func(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error)
+	probe          func(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.OperationCommand) (providerconnection.OperationResult, error)
+	listOperations func(context.Context, tenantadmin.ActorEnvelope, providerconnection.OperationFilter) (providerconnection.OperationPage, error)
 }
 
 type fakeRoutingCatalogAdministration struct {
-	create   func(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error)
-	getDraft func(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Draft, error)
+	create     func(context.Context, tenantadmin.ActorEnvelope, string, routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error)
+	getDraft   func(context.Context, tenantadmin.ActorEnvelope, string) (routingcatalog.Draft, error)
+	listDrafts func(context.Context, tenantadmin.ActorEnvelope, routingcatalog.DraftFilter) (routingcatalog.DraftPage, error)
 }
 
 func (fake *fakeRoutingCatalogAdministration) CreateDraft(ctx context.Context, actor tenantadmin.ActorEnvelope, key string, command routingcatalog.CreateDraftCommand) (routingcatalog.DraftResult, error) {
 	return fake.create(ctx, actor, key, command)
+}
+func (fake *fakeRoutingCatalogAdministration) ListDrafts(ctx context.Context, actor tenantadmin.ActorEnvelope, filter routingcatalog.DraftFilter) (routingcatalog.DraftPage, error) {
+	return fake.listDrafts(ctx, actor, filter)
 }
 func (fake *fakeRoutingCatalogAdministration) GetDraft(ctx context.Context, actor tenantadmin.ActorEnvelope, draftID string) (routingcatalog.Draft, error) {
 	return fake.getDraft(ctx, actor, draftID)
@@ -494,6 +499,9 @@ func (fake *fakeProviderConnectionAdministration) RequestRotation(ctx context.Co
 }
 func (*fakeProviderConnectionAdministration) GetOperation(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.Operation, error) {
 	panic("unexpected GetOperation")
+}
+func (fake *fakeProviderConnectionAdministration) ListOperations(ctx context.Context, actor tenantadmin.ActorEnvelope, filter providerconnection.OperationFilter) (providerconnection.OperationPage, error) {
+	return fake.listOperations(ctx, actor, filter)
 }
 
 func (f *fakeCredentialAdministration) Issue(context.Context, tenantadmin.ActorEnvelope, string, credentialadmin.IssueCommand) (credentialadmin.IssueResult, error) {

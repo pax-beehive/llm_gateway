@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/toddzheng/llm-gateway/internal/quota"
 )
 
 const (
@@ -106,6 +108,9 @@ type Filter struct {
 	Currency      string
 	From          time.Time
 	Through       time.Time
+	// AllTenants is set only after platform-scope authorization. It is never
+	// accepted from request JSON and cannot be used for Tenant-scoped exports.
+	AllTenants bool `json:"-"`
 }
 
 type Totals struct {
@@ -134,6 +139,20 @@ type EventPage struct {
 	Data       []UsageEvent `json:"data"`
 	NextCursor string       `json:"next_cursor,omitempty"`
 	DataCutoff time.Time    `json:"data_cutoff"`
+}
+
+type QuotaDenialFilter struct {
+	Filter
+	Scope     string
+	Dimension string
+	Cursor    string
+	Limit     int
+}
+
+type QuotaDenialPage struct {
+	Data       []quota.DenialEvent `json:"data"`
+	NextCursor string              `json:"next_cursor,omitempty"`
+	DataCutoff time.Time           `json:"data_cutoff"`
 }
 
 type Export struct {

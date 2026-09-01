@@ -15,7 +15,16 @@ func (server *Server) routeProviderConnections(writer http.ResponseWriter, reque
 	const connections = "/control/v1/provider-connections"
 	const operations = "/control/v1/provider-operations"
 	if request.URL.Path == operations || request.URL.Path == operations+"/" {
-		return false
+		if server.providerConnections == nil {
+			writeAPIError(writer, http.StatusServiceUnavailable, "service_unavailable", "Provider Connection Registry is not configured")
+			return true
+		}
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer, http.MethodGet)
+			return true
+		}
+		server.listProviderOperations(writer, request, actor)
+		return true
 	}
 	if strings.HasPrefix(request.URL.Path, operations+"/") {
 		if server.providerConnections == nil {
@@ -95,6 +104,23 @@ func (server *Server) routeProviderConnections(writer http.ResponseWriter, reque
 		writeAPIError(writer, http.StatusNotFound, "not_found", "route not found")
 	}
 	return true
+}
+
+func (server *Server) listProviderOperations(writer http.ResponseWriter, request *http.Request, actor tenantadmin.ActorEnvelope) {
+	limit, err := optionalInt(request.URL.Query().Get("limit"))
+	if err != nil {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be an integer")
+		return
+	}
+	page, err := server.providerConnections.ListOperations(request.Context(), actor, providerconnection.OperationFilter{
+		ConnectionID: request.URL.Query().Get("connection_id"), Type: providerconnection.OperationType(request.URL.Query().Get("type")),
+		Status: providerconnection.OperationStatus(request.URL.Query().Get("status")), Cursor: request.URL.Query().Get("cursor"), Limit: limit,
+	})
+	if err != nil {
+		writeProviderConnectionError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, page)
 }
 
 type registerProviderConnectionRequest struct {

@@ -5,6 +5,7 @@ package quota_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -57,6 +58,7 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM quota_reservations WHERE tenant_id = $1`, tenantID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM cache_refresh_intents WHERE tenant_id = $1`, tenantID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM cache_leases WHERE tenant_id = $1`, tenantID)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM transactional_outbox WHERE tenant_id = $1`, tenantID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM tenants WHERE id = $1`, tenantID)
 	})
 	key, err := accessService.ImportAPIKey(ctx, access.APIKeySpec{
@@ -90,12 +92,24 @@ func TestPostgresQuotaReservationHonorsTenantAndAPIKeyLimits(t *testing.T) {
 	}
 	_, err = controller.Reserve(ctx, quota.ReservationRequest{
 		TenantID: tenantID, APIKeyID: key.ID, ResponseID: "response-2", ResponseAttemptID: "attempt-2",
+		PublicModel: "gateway-model", RouteID: "route-a", Region: "local",
 		TenantPolicyRevision: 1, APIKeyPolicyRevision: 1,
 		TenantLimits: tenantLimits, APIKeyLimits: keyLimits,
 		Requests: 1, ReservedSpendMicros: 30, Currency: "USD", ExpiresAt: now.Add(time.Minute),
 	})
 	if !errors.Is(err, quota.ErrExceeded) {
 		t.Fatalf("second reservation error = %v, want quota exceeded", err)
+	}
+	var denialPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM transactional_outbox WHERE tenant_id=$1 AND event_type='quota.denied' ORDER BY id DESC LIMIT 1`, tenantID).Scan(&denialPayload); err != nil {
+		t.Fatal(err)
+	}
+	var denial quota.DenialEvent
+	if err := json.Unmarshal(denialPayload, &denial); err != nil {
+		t.Fatal(err)
+	}
+	if denial.Scope != "api_key" || denial.Dimension != "spend_micros_usd" || denial.PublicModel != "gateway-model" || denial.RouteID != "route-a" || denial.ResponseID != "response-2" {
+		t.Fatalf("quota denial evidence = %#v", denial)
 	}
 	if err := controller.Release(ctx, first.ID); err != nil {
 		t.Fatal(err)

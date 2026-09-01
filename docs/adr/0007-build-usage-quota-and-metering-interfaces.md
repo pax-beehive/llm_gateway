@@ -21,6 +21,7 @@ GET /metering/v1/usage/summary
 GET /metering/v1/usage/timeseries
 GET /metering/v1/usage/events
 GET /metering/v1/usage/exports
+GET /metering/v1/quota-denials
 GET /metering/v1/tenants/{tenant_id}/usage
 GET /metering/v1/tenants/{tenant_id}/gateway-api-keys/{api_key_id}/usage
 GET /metering/v1/responses/{response_id}/usage
@@ -68,7 +69,7 @@ The Metering inbox deduplicates by `event_id` and rejects incompatible schema ve
 
 ## Query semantics
 
-Queries are Tenant scoped unless the verified actor has a platform-wide Metering scope. Stable cursor pagination is required for event lists. Time-series queries accept bounded intervals and explicit granularity. Supported dimensions include Tenant, Gateway API Key, Provider, public model, Provider model, Model Route, outcome, currency, and time.
+Queries are Tenant scoped unless the verified actor has a platform-wide Metering scope. A platform actor may omit `tenant_id` on summary and time-series queries to receive a platform aggregate; Tenant actors are always forced to their verified Tenant. Stable cursor pagination is required for event and quota-denial lists. Time-series queries accept bounded intervals and explicit granularity. Supported dimensions include Tenant, Gateway API Key, Provider, public model, Provider model, Model Route, outcome, currency, and time. Quota-denial ownership and its content-free event contract are specified by ADR 0011.
 
 Currency totals are never combined without an explicit conversion snapshot. Provider cost and future Customer Price are separate measures.
 

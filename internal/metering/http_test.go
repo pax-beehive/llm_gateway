@@ -20,6 +20,19 @@ func TestFilterFromRequestEnforcesTenantScope(t *testing.T) {
 	}
 }
 
+func TestFilterFromRequestAllowsAuthorizedPlatformAggregation(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/metering/v1/usage/summary", nil)
+	filter, err := filterFromRequest(request, Identity{ActorID: "operator", Scopes: []string{ScopePlatformRead}})
+	if err != nil || !filter.AllTenants || filter.TenantID != "" {
+		t.Fatalf("platform filter/error=%#v/%v", filter, err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/metering/v1/usage/summary?tenant_id=tenant-a", nil)
+	filter, err = filterFromRequest(request, Identity{ActorID: "operator", Scopes: []string{ScopePlatformRead}})
+	if err != nil || filter.AllTenants || filter.TenantID != "tenant-a" {
+		t.Fatalf("scoped platform filter/error=%#v/%v", filter, err)
+	}
+}
+
 func TestHandlerRejectsUnauthenticatedQueries(t *testing.T) {
 	service := &Service{}
 	handler, err := NewHandler(service, IdentityVerifierFunc(func(context.Context, string) (Identity, error) { return Identity{}, ErrPolicyDenied }), nil, nil, nil)

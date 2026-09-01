@@ -114,6 +114,17 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	switch {
+	case request.Method == http.MethodGet && path == "/metering/v1/quota-denials":
+		limit, err := optionalQueryInt(request.URL.Query().Get("limit"))
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		result, err := handler.service.QuotaDenials(request.Context(), QuotaDenialFilter{
+			Filter: filter, Scope: request.URL.Query().Get("scope"), Dimension: request.URL.Query().Get("dimension"),
+			Cursor: request.URL.Query().Get("cursor"), Limit: limit,
+		})
+		handler.result(writer, result, err)
 	case request.Method == http.MethodGet && path == "/metering/v1/usage/summary":
 		result, err := handler.service.Summary(request.Context(), filter)
 		handler.result(writer, result, err)
@@ -151,6 +162,13 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	}
 }
 
+func optionalQueryInt(value string) (int, error) {
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(value)
+}
+
 func filterFromRequest(request *http.Request, identity Identity) (Filter, error) {
 	query := request.URL.Query()
 	filter := Filter{TenantID: query.Get("tenant_id"), APIKeyID: query.Get("api_key_id"), ResponseID: query.Get("response_id"), Provider: query.Get("provider"), PublicModel: query.Get("public_model"), ProviderModel: query.Get("provider_model"), RouteID: query.Get("route_id"), Outcome: query.Get("outcome"), Currency: query.Get("currency")}
@@ -169,9 +187,7 @@ func filterFromRequest(request *http.Request, identity Identity) (Filter, error)
 		filter.Through = parsed
 	}
 	if hasScope(identity, ScopePlatformRead) || hasScope(identity, ScopePlatformWrite) {
-		if filter.TenantID == "" {
-			return Filter{}, ErrPolicyDenied
-		}
+		filter.AllTenants = filter.TenantID == ""
 		return filter, nil
 	}
 	if !hasScope(identity, ScopeTenantRead) || identity.TenantID == "" {
@@ -314,5 +330,17 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(writer).Encode(value)
 }
 func writeError(writer http.ResponseWriter, status int, code string) {
-	writeJSON(writer, status, map[string]any{"error": map[string]string{"code": code}})
+	message := map[string]string{
+		"invalid_identity_assertion": "identity assertion is missing or invalid",
+		"policy_denied":              "Metering access is denied",
+		"invalid_request":            "Metering request is invalid",
+		"not_found":                  "Metering resource was not found",
+		"conflict":                   "Metering request conflicts with existing state",
+		"not_ready":                  "Metering is not ready",
+		"internal_error":             "Metering operation failed",
+	}[code]
+	if message == "" {
+		message = "Metering request failed"
+	}
+	writeJSON(writer, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
 }
