@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { apiGet, ApiError } from "../../api/client";
+import { apiGet, ApiError, authFetch } from "../../api/client";
 import type { ReadinessResult } from "./types";
 
 export interface OpsState<T> {
@@ -56,7 +56,7 @@ export function useReadiness(path: string, tick: number): ReadinessResult | null
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`/api${path}`, { headers: { Accept: "application/json" }, signal: controller.signal })
+    authFetch(path, { headers: { Accept: "application/json" }, signal: controller.signal })
       .then(async (response) => {
         try {
           const body = (await response.json()) as Partial<ReadinessResult>;

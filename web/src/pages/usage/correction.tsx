@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { apiSend, ApiError } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { Modal, useToast } from "../../components/feedback";
 import { Button } from "../../components/ui";
 import type { UsageEvent } from "./types";
@@ -41,6 +43,8 @@ export function ConfirmCorrection({
   onDone: (created: UsageEvent) => void;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.meteringWrite);
   const [reason, setReason] = useState("");
   const [idempotencyKey, setIdempotencyKey] = useState("");
   const [amountMicros, setAmountMicros] = useState("0");
@@ -93,7 +97,12 @@ export function ConfirmCorrection({
       footer={
         <>
           <Button onClick={onClose}>Cancel</Button>
-          <Button variant="danger" disabled={!valid || busy} onClick={submit}>
+          <Button
+            variant="danger"
+            disabled={!canWrite || !valid || busy}
+            title={canWrite ? undefined : "Requires platform:metering:write"}
+            onClick={submit}
+          >
             {busy ? "Appending…" : "Append correction"}
           </Button>
         </>

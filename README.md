@@ -129,6 +129,25 @@ METERING_OPERATIONS_URL=https://control.example
 METERING_OPERATIONS_HMAC_KEY=different-at-least-32-byte-machine-key
 ```
 
+The browser operations console runs behind the same-origin BFF. Production
+WorkOS AuthKit mode requires a complete configuration; partial configuration
+and non-HTTPS public origins fail startup. `BFF_DEV_AUTH=true` is accepted only
+when both the public URL and listening address are loopback.
+
+```text
+BFF_PUBLIC_URL=https://llm-console.paxtech.net
+BFF_WORKOS_API_KEY=sk_...
+BFF_WORKOS_CLIENT_ID=client_...
+BFF_WORKOS_COOKIE_PASSWORD=at-least-32-random-characters
+BFF_WORKOS_OPERATOR_ORGANIZATION_ID=org_...
+BFF_SESSION_COOKIE_SECURE=true
+```
+
+The BFF performs PKCE login, stores WorkOS tokens only in a sealed HttpOnly
+cookie, refreshes expired sessions, validates mutation origins, and checks the
+session permission required by each exposed Gateway, Control Plane, and
+Metering route before injecting its server-side upstream credential.
+
 The Gateway transaction that completes billable work now writes its immutable
 Usage Ledger fact, settles the exact Quota Reservation, and enqueues a stable,
 content-free usage event atomically. Metering consumes those events with leased

@@ -4,6 +4,8 @@
  */
 import { useEffect, useState } from "react";
 import { apiSend } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { Drawer, ErrorBanner, Loading, useToast } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, EmptyState, KeyValueList, Table, Tabs, Td, Th } from "../../components/ui";
 import { useApi } from "../../api/useApi";
@@ -216,6 +218,8 @@ function ListTextarea({
 
 function KeyPolicyTab({ tenantId, keyId }: { tenantId: string; keyId: string }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const path = `/control/v1/tenants/${encodeURIComponent(tenantId)}/gateway-api-keys/${encodeURIComponent(keyId)}/policy`;
   const { data, error, loading, retry } = useApi<APIKeyPolicy>(path);
   const [form, setForm] = useState<KeyPolicyFormState | null>(null);
@@ -378,7 +382,12 @@ function KeyPolicyTab({ tenantId, keyId }: { tenantId: string; keyId: string }) 
         <Button onClick={() => setForm(keyPolicyToForm(data))} disabled={!dirty || saving}>
           Discard
         </Button>
-        <Button variant="primary" disabled={!dirty || !reason.trim() || saving} onClick={() => void save()}>
+        <Button
+          variant="primary"
+          disabled={!canWrite || !dirty || !reason.trim() || saving}
+          title={canWrite ? undefined : "Requires platform:tenants:write"}
+          onClick={() => void save()}
+        >
           Save policy
         </Button>
       </div>
@@ -404,6 +413,8 @@ function KeyDetailDrawer({
   onChanged: () => void;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const base = `/control/v1/tenants/${encodeURIComponent(tenantId)}/gateway-api-keys/${encodeURIComponent(keyId)}`;
   const { data: key, error, loading, retry } = useApi<GatewayKey>(base);
   const effective = useApi<KeyEffectivePolicy>(`${base}/effective-policy`);
@@ -596,7 +607,12 @@ function KeyDetailDrawer({
                     />
                   </Field>
                   <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                    <Button variant="primary" disabled={!editReason.trim() || saving} onClick={() => void save()}>
+                    <Button
+                      variant="primary"
+                      disabled={!canWrite || !editReason.trim() || saving}
+                      title={canWrite ? undefined : "Requires platform:tenants:write"}
+                      onClick={() => void save()}
+                    >
                       Save changes
                     </Button>
                   </div>
@@ -606,8 +622,19 @@ function KeyDetailDrawer({
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {key.status === "active" && (
                     <>
-                      <Button onClick={() => setRotateOpen(true)}>Rotate…</Button>
-                      <Button variant="danger" onClick={() => setRevokeOpen(true)}>
+                      <Button
+                        disabled={!canWrite}
+                        title={canWrite ? undefined : "Requires platform:tenants:write"}
+                        onClick={() => setRotateOpen(true)}
+                      >
+                        Rotate…
+                      </Button>
+                      <Button
+                        variant="danger"
+                        disabled={!canWrite}
+                        title={canWrite ? undefined : "Requires platform:tenants:write"}
+                        onClick={() => setRevokeOpen(true)}
+                      >
                         Revoke…
                       </Button>
                     </>
@@ -681,6 +708,8 @@ function KeyDetailDrawer({
 /* ------------------------------------------------------------------ */
 
 export function GatewayKeysTab({ tenantId }: { tenantId: string }) {
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const [statusFilter, setStatusFilter] = useState("");
   const listPath =
     `/control/v1/tenants/${encodeURIComponent(tenantId)}/gateway-api-keys?limit=25` +
@@ -713,7 +742,12 @@ export function GatewayKeysTab({ tenantId }: { tenantId: string }) {
               <option value="active">Active</option>
               <option value="revoked">Revoked</option>
             </select>
-            <Button variant="primary" onClick={() => setIssueOpen(true)}>
+            <Button
+              variant="primary"
+              disabled={!canWrite}
+              title={canWrite ? undefined : "Requires platform:tenants:write"}
+              onClick={() => setIssueOpen(true)}
+            >
               Issue key…
             </Button>
           </div>
@@ -727,7 +761,16 @@ export function GatewayKeysTab({ tenantId }: { tenantId: string }) {
           <EmptyState
             title="No API keys"
             hint="Issue a Gateway API key to let tenant workloads call the gateway"
-            action={<Button variant="primary" onClick={() => setIssueOpen(true)}>Issue key…</Button>}
+            action={
+              <Button
+                variant="primary"
+                disabled={!canWrite}
+                title={canWrite ? undefined : "Requires platform:tenants:write"}
+                onClick={() => setIssueOpen(true)}
+              >
+                Issue key…
+              </Button>
+            }
           />
         ) : (
           <>

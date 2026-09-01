@@ -102,7 +102,7 @@ run-metering-dev:
 	go run ./cmd/metering
 
 run-bff-dev:
-	GOCACHE=$(GOCACHE) go run ./cmd/bff
+	BFF_ADDR=127.0.0.1:8090 BFF_DEV_AUTH=true GOCACHE=$(GOCACHE) go run ./cmd/bff
 
 migrate-schema:
 	@test -n "$(ADMIN_DATABASE_URL)" || { echo "ADMIN_DATABASE_URL is required" >&2; exit 1; }

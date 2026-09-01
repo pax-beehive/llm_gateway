@@ -4,6 +4,8 @@
  */
 import { useEffect, useState } from "react";
 import { apiSend } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading, useToast } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, EmptyState, KeyValueList, Tabs } from "../../components/ui";
 import { useApi } from "../../api/useApi";
@@ -17,6 +19,8 @@ const TABS = ["Overview", "Limit Policy", "Policy Revisions", "Gateway API Keys"
 
 function OverviewTab({ tenant, onChanged }: { tenant: Tenant; onChanged: () => void }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const [displayName, setDisplayName] = useState(tenant.display_name);
   const [metadata, setMetadata] = useState(tenant.metadata ? JSON.stringify(tenant.metadata, null, 2) : "");
   const [reason, setReason] = useState("");
@@ -100,7 +104,12 @@ function OverviewTab({ tenant, onChanged }: { tenant: Tenant; onChanged: () => v
             />
           </Field>
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
-            <Button variant="primary" disabled={!reason.trim() || saving} onClick={() => void save()}>
+            <Button
+              variant="primary"
+              disabled={!canWrite || !reason.trim() || saving}
+              title={canWrite ? undefined : "Requires platform:tenants:write"}
+              onClick={() => void save()}
+            >
               Save changes
             </Button>
           </div>
@@ -126,6 +135,8 @@ const TRANSITION_DESCRIPTION: Record<TransitionTarget, string> = {
 
 export default function TenantDetail({ tenantId }: { tenantId: string }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const { data: tenant, error, loading, retry } = useApi<Tenant>(
     `/control/v1/tenants/${encodeURIComponent(tenantId)}`,
   );
@@ -179,6 +190,8 @@ export default function TenantDetail({ tenantId }: { tenantId: string }) {
             key={target}
             variant={target === "closed" ? "danger" : target === "suspended" ? "ghost" : "primary"}
             style={target === "suspended" ? { border: "1px solid var(--red)", color: "var(--red)" } : undefined}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "Requires platform:tenants:write"}
             onClick={() => setTransition(target)}
           >
             {TRANSITION_LABEL[target]}…

@@ -6,6 +6,8 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ConfirmDialog, Drawer, useToast } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, CopyButton, EmptyState, KeyValueList, Spinner, Table, Td, Th } from "../../components/ui";
 import { formatDateTime, truncateId } from "../../lib/format";
@@ -37,6 +39,8 @@ export function RevisionsSection({
   onHeadChanged: () => void;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.routingWrite);
   const [revisions, setRevisions] = useState<Revision[]>([]);
   const [nextCursor, setNextCursor] = useState<number | undefined>(undefined);
   const [loading, setLoading] = useState(true);
@@ -165,8 +169,14 @@ export function RevisionsSection({
                   <Td>
                     <div style={{ display: "flex", justifyContent: "flex-end" }}>
                       <Button
-                        disabled={headRevision === null || rev.revision === headRevision}
-                        title={rev.revision === headRevision ? "This revision is already the head" : undefined}
+                        disabled={!canWrite || headRevision === null || rev.revision === headRevision}
+                        title={
+                          !canWrite
+                            ? "Requires platform:routing:write"
+                            : rev.revision === headRevision
+                              ? "This revision is already the head"
+                              : undefined
+                        }
                         onClick={(e) => {
                           e.stopPropagation();
                           setRestoreTarget(rev);

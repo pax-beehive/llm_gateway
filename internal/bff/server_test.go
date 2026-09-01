@@ -18,7 +18,7 @@ import (
 
 func testConfig(t *testing.T, gatewayURL, controlURL, meteringURL string) bff.Config {
 	return bff.Config{
-		Addr:               ":0",
+		Addr:               "127.0.0.1:0",
 		GatewayURL:         gatewayURL,
 		GatewayAPIKey:      "gateway-key-1",
 		GatewayConfigured:  true,
@@ -28,6 +28,8 @@ func testConfig(t *testing.T, gatewayURL, controlURL, meteringURL string) bff.Co
 		MeteringURL:        meteringURL,
 		MeteringToken:      "metering-token-1",
 		MeteringConfigured: true,
+		DevAuth:            true,
+		PublicURL:          "http://localhost:5173",
 		WebDist:            t.TempDir(),
 	}
 }
@@ -161,7 +163,7 @@ func TestControlMutationGeneratesIdempotencyKey(t *testing.T) {
 			if !uuidPattern.MatchString(key) {
 				t.Errorf("generated Idempotency-Key = %q", key)
 			}
-		case r.Method == http.MethodPost && r.URL.Path == "/control/v1/other":
+		case r.Method == http.MethodPost && r.URL.Path == "/control/v1/tenants/tenant-a/transitions":
 			if key != "caller-supplied" {
 				t.Errorf("caller Idempotency-Key overwritten: %q", key)
 			}
@@ -180,7 +182,7 @@ func TestControlMutationGeneratesIdempotencyKey(t *testing.T) {
 			return server.Client().Post(server.URL+"/api/control/v1/tenants", "application/json", strings.NewReader(`{}`))
 		},
 		"caller key preserved": func() (*http.Response, error) {
-			req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/control/v1/other", strings.NewReader(`{}`))
+			req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/control/v1/tenants/tenant-a/transitions", strings.NewReader(`{}`))
 			req.Header.Set("Idempotency-Key", "caller-supplied")
 			return server.Client().Do(req)
 		},
@@ -294,6 +296,109 @@ func TestUnconfiguredUpstreamReturns503Envelope(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusServiceUnavailable || envelope.Error.Code != "upstream_not_configured" {
 		t.Fatalf("status/code = %d / %q", resp.StatusCode, envelope.Error.Code)
+	}
+}
+
+func TestBusinessRoutesRequireSession(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DevAuth = false
+	server := startBFF(t, cfg)
+
+	for _, path := range []string{
+		"/api/llm/models",
+		"/api/control/v1/tenants",
+		"/api/metering/v1/usage/summary",
+	} {
+		resp, err := server.Client().Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s status = %d, want 401", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestBusinessRoutesEnforceDevSessionPermissions(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	cfg := testConfig(t, upstream.URL, upstream.URL, upstream.URL)
+	cfg.DevAuthPermissions = []string{"platform:tenants:read"}
+	server := startBFF(t, cfg)
+
+	allowed, err := server.Client().Get(server.URL + "/api/control/v1/tenants")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed.Body.Close()
+	if allowed.StatusCode != http.StatusOK {
+		t.Fatalf("allowed status = %d", allowed.StatusCode)
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/api/control/v1/tenants"},
+		{http.MethodGet, "/api/llm/models"},
+		{http.MethodGet, "/api/metering/v1/usage/summary"},
+	} {
+		req, _ := http.NewRequest(tc.method, server.URL+tc.path, strings.NewReader(`{}`))
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s status = %d, want 403", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want only the authorized request", calls)
+	}
+}
+
+func TestBusinessRoutePermissionMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		permission string
+		method     string
+		path       string
+		want       int
+	}{
+		{"models lists models", "gateway:models:read", http.MethodGet, "/api/llm/models", http.StatusOK},
+		{"playground lists models", "gateway:playground:use", http.MethodGet, "/api/llm/models", http.StatusOK},
+		{"models reads provider metadata", "gateway:models:read", http.MethodGet, "/api/control/v1/provider-connections", http.StatusOK},
+		{"models reads routing metadata", "gateway:models:read", http.MethodGet, "/api/control/v1/routing-catalog", http.StatusOK},
+		{"providers read operations", "platform:providers:read", http.MethodGet, "/api/control/v1/provider-operations/op_1", http.StatusOK},
+		{"routing reads provider operations", "platform:routing:read", http.MethodGet, "/api/control/v1/provider-operations/op_1", http.StatusOK},
+		{"operations reads audit", "platform:operations:read", http.MethodGet, "/api/control/v1/audit", http.StatusOK},
+		{"metering writes export", "platform:metering:write", http.MethodPost, "/api/metering/v1/usage/exports", http.StatusOK},
+		{"read cannot mutate", "platform:routing:read", http.MethodPost, "/api/control/v1/routing-catalog/drafts", http.StatusForbidden},
+		{"unknown control route is closed", "platform:tenants:write", http.MethodPost, "/api/control/v1/unknown", http.StatusNotFound},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+			defer upstream.Close()
+			cfg := testConfig(t, upstream.URL, upstream.URL, upstream.URL)
+			cfg.DevAuthPermissions = []string{tc.permission}
+			server := startBFF(t, cfg)
+			req, _ := http.NewRequest(tc.method, server.URL+tc.path, strings.NewReader(`{}`))
+			resp, err := server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
 	}
 }
 

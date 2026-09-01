@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, ApiError } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ConfirmCorrection } from "./correction";
 import { Drawer, ErrorBanner, useToast } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, EmptyState, Spinner, Table, Td, Th } from "../../components/ui";
@@ -22,6 +24,8 @@ export function EventLedger({ query, refreshKey }: { query: string; refreshKey: 
   const [error, setError] = useState<ApiError | null>(null);
   const [selected, setSelected] = useState<UsageEvent | null>(null);
   const [correcting, setCorrecting] = useState<UsageEvent | null>(null);
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.meteringWrite);
 
   const load = useCallback(
     (after: string | undefined, append: boolean) => {
@@ -143,6 +147,8 @@ export function EventLedger({ query, refreshKey }: { query: string; refreshKey: 
               <span style={{ flex: 1 }} />
               <Button
                 variant="primary"
+                disabled={!canWrite}
+                title={canWrite ? undefined : "Requires platform:metering:write"}
                 onClick={() => {
                   setCorrecting(selected);
                 }}

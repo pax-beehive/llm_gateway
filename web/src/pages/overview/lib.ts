@@ -5,7 +5,7 @@
  * Metering aggregation helpers.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiGet, ApiError } from "../../api/client";
+import { apiGet, ApiError, authFetch } from "../../api/client";
 import type { BadgeTone } from "../../components/ui";
 
 /* ------------------------------------------------------------------ */
@@ -22,19 +22,26 @@ export interface Resource<T> {
 /**
  * GET-on-mount hook with manual reload. Unlike useApi it takes a fetcher, so a
  * card can compose several endpoints; `deps` re-trigger the load (e.g. a
- * refresh tick). Data is kept while reloading to avoid flicker.
+ * refresh tick). Data is kept while reloading to avoid flicker. With
+ * `opts.enabled === false` nothing is fetched (permission-gated panels) and
+ * the resource reports an idle, empty state.
  */
-export function useResource<T>(load: () => Promise<T>, deps: readonly unknown[]): Resource<T> {
+export function useResource<T>(load: () => Promise<T>, deps: readonly unknown[], opts?: { enabled?: boolean }): Resource<T> {
+  const enabled = opts?.enabled !== false;
   const [state, setState] = useState<{ data: T | null; error: ApiError | null; loading: boolean }>({
     data: null,
     error: null,
-    loading: true,
+    loading: enabled,
   });
   const [attempt, setAttempt] = useState(0);
   const loadRef = useRef(load);
   loadRef.current = load;
 
   useEffect(() => {
+    if (!enabled) {
+      setState({ data: null, error: null, loading: false });
+      return;
+    }
     let cancelled = false;
     setState((s) => ({ ...s, loading: true, error: null }));
     loadRef.current().then(
@@ -54,7 +61,7 @@ export function useResource<T>(load: () => Promise<T>, deps: readonly unknown[])
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, attempt]);
+  }, [enabled, ...deps, attempt]);
 
   const reload = useCallback(() => setAttempt((a) => a + 1), []);
   return { ...state, reload };
@@ -147,7 +154,7 @@ export interface ServiceReadiness {
 }
 
 async function fetchReadiness(path: string): Promise<Readiness> {
-  const response = await fetch(`/api${path}`, { headers: { Accept: "application/json" } });
+  const response = await authFetch(path, { headers: { Accept: "application/json" } });
   let body: unknown = null;
   try {
     body = await response.json();

@@ -5,6 +5,8 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, apiSend } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading, useToast } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, EmptyState, KeyValueList } from "../../components/ui";
 import { useApi } from "../../api/useApi";
@@ -39,6 +41,8 @@ function ConfigurationCard({
   onChanged: () => void;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.providersWrite);
   const [displayName, setDisplayName] = useState(connection.display_name);
   const [baseUrl, setBaseUrl] = useState(connection.base_url);
   const [region, setRegion] = useState(connection.region);
@@ -143,7 +147,12 @@ function ConfigurationCard({
           />
         </Field>
         <div style={{ display: "flex", justifyContent: "flex-end" }}>
-          <Button variant="primary" disabled={!reason.trim() || saving} onClick={() => void save()}>
+          <Button
+            variant="primary"
+            disabled={!canWrite || !reason.trim() || saving}
+            title={canWrite ? undefined : "Requires platform:providers:write"}
+            onClick={() => void save()}
+          >
             Save changes
           </Button>
         </div>
@@ -274,6 +283,8 @@ function OperationsCard({ operations, loading }: { operations: ProviderOperation
 
 export default function ProviderDetail({ connectionId }: { connectionId: string }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.providersWrite);
   const base = `/control/v1/provider-connections/${encodeURIComponent(connectionId)}`;
   const { data: connection, error, loading, retry } = useApi<ProviderConnection>(base);
 
@@ -407,12 +418,32 @@ export default function ProviderDetail({ connectionId }: { connectionId: string 
           </div>
         </div>
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <Button onClick={() => setProbeOpen(true)}>Run probe</Button>
-          <Button onClick={() => setDiscoverOpen(true)}>Discover models</Button>
-          <Button onClick={() => setRotateOpen(true)}>Rotate credential…</Button>
+          <Button
+            disabled={!canWrite}
+            title={canWrite ? undefined : "Requires platform:providers:write"}
+            onClick={() => setProbeOpen(true)}
+          >
+            Run probe
+          </Button>
+          <Button
+            disabled={!canWrite}
+            title={canWrite ? undefined : "Requires platform:providers:write"}
+            onClick={() => setDiscoverOpen(true)}
+          >
+            Discover models
+          </Button>
+          <Button
+            disabled={!canWrite}
+            title={canWrite ? undefined : "Requires platform:providers:write"}
+            onClick={() => setRotateOpen(true)}
+          >
+            Rotate credential…
+          </Button>
           <Button
             variant={enabled ? "ghost" : "primary"}
             style={enabled ? { border: "1px solid var(--red)", color: "var(--red)" } : undefined}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "Requires platform:providers:write"}
             onClick={() => setStatusModal(enabled ? "disable" : "enable")}
           >
             {enabled ? "Disable" : "Enable"} connection…

@@ -1,12 +1,19 @@
 /**
  * API client for the BFF. All calls hit same-origin `/api/...` (proxied by
- * Vite in dev, served by the BFF in production).
+ * Vite in dev, served by the BFF in production) with credentials:
+ * "same-origin" so the BFF session cookie rides along.
  *
  * Error envelopes handled:
  *   {"error":{"code","message","type"?,"param"?}}   (gateway / control plane)
  *   {"error":{"code"}}                              (metering variant)
  * A 503 with code "upstream_not_configured" is thrown like any other
  * ApiError — pages render a configuration banner for it.
+ *
+ * Session behavior: 401 session_required / session_expired are reported to the
+ * handler registered by the AuthProvider (setSessionLostHandler); everything
+ * else, including 403 permission_denied, is a plain ApiError for pages to
+ * render. Call sites needing the raw Response use authFetch(), which keeps
+ * the same credentials + session-loss behavior.
  */
 export class ApiError extends Error {
   readonly status: number;
@@ -29,6 +36,54 @@ export class ApiError extends Error {
 }
 
 const BASE = "/api";
+
+/* ------------------------------------------------------------------ */
+/* Session loss notification                                           */
+/* ------------------------------------------------------------------ */
+
+export type SessionLostReason = "session_required" | "session_expired";
+type SessionLostHandler = (reason: SessionLostReason) => void;
+
+let sessionLostHandler: SessionLostHandler | null = null;
+
+/**
+ * Registered once by the AuthProvider. Called when any request fails with a
+ * 401 session_required / session_expired — the handler transitions the app to
+ * the anonymous state once, so parallel failing requests never cause a
+ * redirect storm. Other 401s and 403 permission_denied stay plain ApiErrors.
+ */
+export function setSessionLostHandler(handler: SessionLostHandler | null): void {
+  sessionLostHandler = handler;
+}
+
+function isSessionLostCode(code: string): code is SessionLostReason {
+  return code === "session_required" || code === "session_expired";
+}
+
+function notifySessionLost(err: ApiError): void {
+  if (err.status === 401 && isSessionLostCode(err.code)) sessionLostHandler?.(err.code);
+}
+
+/**
+ * fetch() wrapper for call sites that need the raw Response (e.g. readiness
+ * 503-with-body, export Link headers). Same-origin credentials are always
+ * set, and 401 session errors are reported to the session-lost handler by
+ * peeking at a cloned body — the caller's body stream stays untouched.
+ */
+export async function authFetch(path: string, init?: RequestInit): Promise<Response> {
+  const response = await fetch(`${BASE}${path}`, { ...init, credentials: "same-origin" });
+  if (response.status === 401 && sessionLostHandler) {
+    response
+      .clone()
+      .json()
+      .then((body) => {
+        const code = (body as ErrorEnvelope)?.error?.code;
+        if (code && isSessionLostCode(code)) sessionLostHandler?.(code);
+      })
+      .catch(() => undefined);
+  }
+  return response;
+}
 
 interface ErrorEnvelope {
   error?: {
@@ -53,7 +108,11 @@ async function parseError(response: Response): Promise<ApiError> {
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
-  if (!response.ok) throw await parseError(response);
+  if (!response.ok) {
+    const err = await parseError(response);
+    notifySessionLost(err);
+    throw err;
+  }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
@@ -62,6 +121,7 @@ export function apiGet<T>(path: string, opts?: { signal?: AbortSignal }): Promis
   return fetch(`${BASE}${path}`, {
     method: "GET",
     headers: { Accept: "application/json" },
+    credentials: "same-origin",
     signal: opts?.signal,
   }).then((r) => parseJson<T>(r));
 }
@@ -79,6 +139,7 @@ export function apiSend<T>(
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: "same-origin",
     signal: opts?.signal,
   }).then((r) => parseJson<T>(r));
 }
@@ -104,9 +165,16 @@ export async function* streamSSE(
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify(body),
+    credentials: "same-origin",
     signal,
   });
-  if (!response.ok) throw await parseError(response);
+  if (!response.ok) {
+    const err = await parseError(response);
+    // A 401 before the stream starts is a session problem; once frames are
+    // flowing, mid-stream disconnects keep the existing partial-output path.
+    notifySessionLost(err);
+    throw err;
+  }
   if (!response.body) throw new ApiError(response.status, "no_body", "Response has no body to stream");
 
   const reader = response.body.getReader();

@@ -5,6 +5,8 @@
  */
 import { useEffect, useState } from "react";
 import { apiSend } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading, Modal, useToast } from "../../components/feedback";
 import { Badge, Button, Card, EmptyState, Table, Td, Th } from "../../components/ui";
 import { navigate } from "../../router";
@@ -182,6 +184,8 @@ function RegisterConnectionModal({
 /* ------------------------------------------------------------------ */
 
 function ConnectionList() {
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.providersWrite);
   const [providerFilter, setProviderFilter] = useState("");
   const [regionFilter, setRegionFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -204,7 +208,12 @@ function ConnectionList() {
             observed health.
           </div>
         </div>
-        <Button variant="primary" onClick={() => setRegisterOpen(true)}>
+        <Button
+          variant="primary"
+          disabled={!canWrite}
+          title={canWrite ? undefined : "Requires platform:providers:write"}
+          onClick={() => setRegisterOpen(true)}
+        >
           Register connection
         </Button>
       </div>
@@ -244,7 +253,12 @@ function ConnectionList() {
             title="No provider connections"
             hint="Register one to route traffic to an upstream provider"
             action={
-              <Button variant="primary" onClick={() => setRegisterOpen(true)}>
+              <Button
+                variant="primary"
+                disabled={!canWrite}
+                title={canWrite ? undefined : "Requires platform:providers:write"}
+                onClick={() => setRegisterOpen(true)}
+              >
                 Register connection
               </Button>
             }

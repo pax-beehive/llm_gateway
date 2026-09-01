@@ -1,4 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { useAuth } from "../auth/AuthProvider";
+import { PERMISSIONS } from "../auth/permissions";
+import { UserMenu } from "../auth/UserMenu";
 import { navigate, useRoute } from "../router";
 
 export interface NavDef {
@@ -6,25 +9,33 @@ export interface NavDef {
   label: string;
   /** 24x24 stroke icon path data (lucide-style, stroke=currentColor, fill=none). */
   icon: string;
+  /**
+   * WorkOS permission required to see this section. Sections without a
+   * permission (Overview) are always visible and gate their panels
+   * individually instead.
+   */
+  permission?: string;
 }
 
 export const NAV: NavDef[] = [
   { id: "overview", label: "Overview", icon: "M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z" },
-  { id: "playground", label: "Playground", icon: "m4 17 6-6-6-6M12 19h8" },
+  { id: "playground", label: "Playground", icon: "m4 17 6-6-6-6M12 19h8", permission: PERMISSIONS.playgroundUse },
   {
     id: "models",
     label: "Models & Capabilities",
     icon: "M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16ZM3.3 7 12 12l8.7-5M12 22V12",
+    permission: PERMISSIONS.modelsRead,
   },
   {
     id: "tenants",
     label: "Tenants",
     icon: "M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18M6 12H4a2 2 0 0 0-2 2v8h4M18 9h2a2 2 0 0 1 2 2v11h-4M10 6h4M10 10h4M10 14h4M10 18h4",
+    permission: PERMISSIONS.tenantsRead,
   },
-  { id: "providers", label: "Provider Connections", icon: "M12 22v-4M9 8V2M15 8V2M18 8v6a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" },
-  { id: "routing", label: "Routing Catalog", icon: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM15 6a9 9 0 0 0-9 9" },
-  { id: "usage", label: "Usage & Metering", icon: "M3 3v18h18M18 17V9M13 17V5M8 17v-3" },
-  { id: "operations", label: "Operations", icon: "M22 12h-4l-3 9L9 3l-3 9H2" },
+  { id: "providers", label: "Provider Connections", icon: "M12 22v-4M9 8V2M15 8V2M18 8v6a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z", permission: PERMISSIONS.providersRead },
+  { id: "routing", label: "Routing Catalog", icon: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM15 6a9 9 0 0 0-9 9", permission: PERMISSIONS.routingRead },
+  { id: "usage", label: "Usage & Metering", icon: "M3 3v18h18M18 17V9M13 17V5M8 17v-3", permission: PERMISSIONS.meteringRead },
+  { id: "operations", label: "Operations", icon: "M22 12h-4l-3 9L9 3l-3 9H2", permission: PERMISSIONS.operationsRead },
 ];
 
 const THEME_KEY = "ugw.theme";
@@ -44,6 +55,7 @@ function Icon({ d, size = 16 }: { d: string; size?: number }) {
 
 export function Layout({ children }: { children: ReactNode }) {
   const route = useRoute();
+  const { can } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">(initialTheme);
 
@@ -52,7 +64,9 @@ export function Layout({ children }: { children: ReactNode }) {
     window.localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
-  const active = NAV.find((n) => n.id === route) ?? NAV[0];
+  // Sections the session has no read permission for are hidden entirely.
+  const visibleNav = NAV.filter((n) => !n.permission || can(n.permission));
+  const active = visibleNav.find((n) => n.id === route) ?? visibleNav[0] ?? NAV[0];
 
   return (
     <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
@@ -85,7 +99,7 @@ export function Layout({ children }: { children: ReactNode }) {
               height: 28,
               borderRadius: "var(--radius)",
               background: "var(--blue)",
-              color: "#fff",
+              color: "var(--on-accent)",
               display: "grid",
               placeItems: "center",
               fontWeight: 700,
@@ -103,7 +117,7 @@ export function Layout({ children }: { children: ReactNode }) {
           )}
         </div>
         <nav style={{ flex: 1, padding: 8, display: "flex", flexDirection: "column", gap: 2, overflowY: "auto" }}>
-          {NAV.map((item) => {
+          {visibleNav.map((item) => {
             const isActive = item.id === active.id;
             return (
               <button
@@ -215,35 +229,7 @@ export function Layout({ children }: { children: ReactNode }) {
               }
             />
           </button>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              padding: "4px 10px 4px 4px",
-              border: "1px solid var(--line)",
-              borderRadius: "var(--radius-pill)",
-              fontSize: 12,
-              color: "var(--ink2)",
-            }}
-          >
-            <span
-              style={{
-                width: 22,
-                height: 22,
-                borderRadius: "50%",
-                background: "var(--purple-bg)",
-                color: "var(--purple)",
-                display: "grid",
-                placeItems: "center",
-                fontWeight: 700,
-                fontSize: 10,
-              }}
-            >
-              DO
-            </span>
-            dev-operator
-          </div>
+          <UserMenu />
         </header>
         <main style={{ flex: 1, overflowY: "auto", padding: 20 }}>{children}</main>
       </div>

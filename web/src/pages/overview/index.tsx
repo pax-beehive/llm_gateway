@@ -5,6 +5,8 @@
  */
 import type { ReactNode } from "react";
 import { apiGet } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { BarChart, LineChart } from "../../components/charts";
 import { ErrorBanner } from "../../components/feedback";
 import { Badge, Button, Card, EmptyState, Spinner, StatCard, Table, Td, Th } from "../../components/ui";
@@ -49,6 +51,23 @@ function CardBody<T>({ res, children }: { res: Resource<T>; children: (data: T) 
   if (res.error) return <ErrorBanner error={res.error} retry={res.reload} />;
   if (!res.data) return null;
   return <>{children(res.data)}</>;
+}
+
+/* ------------------------------------------------------------------ */
+/* Permission-gated panel note                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Shown inside a card whose data source requires a permission the session
+ * lacks. The panel stays visible with an explicit reason instead of failing
+ * with a 403 or vanishing silently.
+ */
+function PermissionNote({ permission }: { permission: string }) {
+  return (
+    <div style={{ padding: "14px 0", textAlign: "center", fontSize: 12, color: "var(--ink3)" }}>
+      Not available — your role lacks <code style={{ fontFamily: "var(--font-mono)" }}>{permission}</code>
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -98,8 +117,21 @@ function ReadinessCard({ res }: { res: Resource<ServiceReadiness[]> }) {
   );
 }
 
-function UsageStatCards({ res }: { res: Resource<UsageAggregate> }) {
+function UsageStatCards({ res, allowed }: { res: Resource<UsageAggregate>; allowed: boolean }) {
   const sub = "platform projection";
+  if (!allowed) {
+    return (
+      <StatCard
+        label="Usage today"
+        value="—"
+        sub={
+          <span style={{ color: "var(--ink3)" }}>
+            requires <code style={{ fontFamily: "var(--font-mono)" }}>{PERMISSIONS.meteringRead}</code>
+          </span>
+        }
+      />
+    );
+  }
   if (res.error) {
     return (
       <>
@@ -134,7 +166,7 @@ function UsageStatCards({ res }: { res: Resource<UsageAggregate> }) {
 /* Request volume & spend chart                                        */
 /* ------------------------------------------------------------------ */
 
-function UsageChartCard({ res }: { res: Resource<UsageSeries> }) {
+function UsageChartCard({ res, allowed }: { res: Resource<UsageSeries>; allowed: boolean }) {
   return (
     <Card
       title="Request volume & spend"
@@ -151,8 +183,9 @@ function UsageChartCard({ res }: { res: Resource<UsageSeries> }) {
         </span>
       }
     >
-      <CardBody res={res}>
-        {(series) => {
+      {allowed ? (
+        <CardBody res={res}>
+          {(series) => {
           const hasData = series.buckets.some((b) => b.requests > 0 || b.spendMicros > 0);
           if (!hasData) {
             return (
@@ -178,7 +211,10 @@ function UsageChartCard({ res }: { res: Resource<UsageSeries> }) {
             </>
           );
         }}
-      </CardBody>
+        </CardBody>
+      ) : (
+        <PermissionNote permission={PERMISSIONS.meteringRead} />
+      )}
     </Card>
   );
 }
@@ -228,7 +264,7 @@ function WarningsCard({ warnings }: { warnings: ReturnType<typeof deriveWarnings
 /* Provider health matrix                                              */
 /* ------------------------------------------------------------------ */
 
-function ProviderHealthCard({ res }: { res: Resource<ProviderConnectionPage> }) {
+function ProviderHealthCard({ res, allowed }: { res: Resource<ProviderConnectionPage>; allowed: boolean }) {
   return (
     <Card
       title={
@@ -237,8 +273,9 @@ function ProviderHealthCard({ res }: { res: Resource<ProviderConnectionPage> }) 
         </span>
       }
     >
-      <CardBody res={res}>
-        {(page) => {
+      {allowed ? (
+        <CardBody res={res}>
+          {(page) => {
           const connections = page.data ?? [];
           if (connections.length === 0) {
             return <EmptyState title="No provider connections" hint="Register a Provider Connection to see the health matrix" />;
@@ -289,7 +326,10 @@ function ProviderHealthCard({ res }: { res: Resource<ProviderConnectionPage> }) 
             </Table>
           );
         }}
-      </CardBody>
+        </CardBody>
+      ) : (
+        <PermissionNote permission={PERMISSIONS.providersRead} />
+      )}
     </Card>
   );
 }
@@ -298,11 +338,12 @@ function ProviderHealthCard({ res }: { res: Resource<ProviderConnectionPage> }) 
 /* Gateway region status                                               */
 /* ------------------------------------------------------------------ */
 
-function GatewayStatusCard({ res }: { res: Resource<GatewayPage> }) {
+function GatewayStatusCard({ res, allowed }: { res: Resource<GatewayPage>; allowed: boolean }) {
   return (
     <Card title="Gateway region status">
-      <CardBody res={res}>
-        {(page) => {
+      {allowed ? (
+        <CardBody res={res}>
+          {(page) => {
           const gateways = [...(page.data ?? [])].sort((a, b) => a.region.localeCompare(b.region) || a.gateway_id.localeCompare(b.gateway_id));
           if (gateways.length === 0) {
             return <EmptyState title="No gateway observations" hint="Gateways report observations to the control plane on an interval" />;
@@ -347,7 +388,10 @@ function GatewayStatusCard({ res }: { res: Resource<GatewayPage> }) {
             </Table>
           );
         }}
-      </CardBody>
+        </CardBody>
+      ) : (
+        <PermissionNote permission={PERMISSIONS.operationsRead} />
+      )}
     </Card>
   );
 }
@@ -356,11 +400,12 @@ function GatewayStatusCard({ res }: { res: Resource<GatewayPage> }) {
 /* Routing Catalog rollout                                             */
 /* ------------------------------------------------------------------ */
 
-function PublicationCard({ res }: { res: Resource<PublicationPage> }) {
+function PublicationCard({ res, allowed }: { res: Resource<PublicationPage>; allowed: boolean }) {
   return (
     <Card title="Routing Catalog">
-      <CardBody res={res}>
-        {(page) => {
+      {allowed ? (
+        <CardBody res={res}>
+          {(page) => {
           const latest: PublicationSummary | null = latestPublication(page);
           if (!latest) return <EmptyState title="No publications yet" hint="Publish a Routing Catalog draft to start a rollout" />;
           return (
@@ -395,7 +440,10 @@ function PublicationCard({ res }: { res: Resource<PublicationPage> }) {
             </>
           );
         }}
-      </CardBody>
+        </CardBody>
+      ) : (
+        <PermissionNote permission={PERMISSIONS.operationsRead} />
+      )}
     </Card>
   );
 }
@@ -429,11 +477,12 @@ function MeteringNode({ node }: { node: MeteringSummary }) {
   );
 }
 
-function MeteringProjectionCard({ res }: { res: Resource<MeteringPage> }) {
+function MeteringProjectionCard({ res, allowed }: { res: Resource<MeteringPage>; allowed: boolean }) {
   return (
     <Card title="Metering projection">
-      <CardBody res={res}>
-        {(page) => {
+      {allowed ? (
+        <CardBody res={res}>
+          {(page) => {
           const nodes = page.data ?? [];
           if (nodes.length === 0) {
             return <EmptyState title="No metering observations" hint="Metering nodes report projections to the control plane on an interval" />;
@@ -451,7 +500,10 @@ function MeteringProjectionCard({ res }: { res: Resource<MeteringPage> }) {
             </>
           );
         }}
-      </CardBody>
+        </CardBody>
+      ) : (
+        <PermissionNote permission={PERMISSIONS.operationsRead} />
+      )}
     </Card>
   );
 }
@@ -460,11 +512,12 @@ function MeteringProjectionCard({ res }: { res: Resource<MeteringPage> }) {
 /* Models available                                                    */
 /* ------------------------------------------------------------------ */
 
-function ModelsCard({ res }: { res: Resource<LLMModelList> }) {
+function ModelsCard({ res, allowed }: { res: Resource<LLMModelList>; allowed: boolean }) {
   return (
     <Card title="Models available">
-      <CardBody res={res}>
-        {(list) => {
+      {allowed ? (
+        <CardBody res={res}>
+          {(list) => {
           const models = list.data ?? [];
           if (models.length === 0) {
             return <EmptyState title="No models available" hint="No public models are visible on the active catalog revision" />;
@@ -494,7 +547,10 @@ function ModelsCard({ res }: { res: Resource<LLMModelList> }) {
             </>
           );
         }}
-      </CardBody>
+        </CardBody>
+      ) : (
+        <PermissionNote permission={PERMISSIONS.modelsRead} />
+      )}
     </Card>
   );
 }
@@ -505,15 +561,23 @@ function ModelsCard({ res }: { res: Resource<LLMModelList> }) {
 
 export default function OverviewPage() {
   const { tick, auto, setAuto, refresh, observedAt } = useAutoRefresh(15_000);
+  const { can } = useAuth();
+
+  // Panels whose data source needs a permission the session lacks are not
+  // fetched at all and show an explicit PermissionNote instead.
+  const canMetering = can(PERMISSIONS.meteringRead);
+  const canProviders = can(PERMISSIONS.providersRead);
+  const canOperations = can(PERMISSIONS.operationsRead);
+  const canModels = can(PERMISSIONS.modelsRead);
 
   const readiness = useResource(loadReadiness, [tick]);
-  const usageToday = useResource(aggregateUsageToday, [tick]);
-  const series = useResource(aggregateUsageSeries24h, [tick]);
-  const connections = useResource(() => apiGet<ProviderConnectionPage>("/control/v1/provider-connections?limit=100"), [tick]);
-  const gateways = useResource(() => apiGet<GatewayPage>("/control/v1/operations/gateways"), [tick]);
-  const publications = useResource(() => apiGet<PublicationPage>("/control/v1/operations/publications"), [tick]);
-  const metering = useResource(() => apiGet<MeteringPage>("/control/v1/operations/metering"), [tick]);
-  const models = useResource(() => apiGet<LLMModelList>("/llm/models"), [tick]);
+  const usageToday = useResource(aggregateUsageToday, [tick], { enabled: canMetering });
+  const series = useResource(aggregateUsageSeries24h, [tick], { enabled: canMetering });
+  const connections = useResource(() => apiGet<ProviderConnectionPage>("/control/v1/provider-connections?limit=100"), [tick], { enabled: canProviders });
+  const gateways = useResource(() => apiGet<GatewayPage>("/control/v1/operations/gateways"), [tick], { enabled: canOperations });
+  const publications = useResource(() => apiGet<PublicationPage>("/control/v1/operations/publications"), [tick], { enabled: canOperations });
+  const metering = useResource(() => apiGet<MeteringPage>("/control/v1/operations/metering"), [tick], { enabled: canOperations });
+  const models = useResource(() => apiGet<LLMModelList>("/llm/models"), [tick], { enabled: canModels });
 
   const warnings = deriveWarnings(readiness.data, gateways.data, publications.data, metering.data);
 
@@ -539,8 +603,8 @@ export default function OverviewPage() {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 10, marginBottom: 14 }}>
         <ReadinessCard res={readiness} />
-        <UsageStatCards res={usageToday} />
-        <ModelsCard res={models} />
+        <UsageStatCards res={usageToday} allowed={canMetering} />
+        <ModelsCard res={models} allowed={canModels} />
       </div>
 
       <div style={{ marginBottom: 14 }}>
@@ -549,13 +613,13 @@ export default function OverviewPage() {
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.9fr) minmax(0,1fr)", gap: 14, alignItems: "start" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
-          <UsageChartCard res={series} />
-          <ProviderHealthCard res={connections} />
-          <GatewayStatusCard res={gateways} />
+          <UsageChartCard res={series} allowed={canMetering} />
+          <ProviderHealthCard res={connections} allowed={canProviders} />
+          <GatewayStatusCard res={gateways} allowed={canOperations} />
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
-          <PublicationCard res={publications} />
-          <MeteringProjectionCard res={metering} />
+          <PublicationCard res={publications} allowed={canOperations} />
+          <MeteringProjectionCard res={metering} allowed={canOperations} />
         </div>
       </div>
     </div>

@@ -1,5 +1,7 @@
 import { useState } from "react";
-import { apiSend, ApiError } from "../../api/client";
+import { apiSend, ApiError, authFetch } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading, Modal, useToast } from "../../components/feedback";
 import { Badge, Button, Card, EmptyState } from "../../components/ui";
 import { formatDateTime, formatNumber, truncateId } from "../../lib/format";
@@ -13,6 +15,8 @@ import { exportStatusTone, type ExportJob, type UsageFilter, usageQuery } from "
  */
 export function ExportJobs({ filter, refreshKey }: { filter: UsageFilter; refreshKey: number }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.meteringWrite);
   const path = `/metering/v1/usage/exports?tenant_id=${encodeURIComponent(filter.tenantId)}&limit=50`;
   const { data, error, loading, retry } = useQuery<{ data: ExportJob[] }>(path, refreshKey);
   const [confirming, setConfirming] = useState(false);
@@ -37,7 +41,7 @@ export function ExportJobs({ filter, refreshKey }: { filter: UsageFilter; refres
   const download = (job: ExportJob) => {
     // The signed content URL is only exposed via the Link response header, so
     // this needs the raw Response rather than apiGet.
-    fetch(`/api/metering/v1/usage/exports/${encodeURIComponent(job.id)}?tenant_id=${encodeURIComponent(job.tenant_id)}`, {
+    authFetch(`/metering/v1/usage/exports/${encodeURIComponent(job.id)}?tenant_id=${encodeURIComponent(job.tenant_id)}`, {
       headers: { Accept: "application/json" },
     })
       .then(async (response) => {
@@ -75,7 +79,12 @@ export function ExportJobs({ filter, refreshKey }: { filter: UsageFilter; refres
         </>
       }
       actions={
-        <Button variant="primary" onClick={() => setConfirming(true)}>
+        <Button
+          variant="primary"
+          onClick={() => setConfirming(true)}
+          disabled={!canWrite}
+          title={canWrite ? undefined : "Requires platform:metering:write"}
+        >
           Request CSV export
         </Button>
       }

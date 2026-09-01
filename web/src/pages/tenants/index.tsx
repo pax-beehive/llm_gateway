@@ -4,6 +4,8 @@
  */
 import { useEffect, useState } from "react";
 import { apiSend } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading, Modal, useToast } from "../../components/feedback";
 import { Badge, Button, Card, EmptyState, Table, Td, Th } from "../../components/ui";
 import { navigate } from "../../router";
@@ -166,6 +168,8 @@ function CreateTenantModal({
 /* ------------------------------------------------------------------ */
 
 function TenantList() {
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const [statusFilter, setStatusFilter] = useState("");
   const [includeClosed, setIncludeClosed] = useState(false);
   const [search, setSearch] = useState("");
@@ -196,7 +200,12 @@ function TenantList() {
             Isolated customer organizations. Each tenant has a Home Region authorized for strongly consistent writes.
           </div>
         </div>
-        <Button variant="primary" onClick={() => setCreateOpen(true)}>
+        <Button
+          variant="primary"
+          disabled={!canWrite}
+          title={canWrite ? undefined : "Requires platform:tenants:write"}
+          onClick={() => setCreateOpen(true)}
+        >
           Create Tenant
         </Button>
       </div>
@@ -235,7 +244,12 @@ function TenantList() {
             hint={needle ? "No tenants match the search" : "Create one to get started"}
             action={
               !needle ? (
-                <Button variant="primary" onClick={() => setCreateOpen(true)}>
+                <Button
+                  variant="primary"
+                  disabled={!canWrite}
+                  title={canWrite ? undefined : "Requires platform:tenants:write"}
+                  onClick={() => setCreateOpen(true)}
+                >
                   Create Tenant
                 </Button>
               ) : undefined

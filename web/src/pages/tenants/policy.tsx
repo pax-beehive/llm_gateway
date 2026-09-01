@@ -4,6 +4,8 @@
  */
 import { useEffect, useState, type ReactNode } from "react";
 import { apiSend } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading, useToast } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, EmptyState, Table, Td, Th } from "../../components/ui";
 import { useApi } from "../../api/useApi";
@@ -215,6 +217,8 @@ function TriStateSelect({
 
 export function TenantPolicyTab({ tenantId }: { tenantId: string }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const path = `/control/v1/tenants/${encodeURIComponent(tenantId)}/policy`;
   const { data, error, loading, retry } = useApi<TenantPolicy>(path);
   const effective = useApi<TenantEffectivePolicy>(
@@ -379,7 +383,12 @@ export function TenantPolicyTab({ tenantId }: { tenantId: string }) {
           <Button onClick={() => setForm(policyToForm(data))} disabled={!dirty || saving}>
             Discard
           </Button>
-          <Button variant="primary" disabled={!dirty || !reason.trim() || saving} onClick={() => void save()}>
+          <Button
+            variant="primary"
+            disabled={!canWrite || !dirty || !reason.trim() || saving}
+            title={canWrite ? undefined : "Requires platform:tenants:write"}
+            onClick={() => void save()}
+          >
             Save policy
           </Button>
         </div>
@@ -444,6 +453,8 @@ export function PolicyRevisionsTab({
   revisionsPath: string;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.tenantsWrite);
   const list = usePagedList<AnyRevision>(`${revisionsPath}?limit=25`);
   const policy = useApi<TenantPolicy | APIKeyPolicy>(policyPath);
   const [restoreTarget, setRestoreTarget] = useState<AnyRevision | null>(null);
@@ -508,7 +519,15 @@ export function PolicyRevisionsTab({
                     <Button onClick={() => setViewing(viewing?.revision === rev.revision ? null : rev)}>
                       {viewing?.revision === rev.revision ? "Hide" : "JSON"}
                     </Button>
-                    {!isCurrent && <Button onClick={() => setRestoreTarget(rev)}>Restore</Button>}
+                    {!isCurrent && (
+                      <Button
+                        disabled={!canWrite}
+                        title={canWrite ? undefined : "Requires platform:tenants:write"}
+                        onClick={() => setRestoreTarget(rev)}
+                      >
+                        Restore
+                      </Button>
+                    )}
                   </div>
                 </Td>
               </tr>

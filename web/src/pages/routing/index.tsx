@@ -8,6 +8,8 @@
  */
 import { useState } from "react";
 import { useApi } from "../../api/useApi";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ErrorBanner, Loading } from "../../components/feedback";
 import { Badge, Button, Card, CopyButton, EmptyState, Tabs } from "../../components/ui";
 import { formatDateTime, truncateId } from "../../lib/format";
@@ -21,6 +23,8 @@ const TABS = ["Active routes", "Drafts", "Revisions"];
 
 export default function RoutingPage() {
   const { data: head, error, loading, retry } = useApi<Revision>("/control/v1/routing-catalog");
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.routingWrite);
   const [tab, setTab] = useState(TABS[0]);
   const [trackedPubId, setTrackedPubId] = useState<string | null>(null);
   const [inspectId, setInspectId] = useState("");
@@ -81,8 +85,8 @@ export default function RoutingPage() {
           </Button>
           <Button
             variant="primary"
-            disabled={!head}
-            title={head ? undefined : "No published revision to base a draft on"}
+            disabled={!canWrite || !head}
+            title={!canWrite ? "Requires platform:routing:write" : head ? undefined : "No published revision to base a draft on"}
             onClick={() => {
               setTab("Drafts");
               setCreateSignal((n) => n + 1);

@@ -22,11 +22,17 @@ web/
   scripts/extract-fonts.mjs # font extractor (generated src/styles/fonts.css, do not edit by hand)
   src/
     main.tsx                # entry, imports styles/fonts.css, tokens.css, base.css
-    App.tsx                 # route → page switch, Layout + ToastProvider wiring
+    App.tsx                 # ToastProvider → AuthProvider → RequireSession → Layout + page
     router.ts               # hash routing (useRoute, navigate)
     styles/tokens.css       # ALL design tokens (CSS custom properties)
-    styles/base.css         # reset, scrollbars, typography
-    api/client.ts           # ApiError, apiGet, apiSend, streamSSE
+    styles/base.css         # reset, scrollbars, typography, :focus-visible ring
+    auth/types.ts           # SessionView, AuthState
+    auth/AuthProvider.tsx   # session bootstrap, useAuth() { state, retry, signIn, signOut, can }
+    auth/RequireSession.tsx # gates the console behind a valid session
+    auth/SignInPage.tsx     # standalone sign-in surface
+    auth/UserMenu.tsx       # identity, organization, role, sign-out menu
+    auth/permissions.ts     # PERMISSIONS constants + hasPermission
+    api/client.ts           # ApiError, apiGet, apiSend, streamSSE, authFetch, setSessionLostHandler
     api/useApi.ts           # useApi<T>(path) GET-on-mount hook
     lib/format.ts           # formatting helpers
     components/layout.tsx   # sidebar/header/breadcrumbs shell, NAV definitions
@@ -38,6 +44,35 @@ web/
     pages/<section>/index.tsx  # one directory per nav section
     pages/shared.tsx        # SmokePage placeholder (replace per section)
 ```
+
+## Auth & permissions
+
+The console sits behind a BFF session (WorkOS AuthKit; see
+`docs/handsoff/2026-08-31-workos-frontend-integration-handoff.md`).
+
+- `AuthProvider` fetches `GET /api/auth/session` once at startup and keeps the session in
+  React memory only — never localStorage (localStorage stays limited to the theme).
+- `RequireSession` blocks all pages until bootstrap resolves; 401 → SignInPage,
+  `organization_denied` → Access denied, network/5xx → Retry surface.
+- Sign in uses top-level navigation. Sign out uses `apiSend` to POST the same-origin
+  logout endpoint, then performs a top-level navigation to its validated `redirect_to`.
+- Every request goes through `apiGet`/`apiSend`/`streamSSE`/`authFetch` with
+  `credentials: "same-origin"`; 401 `session_required`/`session_expired` flips the app to
+  anonymous via the registered session-lost handler; 403 `permission_denied` stays a plain
+  `ApiError` for the page to render.
+- UI gating uses `useAuth().can(PERMISSIONS.*)`: sections without read permission are
+  hidden from the sidebar (NAV entries carry `permission`), mutation triggers are
+  `disabled` with a `title="Requires <permission>"` tooltip. Frontend permissions only
+  hide/disable — the BFF and upstreams re-authorize server-side.
+- Never put WorkOS tokens, Gateway API keys, or any secret into env vars, the bundle,
+  storage, logs, or error reports. Never call WorkOS or Cloud Run directly.
+
+Local development uses the BFF development auth mode (`make run-bff-dev` sets
+`BFF_DEV_AUTH=true` and binds `127.0.0.1`): `/api/auth/session` returns a fixed dev session with the full
+permission set. Set `BFF_DEV_AUTH_PERMISSIONS="platform:tenants:read,..."` to exercise
+permission-gated UI. Without `BFF_DEV_AUTH`, the BFF uses WorkOS only when all
+required WorkOS variables are configured; otherwise auth and every business
+proxy fail closed.
 
 ## Routing
 
@@ -51,7 +86,8 @@ navigate("tenants");           // sets location.hash
 
 To add a page: create `src/pages/<name>/index.tsx` with a default-exported component,
 register it in `App.tsx` (`PAGES` map) and add a `NAV` entry in
-`components/layout.tsx` (24x24 stroke SVG path for the icon).
+`components/layout.tsx` (24x24 stroke SVG path for the icon; set `permission` when the
+section requires a WorkOS read permission).
 
 ## API client
 
@@ -128,7 +164,7 @@ const toast = useToast(); toast("Saved", "success" | "error" | "info");
 
 ## Design tokens (use var(--*) only — never hardcode colors)
 
-Surfaces/text: `--bg`, `--panel`, `--ink`, `--ink2` (muted), `--ink3` (faint), `--line`, `--chip`.
+Surfaces/text: `--bg`, `--panel`, `--ink`, `--ink2` (muted), `--ink3` (faint), `--line`, `--chip`, `--on-accent`.
 Semantic (each has a matching `--<c>-bg`): `--blue` (primary), `--green`, `--amber`, `--red`, `--purple`.
 `--shadow`, `--radius-sm|–|–lg|--radius-pill`, `--font-ui`, `--font-mono`,
 `--sidebar-w`, `--sidebar-w-collapsed`, `--header-h`.

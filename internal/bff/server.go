@@ -22,6 +22,10 @@ const maxLLMRequestBody = 1 << 20 // 1 MiB
 
 // NewHandler builds the BFF HTTP handler: /api proxies plus the SPA fallback.
 func NewHandler(cfg Config) (http.Handler, error) {
+	auth, err := newAuthService(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("BFF auth configuration: %w", err)
+	}
 	gatewayURL, err := url.Parse(cfg.GatewayURL)
 	if err != nil {
 		return nil, fmt.Errorf("BFF_GATEWAY_URL: %w", err)
@@ -37,6 +41,8 @@ func NewHandler(cfg Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 
+	registerAuthRoutes(mux, auth)
+
 	// Gateway LLM endpoints: /api/llm/X → /v1/X, except healthz/readyz which
 	// pass through unchanged. No Idempotency-Key is added here; the gateway
 	// owns request identity for Responses.
@@ -49,10 +55,10 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		gateway = nil
 	}
 	gatewayHandler := upstreamOrUnconfigured("/api/llm", gateway, cfg.GatewayConfigured)
-	mux.Handle("GET /api/llm/models", gatewayHandler)
-	mux.Handle("POST /api/llm/responses", limitBody(gatewayHandler, maxLLMRequestBody))
-	mux.Handle("GET /api/llm/healthz", gatewayHandler)
-	mux.Handle("GET /api/llm/readyz", gatewayHandler)
+	mux.Handle("GET /api/llm/models", authorizeBusinessRequest(auth, gatewayHandler))
+	mux.Handle("POST /api/llm/responses", authorizeBusinessRequest(auth, limitBody(gatewayHandler, maxLLMRequestBody)))
+	mux.Handle("GET /api/llm/healthz", authorizeBusinessRequest(auth, gatewayHandler))
+	mux.Handle("GET /api/llm/readyz", authorizeBusinessRequest(auth, gatewayHandler))
 	mux.Handle("/api/llm/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "LLM BFF route is not exposed")
 	}))
@@ -66,7 +72,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		}
 		ensureIdempotencyKey(req)
 	})
-	mux.Handle("/api/control/", upstreamOrUnconfigured("/api/control/", control, cfg.ControlConfigured))
+	mux.Handle("/api/control/", authorizeBusinessRequest(auth, upstreamOrUnconfigured("/api/control/", control, cfg.ControlConfigured)))
 
 	// Metering: strip /api, inject admin token. Health endpoints live at the
 	// server root, not under /metering.
@@ -75,7 +81,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/metering")
 		}
 	})
-	mux.Handle("/api/metering/", upstreamOrUnconfigured("/api/metering/", metering, cfg.MeteringConfigured))
+	mux.Handle("/api/metering/", authorizeBusinessRequest(auth, upstreamOrUnconfigured("/api/metering/", metering, cfg.MeteringConfigured)))
 
 	mux.Handle("/", spaHandler(cfg.WebDist))
 

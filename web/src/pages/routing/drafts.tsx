@@ -4,6 +4,8 @@
  */
 import { useEffect, useState } from "react";
 import { ApiError } from "../../api/client";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
 import { ConfirmDialog, Modal, useToast } from "../../components/feedback";
 import { Badge, Button, Card, EmptyState, Spinner, Table, Td, Th } from "../../components/ui";
 import { timeAgo, truncateId } from "../../lib/format";
@@ -55,6 +57,8 @@ export function DraftsSection({
   onHeadChanged: () => void;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.routingWrite);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -118,7 +122,7 @@ export function DraftsSection({
       <Card
         title="Drafts"
         actions={
-          <Button variant="primary" disabled={!head} title={head ? undefined : "No published revision to base a draft on"} onClick={() => setCreateOpen(true)}>
+          <Button variant="primary" disabled={!canWrite || !head} title={!canWrite ? "Requires platform:routing:write" : head ? undefined : "No published revision to base a draft on"} onClick={() => setCreateOpen(true)}>
             Create draft
           </Button>
         }
@@ -320,6 +324,8 @@ function DraftEditor({
   onClose: () => void;
 }) {
   const toast = useToast();
+  const { can } = useAuth();
+  const canWrite = can(PERMISSIONS.routingWrite);
   const [doc, setDoc] = useState<RoutingDocument>(() => JSON.parse(JSON.stringify(draft.document)) as RoutingDocument);
   const [dirty, setDirty] = useState(false);
   const [view, setView] = useState<"visual" | "json">("visual");
@@ -419,18 +425,32 @@ function DraftEditor({
       }
       actions={
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <Button disabled={busy || !dirty} onClick={() => setPending("save")}>Save</Button>
-          <Button disabled={busy || dirty} title={dirty ? "Save before validating" : undefined} onClick={() => setPending("validate")}>
+          <Button disabled={!canWrite || busy || !dirty} title={canWrite ? undefined : "Requires platform:routing:write"} onClick={() => setPending("save")}>Save</Button>
+          <Button
+            disabled={!canWrite || busy || dirty}
+            title={!canWrite ? "Requires platform:routing:write" : dirty ? "Save before validating" : undefined}
+            onClick={() => setPending("validate")}
+          >
             Validate
           </Button>
-          <Button disabled={busy || dirty} title={dirty ? "Save before probing" : undefined} onClick={() => setPending("probe")}>
+          <Button
+            disabled={!canWrite || busy || dirty}
+            title={!canWrite ? "Requires platform:routing:write" : dirty ? "Save before probing" : undefined}
+            onClick={() => setPending("probe")}
+          >
             Probe connections
           </Button>
           <Button
             variant="primary"
-            disabled={busy || dirty || !publishable}
+            disabled={!canWrite || busy || dirty || !publishable}
             title={
-              dirty ? "Save before publishing" : !publishable ? "Draft must pass validation first" : undefined
+              !canWrite
+                ? "Requires platform:routing:write"
+                : dirty
+                  ? "Save before publishing"
+                  : !publishable
+                    ? "Draft must pass validation first"
+                    : undefined
             }
             onClick={() => setPending("publish")}
           >
@@ -471,6 +491,8 @@ function DraftEditor({
             <span style={{ flex: 1 }} />
             {view === "visual" && (
               <Button
+                disabled={!canWrite}
+                title={canWrite ? undefined : "Requires platform:routing:write"}
                 onClick={() => {
                   const routes = [...doc.routes, blankRoute()];
                   mutateDoc({ routes });
@@ -516,6 +538,8 @@ function DraftEditor({
                       <Td>
                         <div style={{ display: "flex", gap: 5 }}>
                           <Button
+                            disabled={!canWrite}
+                            title={canWrite ? undefined : "Requires platform:routing:write"}
                             onClick={() => {
                               setEditIndex(i);
                               setFormOpen(true);
@@ -524,6 +548,8 @@ function DraftEditor({
                             Edit
                           </Button>
                           <Button
+                            disabled={!canWrite}
+                            title={canWrite ? undefined : "Requires platform:routing:write"}
                             onClick={() => {
                               const copy = JSON.parse(JSON.stringify(route)) as ManagedRoute;
                               copy.route_id = `${route.route_id}-copy`;
@@ -533,6 +559,8 @@ function DraftEditor({
                             Duplicate
                           </Button>
                           <Button
+                            disabled={!canWrite}
+                            title={canWrite ? undefined : "Requires platform:routing:write"}
                             style={{ color: "var(--red)" }}
                             onClick={() => mutateDoc({ routes: doc.routes.filter((_, j) => j !== i) })}
                           >
@@ -576,7 +604,14 @@ function DraftEditor({
               )}
               <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
                 <Button onClick={() => setView("visual")}>Back to visual</Button>
-                <Button variant="primary" onClick={applyJson}>Apply JSON</Button>
+                <Button
+                  variant="primary"
+                  disabled={!canWrite}
+                  title={canWrite ? undefined : "Requires platform:routing:write"}
+                  onClick={applyJson}
+                >
+                  Apply JSON
+                </Button>
               </div>
             </div>
           )}
