@@ -62,7 +62,7 @@ func TestBFFHealthAndReadinessAreUnauthenticated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"/healthz", "/readyz"} {
+	for _, path := range []string{"/health", "/ready", "/healthz", "/readyz"} {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 		if recorder.Code != http.StatusOK {

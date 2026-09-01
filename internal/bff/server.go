@@ -42,16 +42,20 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	healthHandler := func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+	}
+	mux.HandleFunc("GET /health", healthHandler)
+	mux.HandleFunc("GET /healthz", healthHandler)
+	readyHandler := func(w http.ResponseWriter, _ *http.Request) {
 		if _, err := os.Stat(filepath.Join(cfg.WebDist, "index.html")); err != nil {
 			writeError(w, http.StatusServiceUnavailable, "web_dist_missing", "web console build is unavailable")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-	})
+	}
+	mux.HandleFunc("GET /ready", readyHandler)
+	mux.HandleFunc("GET /readyz", readyHandler)
 
 	registerAuthRoutes(mux, auth)
 

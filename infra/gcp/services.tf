@@ -58,7 +58,7 @@ resource "google_cloud_run_v2_service" "control_plane" {
         period_seconds        = 5
         failure_threshold     = 48
         http_get {
-          path = "/readyz"
+          path = "/ready"
           port = 8080
         }
       }
@@ -69,7 +69,7 @@ resource "google_cloud_run_v2_service" "control_plane" {
         period_seconds        = 10
         failure_threshold     = 3
         http_get {
-          path = "/healthz"
+          path = "/health"
           port = 8080
         }
       }
@@ -585,12 +585,13 @@ resource "google_cloud_run_v2_service_iam_member" "control_invoker" {
 resource "google_cloud_run_v2_service" "bff" {
   count = var.bff_service_enabled ? 1 : 0
 
-  project             = var.project_id
-  location            = var.region
-  name                = local.bff_service_name
-  labels              = merge(local.labels, { component = "bff-console" })
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = true
+  project              = var.project_id
+  location             = var.region
+  name                 = local.bff_service_name
+  labels               = merge(local.labels, { component = "bff-console" })
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  deletion_protection  = true
 
   template {
     service_account                  = google_service_account.bff.email
@@ -757,13 +758,4 @@ resource "google_cloud_run_v2_service_iam_member" "bff_metering_invoker" {
   name     = google_cloud_run_v2_service.metering.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.bff.email}"
-}
-
-resource "google_cloud_run_v2_service_iam_member" "bff_public_invoker" {
-  count    = var.bff_service_enabled ? 1 : 0
-  project  = var.project_id
-  location = google_cloud_run_v2_service.bff[0].location
-  name     = google_cloud_run_v2_service.bff[0].name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
 }
