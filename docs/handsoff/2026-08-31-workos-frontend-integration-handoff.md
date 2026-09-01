@@ -59,12 +59,14 @@ BFF 部署仍未完成；上面的“当前事实”仍描述已发布 SHA 的�
 - `operator-admin`：完整 Ops Console 权限，包括 Playground 和所有 mutation。
 - `operator-viewer`：只读权限，不包括 Playground。
 
-两个 Operator organization 当前都没有已接受邀请的用户。已向
-`toddzheng@paxtech.net` 发送 7 天有效的 `operator-admin` 邀请，当前状态均为
-`Pending`：Staging `invitation_01M1DH10GPTSV269BQ2TS4XNAS`，Production
-`invitation_01M1DH12X29PAKYWJSTXARA67Y`。WorkOS MCP 不返回或生成可供 BFF
-使用的 secret；仍需从 WorkOS Dashboard 创建/取得环境 API key，并直接写入本地
-secret store 或 GCP Secret Manager，不要写入仓库或交接文档。
+Staging 邀请 `invitation_01M1DH10GPTSV269BQ2TS4XNAS` 仍为 `Pending`，当前不再
+推进。Production 邀请 `invitation_01M1DH12X29PAKYWJSTXARA67Y` 已由
+`toddzheng@paxtech.net` 接受；用户 `user_01M1DH12V6N1KT5WRP7KHD85KK`
+已完成邮箱验证并建立 session，organization membership
+`om_01M1DH12W5B7HJFMZENVRX994N` 为 `Active`，角色为 `operator-admin`。
+WorkOS MCP 不返回或生成可供 BFF 使用的 secret；仍需从 WorkOS Dashboard
+创建/取得环境 API key，并直接写入本地 secret store 或 GCP Secret Manager，
+不要写入仓库或交接文档。
 
 生产 BFF 需要同时配置：
 
