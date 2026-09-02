@@ -38,6 +38,10 @@ available until DNS and TLS are ready. WorkOS must allow both the custom-domain
 callback (`/api/auth/callback`) and logout URL before the BFF is rolled to the
 new public URL.
 
+Pin `bff_workos_api_key_version` to the numeric Secret Manager version used by
+production. During a key rotation, add and validate the new secret version,
+advance this variable, roll the BFF, and only then disable the previous version.
+
 ```sh
 terraform -chdir=infra/gcp output -json console_domain
 gcloud certificate-manager certificates describe llm-gateway-prod-console \

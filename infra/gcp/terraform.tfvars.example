@@ -5,6 +5,7 @@ gateway_image        = "us-west1-docker.pkg.dev/pax-fde-prod/llm-gateway-prod-co
 control_plane_image  = "us-west1-docker.pkg.dev/pax-fde-prod/llm-gateway-prod-containers/control-plane@sha256:replace-with-release-digest"
 metering_image       = "us-west1-docker.pkg.dev/pax-fde-prod/llm-gateway-prod-containers/metering@sha256:replace-with-release-digest"
 gateway_service_enabled = false
+bff_workos_api_key_version = "latest"
 console_domain = ""
 console_certificate_enabled    = false
 console_certificate_generation = "v1"

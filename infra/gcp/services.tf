@@ -709,7 +709,7 @@ resource "google_cloud_run_v2_service" "bff" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.bff_workos_api_key.secret_id
-            version = "latest"
+            version = var.bff_workos_api_key_version
           }
         }
       }

@@ -132,6 +132,17 @@ variable "bff_service_enabled" {
   default     = false
 }
 
+variable "bff_workos_api_key_version" {
+  description = "Secret Manager version containing the WorkOS Production API key. Pin a numeric version in production so rotations roll the BFF deterministically."
+  type        = string
+  default     = "latest"
+
+  validation {
+    condition     = can(regex("^(latest|[1-9][0-9]*)$", var.bff_workos_api_key_version))
+    error_message = "bff_workos_api_key_version must be latest or a positive numeric Secret Manager version."
+  }
+}
+
 variable "bff_public_url" {
   description = "Browser-visible HTTPS origin registered as the WorkOS callback and logout URL."
   type        = string
