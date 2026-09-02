@@ -81,3 +81,11 @@ output "bff_service" {
     uri  = google_cloud_run_v2_service.bff[0].uri
   } : null
 }
+
+output "console_domain" {
+  value = var.console_domain != "" && var.bff_service_enabled ? {
+    hostname                 = var.console_domain
+    ipv4_address             = google_compute_global_address.console[0].address
+    dns_authorization_record = google_certificate_manager_dns_authorization.console[0].dns_resource_record
+  } : null
+}

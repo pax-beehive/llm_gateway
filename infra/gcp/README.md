@@ -13,7 +13,31 @@ configuration Cloud Run Jobs pinned by digest, followed by private Control
 Plane and Metering Cloud Run services. The Gateway resource remains gated by
 `gateway_service_enabled=false` until a Provider Connection, Routing Catalog,
 Tenant, and Gateway API key have been published. This stage does not create
-public DNS or a load balancer.
+public DNS or a load balancer unless `console_domain` is set for an enabled
+BFF service.
+
+## Production console domain
+
+Setting `console_domain` creates a fixed global IPv4 address, a global external
+Application Load Balancer backed by a regional serverless NEG, HTTP-to-HTTPS
+redirects, and a Certificate Manager DNS-authorized managed certificate. Keep
+the certificate authorization CNAME DNS-only at the authoritative DNS provider.
+Point the console hostname at the `console_domain.ipv4_address` output. The A
+record may remain DNS-only while the Google certificate reaches `ACTIVE`; if a
+Cloudflare proxy is enabled afterward, retain the authorization CNAME as
+DNS-only and use Full (strict) origin TLS.
+
+Apply the infrastructure and DNS records before changing `bff_public_url` to
+the custom HTTPS origin. That ordering keeps the existing `run.app` login flow
+available until DNS and TLS are ready. WorkOS must allow both the custom-domain
+callback (`/api/auth/callback`) and logout URL before the BFF is rolled to the
+new public URL.
+
+```sh
+terraform -chdir=infra/gcp output -json console_domain
+gcloud certificate-manager certificates describe llm-gateway-prod-console \
+  --project=pax-fde-prod --location=global
+```
 
 The services use an isolated regional VPC and Direct VPC egress with
 `ALL_TRAFFIC`. Private Google Access makes same-project Cloud Run calls count

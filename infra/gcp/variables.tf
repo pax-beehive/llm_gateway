@@ -138,6 +138,17 @@ variable "bff_public_url" {
   default     = ""
 }
 
+variable "console_domain" {
+  description = "Optional production hostname exposed through a global HTTPS load balancer in front of the BFF."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.console_domain == "" || can(regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", var.console_domain))
+    error_message = "console_domain must be empty or a lowercase DNS hostname without a scheme or path."
+  }
+}
+
 variable "workos_client_id" {
   description = "WorkOS Production AuthKit client ID; not a secret."
   type        = string

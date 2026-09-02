@@ -50,6 +50,7 @@ resource "google_project_service" "required" {
   for_each = toset([
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
+    "certificatemanager.googleapis.com",
     "compute.googleapis.com",
     "iamcredentials.googleapis.com",
     "logging.googleapis.com",

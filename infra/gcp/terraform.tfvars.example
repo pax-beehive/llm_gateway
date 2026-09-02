@@ -5,6 +5,7 @@ gateway_image        = "us-west1-docker.pkg.dev/pax-fde-prod/llm-gateway-prod-co
 control_plane_image  = "us-west1-docker.pkg.dev/pax-fde-prod/llm-gateway-prod-containers/control-plane@sha256:replace-with-release-digest"
 metering_image       = "us-west1-docker.pkg.dev/pax-fde-prod/llm-gateway-prod-containers/metering@sha256:replace-with-release-digest"
 gateway_service_enabled = false
+console_domain = ""
 region           = "us-west1"
 environment      = "prod"
 database_version = "POSTGRES_18"
