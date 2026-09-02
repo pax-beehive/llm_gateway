@@ -20,12 +20,17 @@ BFF service.
 
 Setting `console_domain` creates a fixed global IPv4 address, a global external
 Application Load Balancer backed by a regional serverless NEG, HTTP-to-HTTPS
-redirects, and a Certificate Manager DNS-authorized managed certificate. Keep
-the certificate authorization CNAME DNS-only at the authoritative DNS provider.
-Point the console hostname at the `console_domain.ipv4_address` output. The A
-record may remain DNS-only while the Google certificate reaches `ACTIVE`; if a
-Cloudflare proxy is enabled afterward, retain the authorization CNAME as
-DNS-only and use Full (strict) origin TLS.
+redirects, and a Certificate Manager DNS authorization. Keep
+`console_certificate_enabled=false` for this first apply. Publish the output
+authorization CNAME as DNS-only and point the console hostname at the
+`console_domain.ipv4_address` output. After both records resolve publicly, set
+`console_certificate_enabled=true` and apply again to create the managed
+certificate and HTTPS frontend. The A record may remain DNS-only while the
+Google certificate reaches `ACTIVE`; if a Cloudflare proxy is enabled afterward,
+retain the authorization CNAME as DNS-only and use Full (strict) origin TLS.
+If a failed authorization must be retried or a certificate must be replaced,
+increment `console_certificate_generation`; Terraform creates the new
+certificate before switching the map entry and removing the previous one.
 
 Apply the infrastructure and DNS records before changing `bff_public_url` to
 the custom HTTPS origin. That ordering keeps the existing `run.app` login flow

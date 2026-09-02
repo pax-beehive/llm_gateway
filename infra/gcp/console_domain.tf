@@ -1,5 +1,6 @@
 locals {
-  console_domain_enabled = var.bff_service_enabled && var.console_domain != ""
+  console_domain_enabled      = var.bff_service_enabled && var.console_domain != ""
+  console_certificate_enabled = local.console_domain_enabled && var.console_certificate_enabled
 }
 
 resource "google_compute_global_address" "console" {
@@ -87,11 +88,11 @@ resource "google_certificate_manager_dns_authorization" "console" {
 }
 
 resource "google_certificate_manager_certificate" "console" {
-  count = local.console_domain_enabled ? 1 : 0
+  count = local.console_certificate_enabled ? 1 : 0
 
   project     = var.project_id
   location    = "global"
-  name        = "${local.prefix}-console"
+  name        = "${local.prefix}-console-${var.console_certificate_generation}"
   description = "Google-managed certificate for ${var.console_domain}."
   labels      = local.labels
 
@@ -101,12 +102,12 @@ resource "google_certificate_manager_certificate" "console" {
   }
 
   lifecycle {
-    prevent_destroy = true
+    create_before_destroy = true
   }
 }
 
 resource "google_certificate_manager_certificate_map" "console" {
-  count = local.console_domain_enabled ? 1 : 0
+  count = local.console_certificate_enabled ? 1 : 0
 
   project     = var.project_id
   name        = "${local.prefix}-console"
@@ -115,7 +116,7 @@ resource "google_certificate_manager_certificate_map" "console" {
 }
 
 resource "google_certificate_manager_certificate_map_entry" "console" {
-  count = local.console_domain_enabled ? 1 : 0
+  count = local.console_certificate_enabled ? 1 : 0
 
   project      = var.project_id
   name         = "${local.prefix}-console"
@@ -135,7 +136,7 @@ resource "google_compute_ssl_policy" "console" {
 }
 
 resource "google_compute_target_https_proxy" "console" {
-  count = local.console_domain_enabled ? 1 : 0
+  count = local.console_certificate_enabled ? 1 : 0
 
   project         = var.project_id
   name            = "${local.prefix}-console"
@@ -153,7 +154,7 @@ resource "google_compute_target_http_proxy" "console" {
 }
 
 resource "google_compute_global_forwarding_rule" "console_https" {
-  count = local.console_domain_enabled ? 1 : 0
+  count = local.console_certificate_enabled ? 1 : 0
 
   project               = var.project_id
   name                  = "${local.prefix}-console-https"

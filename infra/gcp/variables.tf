@@ -149,6 +149,23 @@ variable "console_domain" {
   }
 }
 
+variable "console_certificate_enabled" {
+  description = "Create the console managed certificate and HTTPS frontend after the DNS authorization CNAME has propagated."
+  type        = bool
+  default     = false
+}
+
+variable "console_certificate_generation" {
+  description = "Version suffix for zero-downtime console certificate replacement after DNS is ready."
+  type        = string
+  default     = "v1"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,20}$", var.console_certificate_generation))
+    error_message = "console_certificate_generation must start with a lowercase letter and contain only lowercase letters, digits, or hyphens."
+  }
+}
+
 variable "workos_client_id" {
   description = "WorkOS Production AuthKit client ID; not a secret."
   type        = string
