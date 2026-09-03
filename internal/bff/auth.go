@@ -181,8 +181,8 @@ func newAuthService(cfg Config) (*authService, error) {
 	a.client = workos.NewClient(cfg.WorkOSAPIKey, opts...)
 	// WorkOS PKCE uses the verifier instead of a client secret. A dedicated
 	// client prevents the SDK from also populating client_secret and the
-	// Authorization header during the code exchange. The authenticated client
-	// remains responsible for session refresh and logout.
+	// Authorization header during code exchange and refresh. The authenticated
+	// client remains responsible for logout.
 	a.pkceClient = workos.NewClient("", pkceOpts...)
 	return a, nil
 }
@@ -347,7 +347,10 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 		return nil, sessionRequired()
 	}
 	sealed := cookie.Value
-	session := workos.NewSession(a.client, sealed, a.cfg.WorkOSCookiePassword)
+	// The refresh token was issued through the PKCE exchange. Keep its refresh
+	// on the same public-client path so the SDK does not attach the separately
+	// configured WorkOS API key as client_secret or Authorization.
+	session := workos.NewSession(a.pkceClient, sealed, a.cfg.WorkOSCookiePassword)
 	result, err := session.Authenticate()
 	if err != nil {
 		a.clearCookie(w, sessionCookieName, "/")
@@ -375,7 +378,7 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 				return nil, sessionRefreshUnavailable()
 			}
 			a.setCookie(w, sessionCookieName, sealed, "/", 0)
-			result, err = workos.NewSession(a.client, sealed, a.cfg.WorkOSCookiePassword).Authenticate()
+			result, err = workos.NewSession(a.pkceClient, sealed, a.cfg.WorkOSCookiePassword).Authenticate()
 			if err != nil {
 				return nil, sessionRefreshUnavailable()
 			}

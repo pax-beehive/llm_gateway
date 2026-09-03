@@ -424,6 +424,9 @@ func TestWorkOSSessionRefreshRotatesSealedCookie(t *testing.T) {
 			if body["grant_type"] != "refresh_token" || body["refresh_token"] != "refresh_old" {
 				t.Errorf("refresh body = %#v", body)
 			}
+			if _, ok := body["client_secret"]; ok || r.Header.Get("Authorization") != "" {
+				t.Error("PKCE refresh must not send the WorkOS API key")
+			}
 			writeTestJSON(w, map[string]any{
 				"user":            map[string]any{"id": "user_123", "email": "ada@example.com"},
 				"organization_id": "org_operator", "access_token": freshToken, "refresh_token": "refresh_new",
