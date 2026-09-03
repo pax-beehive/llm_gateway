@@ -3,6 +3,7 @@ package bff
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -353,7 +354,7 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 		return nil, sessionRequired()
 	}
 	if result.NeedsRefresh {
-		refreshed, _ := session.Refresh(r.Context())
+		refreshed, refreshErr := session.Refresh(r.Context())
 		if refreshed != nil && refreshed.Authenticated && refreshed.Session != nil {
 			data, unsealErr := workos.Unseal[appSessionData](sealed, a.cfg.WorkOSCookiePassword)
 			if unsealErr != nil {
@@ -379,9 +380,11 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 				return nil, sessionRefreshUnavailable()
 			}
 		} else if refreshed != nil && refreshed.Reason == "refresh_token_revoked" {
+			logSessionRefreshFailure(refreshed, refreshErr)
 			a.clearCookie(w, sessionCookieName, "/")
 			return nil, &authFailure{http.StatusUnauthorized, "session_expired", "Your session has expired"}
 		} else {
+			logSessionRefreshFailure(refreshed, refreshErr)
 			return nil, sessionRefreshUnavailable()
 		}
 	}
@@ -417,6 +420,34 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 		accessToken:  data.AccessToken,
 	}
 	return &view, nil
+}
+
+func logSessionRefreshFailure(result *workos.RefreshSessionResult, err error) {
+	reason := "unknown"
+	if result != nil && result.Reason != "" {
+		reason = result.Reason
+	}
+	attributes := []any{"reason", reason, "error_kind", "unknown"}
+	var apiErr *workos.APIError
+	var networkErr *workos.NetworkError
+	switch {
+	case errors.As(err, &apiErr):
+		code := apiErr.Code
+		if code == "" {
+			code = apiErr.ErrorCode
+		}
+		attributes = []any{
+			"reason", reason,
+			"error_kind", "workos_api",
+			"workos_status", apiErr.StatusCode,
+			"workos_code", code,
+		}
+	case errors.As(err, &networkErr):
+		attributes = []any{"reason", reason, "error_kind", "network"}
+	case err == nil:
+		attributes = []any{"reason", reason, "error_kind", "result"}
+	}
+	slog.Warn("bff session refresh failed", attributes...)
 }
 
 func (a *authService) checkMutationOrigin(r *http.Request) *authFailure {
