@@ -4,7 +4,7 @@ import { useToast } from "../components/feedback";
 import { hasPermission } from "./permissions";
 import type { AuthState, SessionView } from "./types";
 
-const AUTH_QUERY_PARAMS = ["auth_error", "error", "error_description", "code", "state"];
+const AUTH_QUERY_PARAMS = ["auth_error", "auth_stage", "error", "error_description", "code", "state"];
 let sessionRequestAttempt = -1;
 let sessionRequest: Promise<SessionView> | null = null;
 

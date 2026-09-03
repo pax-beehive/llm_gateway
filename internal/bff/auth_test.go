@@ -289,7 +289,7 @@ func TestWorkOSPKCECallbackSessionAuthorizationAndLogout(t *testing.T) {
 		t.Fatal(err)
 	}
 	badCallback.Body.Close()
-	if badCallback.Header.Get("Location") != cfg.PublicURL+"/?auth_error=login_failed" {
+	if badCallback.Header.Get("Location") != cfg.PublicURL+"/?auth_error=login_failed&auth_stage=state_mismatch" {
 		t.Fatalf("failed callback location = %q", badCallback.Header.Get("Location"))
 	}
 	if cleared := cookieNamed(t, badCallback.Cookies(), "ugw_login"); cleared.MaxAge != -1 {

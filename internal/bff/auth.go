@@ -220,29 +220,45 @@ func (a *authService) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Delete the one-time state cookie before any redirect commits headers.
 	a.clearCookie(w, loginCookieName, "/api/auth")
 	if r.URL.Query().Get("error") != "" {
-		a.redirectAuthFailure(w, r)
+		a.redirectAuthFailure(w, r, "provider_error")
 		return
 	}
 	cookie, err := r.Cookie(loginCookieName)
 	if err != nil {
-		a.redirectAuthFailure(w, r)
+		a.redirectAuthFailure(w, r, "login_state_missing")
 		return
 	}
 	pending, err := workos.Unseal[loginState](cookie.Value, a.cfg.WorkOSCookiePassword)
-	if err != nil || pending.ExpiresAt <= time.Now().Unix() || !constantTimeEqual(pending.State, r.URL.Query().Get("state")) {
-		a.redirectAuthFailure(w, r)
+	if err != nil {
+		a.redirectAuthFailure(w, r, "login_state_invalid")
+		return
+	}
+	if pending.ExpiresAt <= time.Now().Unix() {
+		a.redirectAuthFailure(w, r, "login_state_expired")
+		return
+	}
+	if !constantTimeEqual(pending.State, r.URL.Query().Get("state")) {
+		a.redirectAuthFailure(w, r, "state_mismatch")
 		return
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		a.redirectAuthFailure(w, r)
+		a.redirectAuthFailure(w, r, "authorization_code_missing")
 		return
 	}
 	result, err := a.client.AuthKitPKCECodeExchange(r.Context(), workos.AuthKitPKCECodeExchangeParams{
 		Code: code, CodeVerifier: pending.CodeVerifier,
 	})
-	if err != nil || result.User == nil || result.OrganizationID == nil || result.AccessToken == "" || result.RefreshToken == "" || *result.OrganizationID != a.cfg.WorkOSOperatorOrganizationID {
-		a.redirectAuthFailure(w, r)
+	if err != nil {
+		a.redirectAuthFailure(w, r, "code_exchange_failed")
+		return
+	}
+	if result == nil || result.User == nil || result.OrganizationID == nil || result.AccessToken == "" || result.RefreshToken == "" {
+		a.redirectAuthFailure(w, r, "code_exchange_incomplete")
+		return
+	}
+	if *result.OrganizationID != a.cfg.WorkOSOperatorOrganizationID {
+		a.redirectAuthFailure(w, r, "organization_denied")
 		return
 	}
 	sealed, err := workos.Seal(appSessionData{
@@ -253,7 +269,7 @@ func (a *authService) handleCallback(w http.ResponseWriter, r *http.Request) {
 		OrganizationName: *result.OrganizationID,
 	}, a.cfg.WorkOSCookiePassword)
 	if err != nil {
-		a.redirectAuthFailure(w, r)
+		a.redirectAuthFailure(w, r, "session_seal_failed")
 		return
 	}
 	a.setCookie(w, sessionCookieName, sealed, "/", 0)
@@ -405,8 +421,10 @@ func (a *authService) clearCookie(w http.ResponseWriter, name, path string) {
 	})
 }
 
-func (a *authService) redirectAuthFailure(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, a.cfg.PublicURL+"/?auth_error=login_failed", http.StatusFound)
+func (a *authService) redirectAuthFailure(w http.ResponseWriter, r *http.Request, stage string) {
+	slog.Warn("bff auth callback failed", "stage", stage)
+	destination := a.cfg.PublicURL + "/?auth_error=login_failed&auth_stage=" + url.QueryEscape(stage)
+	http.Redirect(w, r, destination, http.StatusFound)
 }
 
 func (a *authService) isWorkOSURL(raw, wantPath string) bool {
