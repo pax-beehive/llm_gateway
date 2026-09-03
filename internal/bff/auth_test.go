@@ -216,6 +216,7 @@ func TestWorkOSPKCECallbackSessionAuthorizationAndLogout(t *testing.T) {
 		"sid": "session_123", "org_id": "org_operator", "role": "platform-viewer",
 		"permissions": []string{"platform:tenants:read", "platform:tenants:write"}, "exp": time.Now().Add(time.Hour).Unix(),
 	})
+	var organizationLookupCalls int
 	workOS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/user_management/authenticate":
@@ -234,7 +235,8 @@ func TestWorkOSPKCECallbackSessionAuthorizationAndLogout(t *testing.T) {
 				"organization_id": "org_operator", "access_token": accessToken, "refresh_token": "refresh_secret",
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/organizations/org_operator":
-			writeTestJSON(w, map[string]any{"id": "org_operator", "name": "Platform Operators"})
+			organizationLookupCalls++
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -331,8 +333,11 @@ func TestWorkOSPKCECallbackSessionAuthorizationAndLogout(t *testing.T) {
 	if err := json.NewDecoder(sessionResp.Body).Decode(&view); err != nil {
 		t.Fatal(err)
 	}
-	if view.User.ID != "user_123" || view.Organization.Name != "Platform Operators" || len(view.Permissions) != 2 {
+	if view.User.ID != "user_123" || view.Organization.Name != "org_operator" || len(view.Permissions) != 2 {
 		t.Fatalf("session view = %+v", view)
+	}
+	if organizationLookupCalls != 0 {
+		t.Fatalf("organization lookup calls = %d, want 0", organizationLookupCalls)
 	}
 
 	readReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/control/v1/tenants", nil)
@@ -404,7 +409,7 @@ func TestWorkOSSessionRefreshRotatesSealedCookie(t *testing.T) {
 		"sid": "session_123", "org_id": "org_operator", "role": "platform-admin",
 		"permissions": []string{"platform:tenants:read", "platform:tenants:write"}, "exp": time.Now().Add(time.Hour).Unix(),
 	})
-	var refreshCalls int
+	var refreshCalls, organizationLookupCalls int
 	workOS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/user_management/authenticate":
@@ -421,7 +426,8 @@ func TestWorkOSSessionRefreshRotatesSealedCookie(t *testing.T) {
 				"organization_id": "org_operator", "access_token": freshToken, "refresh_token": "refresh_new",
 			})
 		case "/organizations/org_operator":
-			writeTestJSON(w, map[string]any{"id": "org_operator", "name": "Platform Operators"})
+			organizationLookupCalls++
+			http.NotFound(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -463,14 +469,20 @@ func TestWorkOSSessionRefreshRotatesSealedCookie(t *testing.T) {
 		t.Fatal("refresh must rotate to a newly sealed cookie")
 	}
 	var view struct {
+		Organization struct {
+			Name string `json:"name"`
+		} `json:"organization"`
 		Role        string   `json:"role"`
 		Permissions []string `json:"permissions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
 		t.Fatal(err)
 	}
-	if view.Role != "platform-admin" || len(view.Permissions) != 2 {
+	if view.Organization.Name != "Platform Operators" || view.Role != "platform-admin" || len(view.Permissions) != 2 {
 		t.Fatalf("refreshed view = %+v", view)
+	}
+	if organizationLookupCalls != 0 {
+		t.Fatalf("organization lookup calls = %d, want 0", organizationLookupCalls)
 	}
 }
 

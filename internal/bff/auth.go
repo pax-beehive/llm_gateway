@@ -245,17 +245,12 @@ func (a *authService) handleCallback(w http.ResponseWriter, r *http.Request) {
 		a.redirectAuthFailure(w, r)
 		return
 	}
-	organization, err := a.client.Organizations().Get(r.Context(), *result.OrganizationID)
-	if err != nil || organization == nil || organization.ID != a.cfg.WorkOSOperatorOrganizationID {
-		a.redirectAuthFailure(w, r)
-		return
-	}
 	sealed, err := workos.Seal(appSessionData{
 		AccessToken:      result.AccessToken,
 		RefreshToken:     result.RefreshToken,
 		User:             result.User,
 		Impersonator:     result.Impersonator,
-		OrganizationName: organization.Name,
+		OrganizationName: *result.OrganizationID,
 	}, a.cfg.WorkOSCookiePassword)
 	if err != nil {
 		a.redirectAuthFailure(w, r)
@@ -315,16 +310,20 @@ func (a *authService) authenticate(w http.ResponseWriter, r *http.Request) (*ses
 	if result.NeedsRefresh {
 		refreshed, _ := session.Refresh(r.Context())
 		if refreshed != nil && refreshed.Authenticated && refreshed.Session != nil {
-			organization, orgErr := a.client.Organizations().Get(r.Context(), result.OrganizationID)
-			if orgErr != nil || organization == nil {
+			data, unsealErr := workos.Unseal[appSessionData](sealed, a.cfg.WorkOSCookiePassword)
+			if unsealErr != nil {
 				return nil, sessionRefreshUnavailable()
+			}
+			organizationName := data.OrganizationName
+			if organizationName == "" {
+				organizationName = result.OrganizationID
 			}
 			sealed, err = workos.Seal(appSessionData{
 				AccessToken:      refreshed.Session.AccessToken,
 				RefreshToken:     refreshed.Session.RefreshToken,
 				User:             refreshed.Session.User,
 				Impersonator:     refreshed.Session.Impersonator,
-				OrganizationName: organization.Name,
+				OrganizationName: organizationName,
 			}, a.cfg.WorkOSCookiePassword)
 			if err != nil {
 				return nil, sessionRefreshUnavailable()
