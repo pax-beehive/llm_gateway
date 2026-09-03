@@ -80,10 +80,25 @@ type appSessionData struct {
 }
 
 type authService struct {
-	cfg       Config
-	client    *workos.Client
-	dev       *sessionView
-	publicURL *url.URL
+	cfg        Config
+	client     *workos.Client
+	pkceClient *workos.Client
+	dev        *sessionView
+	publicURL  *url.URL
+}
+
+type stripEmptyBearerTransport struct {
+	base http.RoundTripper
+}
+
+func (t stripEmptyBearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("Authorization") == "Bearer " {
+		clone := req.Clone(req.Context())
+		clone.Header = req.Header.Clone()
+		clone.Header.Del("Authorization")
+		req = clone
+	}
+	return t.base.RoundTrip(req)
 }
 
 func devSessionView(permissions []string) sessionView {
@@ -146,14 +161,28 @@ func newAuthService(cfg Config) (*authService, error) {
 		workos.WithHTTPClient(&http.Client{Timeout: 10 * time.Second}),
 		workos.WithMaxRetries(2),
 	}
+	pkceOpts := []workos.ClientOption{
+		workos.WithClientID(cfg.WorkOSClientID),
+		workos.WithHTTPClient(&http.Client{
+			Timeout:   10 * time.Second,
+			Transport: stripEmptyBearerTransport{base: http.DefaultTransport},
+		}),
+		workos.WithMaxRetries(2),
+	}
 	if cfg.WorkOSBaseURL != "" {
 		baseURL, parseErr := url.Parse(cfg.WorkOSBaseURL)
 		if parseErr != nil || baseURL.Host == "" || (baseURL.Scheme != "https" && !isLoopbackHost(baseURL.Hostname())) {
 			return nil, fmt.Errorf("BFF_WORKOS_BASE_URL must use HTTPS outside tests")
 		}
 		opts = append(opts, workos.WithBaseURL(cfg.WorkOSBaseURL))
+		pkceOpts = append(pkceOpts, workos.WithBaseURL(cfg.WorkOSBaseURL))
 	}
 	a.client = workos.NewClient(cfg.WorkOSAPIKey, opts...)
+	// WorkOS PKCE uses the verifier instead of a client secret. A dedicated
+	// client prevents the SDK from also populating client_secret and the
+	// Authorization header during the code exchange. The authenticated client
+	// remains responsible for session refresh and logout.
+	a.pkceClient = workos.NewClient("", pkceOpts...)
 	return a, nil
 }
 
@@ -187,7 +216,7 @@ func (a *authService) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	provider := "authkit"
 	organizationID := a.cfg.WorkOSOperatorOrganizationID
-	result, err := a.client.GetAuthKitPKCEAuthorizationURL(workos.AuthKitAuthorizationURLParams{
+	result, err := a.pkceClient.GetAuthKitPKCEAuthorizationURL(workos.AuthKitAuthorizationURLParams{
 		RedirectURI:    a.cfg.PublicURL + "/api/auth/callback",
 		Provider:       &provider,
 		OrganizationID: &organizationID,
@@ -246,7 +275,7 @@ func (a *authService) handleCallback(w http.ResponseWriter, r *http.Request) {
 		a.redirectAuthFailure(w, r, "authorization_code_missing")
 		return
 	}
-	result, err := a.client.AuthKitPKCECodeExchange(r.Context(), workos.AuthKitPKCECodeExchangeParams{
+	result, err := a.pkceClient.AuthKitPKCECodeExchange(r.Context(), workos.AuthKitPKCECodeExchangeParams{
 		Code: code, CodeVerifier: pending.CodeVerifier,
 	})
 	if err != nil {

@@ -227,6 +227,9 @@ func TestWorkOSPKCECallbackSessionAuthorizationAndLogout(t *testing.T) {
 			if body["grant_type"] != "authorization_code" || body["code"] != "code_123" || body["code_verifier"] == "" {
 				t.Errorf("authenticate body = %#v", body)
 			}
+			if _, ok := body["client_secret"]; ok || r.Header.Get("Authorization") != "" {
+				t.Error("PKCE exchange must not send the WorkOS API key")
+			}
 			writeTestJSON(w, map[string]any{
 				"user": map[string]any{
 					"id": "user_123", "email": "ada@example.com", "first_name": "Ada", "last_name": "Lovelace",
