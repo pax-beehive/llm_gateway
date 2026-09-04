@@ -491,7 +491,7 @@ func configureIdentityVerifier() (controlapi.IdentityVerifier, error) {
 			return nil, errors.New("WorkOS IAM requires CONTROL_IAM_JWKS_URL, CONTROL_IAM_ISSUER, CONTROL_IAM_AUDIENCE, and CONTROL_IAM_ALLOWED_ORGANIZATION_ID")
 		}
 		return controlapi.NewWorkOSVerifier(controlapi.WorkOSVerifierConfig{
-			JWKSURL: jwksURL, Issuer: issuer, Audience: clientID,
+			JWKSURL: jwksURL, Issuer: issuer, ClientID: clientID,
 			AllowedOrganizationID: organizationID, ClockSkew: 30 * time.Second,
 		})
 	}

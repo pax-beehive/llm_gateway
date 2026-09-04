@@ -26,14 +26,14 @@ func TestWorkOSVerifierMapsPermissionsAndPinsOrganization(t *testing.T) {
 	})}
 	now := time.Unix(1_800_000_000, 0)
 	verifier, err := controlapi.NewWorkOSVerifier(controlapi.WorkOSVerifierConfig{
-		JWKSURL: "https://api.workos.test/sso/jwks/client_1", Issuer: "https://api.workos.test/user_management/client_1",
-		Audience: "client_1", AllowedOrganizationID: "org_operator", HTTPClient: client, Now: func() time.Time { return now },
+		JWKSURL: "https://api.workos.test/sso/jwks/client_1", Issuer: "https://api.workos.test",
+		ClientID: "client_1", AllowedOrganizationID: "org_operator", HTTPClient: client, Now: func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	claims := map[string]any{
-		"iss": "https://api.workos.test/user_management/client_1", "aud": "client_1", "sub": "user_1",
+		"iss": "https://api.workos.test/", "client_id": "client_1", "sub": "user_1",
 		"org_id": "org_operator", "permissions": []string{"platform:providers:read", "platform:providers:read", "platform:routing:write"},
 		"exp": now.Add(time.Minute).Unix(),
 	}
@@ -47,7 +47,7 @@ func TestWorkOSVerifierMapsPermissionsAndPinsOrganization(t *testing.T) {
 
 	for name, mutate := range map[string]func(map[string]any){
 		"other organization": func(value map[string]any) { value["org_id"] = "org_other" },
-		"wrong audience":     func(value map[string]any) { value["aud"] = "client_other" },
+		"wrong client":       func(value map[string]any) { value["client_id"] = "client_other" },
 		"wrong issuer":       func(value map[string]any) { value["iss"] = "https://evil.test" },
 		"expired":            func(value map[string]any) { value["exp"] = now.Add(-time.Second).Unix() },
 	} {

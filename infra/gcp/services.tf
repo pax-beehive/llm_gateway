@@ -5,7 +5,7 @@ locals {
   bff_service_name      = "${local.prefix}-console"
 
   workos_jwks_url = "https://api.workos.com/sso/jwks/${var.workos_client_id}"
-  workos_issuer   = "https://api.workos.com/user_management/${var.workos_client_id}"
+  workos_issuer   = "https://api.workos.com"
 }
 
 resource "google_cloud_run_v2_service" "control_plane" {

@@ -19,7 +19,7 @@ import (
 type WorkOSVerifier struct {
 	keys         *JWKSVerifier
 	issuer       string
-	audience     string
+	clientID     string
 	organization string
 	now          func() time.Time
 	clockSkew    time.Duration
@@ -28,7 +28,7 @@ type WorkOSVerifier struct {
 type WorkOSVerifierConfig struct {
 	JWKSURL               string
 	Issuer                string
-	Audience              string
+	ClientID              string
 	AllowedOrganizationID string
 	HTTPClient            *http.Client
 	Now                   func() time.Time
@@ -43,14 +43,14 @@ func NewWorkOSVerifier(config WorkOSVerifierConfig) (*WorkOSVerifier, error) {
 		config.Now = time.Now
 	}
 	keys, err := NewJWKSVerifier(JWKSVerifierConfig{
-		URL: config.JWKSURL, Issuer: config.Issuer, Audience: config.Audience,
+		URL: config.JWKSURL, Issuer: config.Issuer, Audience: config.ClientID,
 		HTTPClient: config.HTTPClient, Now: config.Now, ClockSkew: config.ClockSkew,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &WorkOSVerifier{
-		keys: keys, issuer: config.Issuer, audience: config.Audience,
+		keys: keys, issuer: config.Issuer, clientID: config.ClientID,
 		organization: config.AllowedOrganizationID, now: config.Now, clockSkew: config.ClockSkew,
 	}, nil
 }
@@ -95,20 +95,20 @@ func (verifier *WorkOSVerifier) Verify(ctx context.Context, authorization string
 		return VerifiedIdentity{}, errors.New("identity assertion payload is invalid")
 	}
 	var claims struct {
-		Issuer       string    `json:"iss"`
-		Audience     audiences `json:"aud"`
-		Subject      string    `json:"sub"`
-		Organization string    `json:"org_id"`
-		Permissions  []string  `json:"permissions"`
-		ExpiresAt    int64     `json:"exp"`
-		NotBefore    int64     `json:"nbf"`
+		Issuer       string   `json:"iss"`
+		ClientID     string   `json:"client_id"`
+		Subject      string   `json:"sub"`
+		Organization string   `json:"org_id"`
+		Permissions  []string `json:"permissions"`
+		ExpiresAt    int64    `json:"exp"`
+		NotBefore    int64    `json:"nbf"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return VerifiedIdentity{}, errors.New("identity assertion claims are invalid")
 	}
 	now := verifier.now().UTC()
-	if claims.Issuer != verifier.issuer || !claims.Audience.Contains(verifier.audience) {
-		return VerifiedIdentity{}, errors.New("identity assertion issuer or audience is invalid")
+	if strings.TrimSuffix(claims.Issuer, "/") != strings.TrimSuffix(verifier.issuer, "/") || claims.ClientID != verifier.clientID {
+		return VerifiedIdentity{}, errors.New("identity assertion issuer or client is invalid")
 	}
 	if claims.Subject == "" || claims.Organization != verifier.organization || claims.ExpiresAt == 0 {
 		return VerifiedIdentity{}, errors.New("identity assertion required claims are missing or invalid")
