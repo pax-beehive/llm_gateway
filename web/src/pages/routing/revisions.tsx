@@ -158,10 +158,10 @@ export function RevisionsSection({
                   <Td>{rev.created_by}</Td>
                   <Td mono>{rev.document.routes.length}</Td>
                   <Td>
-                    <span style={{ fontSize: 11.5, color: rev.validation_report.valid ? "var(--green)" : "var(--red)" }}>
+                    <span style={{ fontSize: 12, color: rev.validation_report.valid ? "var(--green)" : "var(--red)" }}>
                       {rev.validation_report.valid ? "Valid" : "Failed"}
                     </span>
-                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)", marginLeft: 6 }}>
+                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)", marginLeft: 6 }}>
                       {truncateId(rev.validation_hash, 8, 4)}
                     </span>
                   </Td>
@@ -272,7 +272,7 @@ function RevisionDrawer({ revision, onClose }: { revision: Revision | null; onCl
           />
           <div>
             <div style={{ fontSize: 11, fontWeight: 600, color: "var(--ink3)", marginBottom: 6 }}>ROUTES</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11.5 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
               {revision.document.routes.map((r) => (
                 <div key={r.route_id} style={{ display: "flex", gap: 8, fontFamily: "var(--font-mono)" }}>
                   <span style={{ color: "var(--purple)" }}>{r.public_model}</span>

@@ -30,7 +30,7 @@ export const inputStyle: CSSProperties = {
   fontSize: 12,
 };
 
-export const monoInputStyle: CSSProperties = { ...inputStyle, fontFamily: "var(--font-mono)", fontSize: 11.5 };
+export const monoInputStyle: CSSProperties = { ...inputStyle, fontFamily: "var(--font-mono)", fontSize: 12 };
 
 export const labelStyle: CSSProperties = {
   display: "block",

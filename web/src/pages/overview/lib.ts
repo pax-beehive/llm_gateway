@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet, ApiError, authFetch } from "../../api/client";
 import type { BadgeTone } from "../../components/ui";
+import { formatDuration, truncateId } from "../../lib/format";
 
 /* ------------------------------------------------------------------ */
 /* useResource / useAutoRefresh                                        */
@@ -439,25 +440,26 @@ export function deriveWarnings(
   }
 
   for (const gateway of gateways?.data ?? []) {
+    const ref = `Gateway ${truncateId(gateway.gateway_id, 20, 6)} (${truncateId(gateway.region, 20, 6)})`;
     if (gateway.heartbeat_status === "stale") {
       warnings.push({
         tone: "amber",
         label: "stale",
-        text: `Gateway ${gateway.gateway_id} (${gateway.region}) heartbeat is stale — ${Math.round(gateway.heartbeat_lag_seconds)}s behind`,
+        text: `${ref} heartbeat is stale — ${formatDuration(gateway.heartbeat_lag_seconds)} behind`,
       });
     }
     if (gateway.routing_revision_lag > 0) {
       warnings.push({
         tone: "amber",
         label: "propagating",
-        text: `Gateway ${gateway.gateway_id} (${gateway.region}) is ${gateway.routing_revision_lag} routing catalog revision(s) behind ${formatRevision(gateway.desired_routing_revision)}`,
+        text: `${ref} is ${gateway.routing_revision_lag} routing catalog revision(s) behind ${formatRevision(gateway.desired_routing_revision)}`,
       });
     }
     if ((gateway.backlogs?.outbox_pending_count ?? 0) > 0) {
       warnings.push({
         tone: "amber",
         label: "pending",
-        text: `Gateway ${gateway.gateway_id} (${gateway.region}) has ${gateway.backlogs.outbox_pending_count} unpublished usage outbox event(s)`,
+        text: `${ref} has ${gateway.backlogs.outbox_pending_count} unpublished usage outbox event(s)`,
       });
     }
   }

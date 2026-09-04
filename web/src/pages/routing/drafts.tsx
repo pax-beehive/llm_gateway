@@ -127,7 +127,7 @@ export function DraftsSection({
           </Button>
         }
       >
-        <div style={{ fontSize: 11.5, color: "var(--ink3)", marginBottom: 10 }}>
+        <div style={{ fontSize: 12, color: "var(--ink3)", marginBottom: 10 }}>
           Drafts are loaded from the control plane; enter a draft id to open an older item directly.
         </div>
         <div style={{ display: "flex", gap: 8, marginBottom: drafts.length > 0 ? 12 : 0 }}>
@@ -460,7 +460,7 @@ function DraftEditor({
         </div>
       }
     >
-      <div style={{ fontSize: 11.5, color: "var(--ink2)", marginBottom: 12 }}>
+      <div style={{ fontSize: 12, color: "var(--ink2)", marginBottom: 12 }}>
         Base revision <b style={{ fontFamily: "var(--font-mono)" }}>{formatRevision(draft.base_revision)}</b>
         {" · "}draft revision <b style={{ fontFamily: "var(--font-mono)" }}>{draft.revision}</b> (sent as expected_revision)
         {" · "}{draft.updated_by} · updated {timeAgo(draft.updated_at)}
@@ -593,7 +593,7 @@ function DraftEditor({
                   background: "var(--bg)",
                   color: "var(--ink)",
                   fontFamily: "var(--font-mono)",
-                  fontSize: 11.5,
+                  fontSize: 12,
                   lineHeight: 1.6,
                 }}
               />
@@ -623,14 +623,14 @@ function DraftEditor({
             {draft.status === "validated" ? (
               <ValidationReportView report={report} hash={draft.validation_hash} />
             ) : (
-              <div style={{ fontSize: 11.5, color: "var(--ink3)" }}>Not validated yet — run Validate.</div>
+              <div style={{ fontSize: 12, color: "var(--ink3)" }}>Not validated yet — run Validate.</div>
             )}
           </Card>
 
           {probeOps && <ProbePanel initialOps={probeOps} />}
 
           <Card title="Publication lifecycle">
-            <div style={{ display: "flex", flexDirection: "column", gap: 7, fontSize: 11.5 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 7, fontSize: 12 }}>
               {(
                 [
                   ["published", "Publish request durably enqueued — proves nothing about application"],
@@ -781,25 +781,25 @@ function ProbePanel({ initialOps }: { initialOps: Operation[] }) {
       }
     >
       {list.length === 0 ? (
-        <div style={{ fontSize: 11.5, color: "var(--ink3)" }}>No connections referenced by this draft.</div>
+        <div style={{ fontSize: 12, color: "var(--ink3)" }}>No connections referenced by this draft.</div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {list.map((op) => (
             <div key={op.id} style={{ border: "1px solid var(--line)", borderRadius: "var(--radius)", padding: "8px 10px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5 }}>{op.connection_id}</span>
-                <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>{truncateId(op.id)}</span>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{op.connection_id}</span>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>{truncateId(op.id)}</span>
                 <span style={{ flex: 1 }} />
                 <Badge tone={operationTone(op.status)}>{op.status}</Badge>
               </div>
               {op.status === "failed" && (
-                <div style={{ marginTop: 4, fontSize: 11.5, color: "var(--red)" }}>
+                <div style={{ marginTop: 4, fontSize: 12, color: "var(--red)" }}>
                   {op.error_code ? `${op.error_code}: ` : ""}
                   {op.error_message ?? "probe failed"}
                 </div>
               )}
               {op.status === "succeeded" && op.result && (
-                <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)", wordBreak: "break-all" }}>
+                <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)", wordBreak: "break-all" }}>
                   {JSON.stringify(op.result)}
                 </div>
               )}

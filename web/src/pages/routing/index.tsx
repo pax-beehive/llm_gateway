@@ -47,7 +47,7 @@ export default function RoutingPage() {
       <div style={{ display: "flex", alignItems: "flex-start", gap: 16, marginBottom: 14, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 260 }}>
           <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Routing Catalog</h1>
-          <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 12.5 }}>
+          <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 13 }}>
             Routing is versioned and published — never edited in place. A publication is durable on acceptance and
             confirmed per region by receipt.
           </div>
@@ -70,7 +70,7 @@ export default function RoutingPage() {
               background: "var(--panel)",
               color: "var(--ink)",
               fontFamily: "var(--font-mono)",
-              fontSize: 11.5,
+              fontSize: 12,
               width: 200,
             }}
           />
@@ -116,13 +116,13 @@ export default function RoutingPage() {
                   <Badge tone="blue">restored from {formatRevision(head.source_revision)}</Badge>
                 )}
               </div>
-              <div style={{ fontSize: 11.5, color: "var(--ink2)", marginBottom: 10 }}>
+              <div style={{ fontSize: 12, color: "var(--ink2)", marginBottom: 10 }}>
                 {formatDateTime(head.created_at)} · {head.created_by} · {head.document.routes.length} routes · immutable
                 once published
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 11, fontWeight: 600, color: "var(--ink3)" }}>VALIDATION HASH</span>
-                <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--ink2)" }}>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink2)" }}>
                   {truncateId(head.validation_hash, 12, 8)}
                 </span>
                 <CopyButton text={head.validation_hash} label="Copy hash" />
@@ -133,7 +133,7 @@ export default function RoutingPage() {
                   padding: "8px 10px",
                   borderRadius: "var(--radius)",
                   background: "var(--chip)",
-                  fontSize: 11.5,
+                  fontSize: 12,
                   color: "var(--ink2)",
                 }}
               >

@@ -111,8 +111,8 @@ export function Layout({ children }: { children: ReactNode }) {
           </div>
           {!collapsed && (
             <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 12, whiteSpace: "nowrap" }}>Universal LLM Gateway</div>
-              <div style={{ fontSize: 10, color: "var(--ink3)", whiteSpace: "nowrap" }}>Operations console</div>
+              <div style={{ fontWeight: 600, fontSize: 13, whiteSpace: "nowrap" }}>Universal LLM Gateway</div>
+              <div style={{ fontSize: 11, color: "var(--ink3)", whiteSpace: "nowrap" }}>Operations console</div>
             </div>
           )}
         </div>
@@ -134,7 +134,7 @@ export function Layout({ children }: { children: ReactNode }) {
                   borderRadius: "var(--radius)",
                   background: isActive ? "var(--blue-bg)" : "transparent",
                   color: isActive ? "var(--blue)" : "var(--ink2)",
-                  fontSize: 12,
+                  fontSize: 13,
                   fontWeight: isActive ? 600 : 500,
                   whiteSpace: "nowrap",
                 }}
@@ -155,7 +155,7 @@ export function Layout({ children }: { children: ReactNode }) {
             borderRadius: "var(--radius)",
             background: "transparent",
             color: "var(--ink3)",
-            fontSize: 11,
+            fontSize: 12,
           }}
         >
           {collapsed ? "»" : "«"}
@@ -175,7 +175,7 @@ export function Layout({ children }: { children: ReactNode }) {
             borderBottom: "1px solid var(--line)",
           }}
         >
-          <nav style={{ fontSize: 12, color: "var(--ink3)", whiteSpace: "nowrap" }}>
+          <nav style={{ fontSize: 13, color: "var(--ink3)", whiteSpace: "nowrap" }}>
             Console <span style={{ margin: "0 4px" }}>/</span>{" "}
             <span style={{ color: "var(--ink)", fontWeight: 600 }}>{active.label}</span>
           </nav>
@@ -189,7 +189,7 @@ export function Layout({ children }: { children: ReactNode }) {
               border: "1px solid var(--line)",
               borderRadius: "var(--radius)",
               color: "var(--ink3)",
-              fontSize: 12,
+              fontSize: 13,
               background: "var(--bg)",
               minWidth: 220,
             }}
@@ -199,7 +199,7 @@ export function Layout({ children }: { children: ReactNode }) {
             <kbd
               style={{
                 fontFamily: "var(--font-mono)",
-                fontSize: 10,
+                fontSize: 11,
                 background: "var(--chip)",
                 borderRadius: 4,
                 padding: "1px 5px",

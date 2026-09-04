@@ -796,7 +796,7 @@ export function GatewayKeysTab({ tenantId }: { tenantId: string }) {
                   >
                     <Td>
                       <div style={{ fontWeight: 600 }}>{key.name}</div>
-                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
+                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
                         {truncateId(key.id)}
                       </div>
                     </Td>

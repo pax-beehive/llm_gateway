@@ -85,7 +85,7 @@ export function PublicationTracker({
             </span>
             <CopyButton text={publication.id} label="Copy id" />
             <Badge tone={publicationTone(publication.status)}>{publication.status.replace(/_/g, " ")}</Badge>
-            <span style={{ fontSize: 11.5, color: "var(--ink2)" }}>
+            <span style={{ fontSize: 12, color: "var(--ink2)" }}>
               publishes <b style={{ fontFamily: "var(--font-mono)" }}>{formatRevision(publication.catalog_revision)}</b>
             </span>
           </div>
@@ -102,7 +102,7 @@ export function PublicationTracker({
             ]}
           />
           {polling && (
-            <div style={{ fontSize: 11.5, color: "var(--ink3)" }}>
+            <div style={{ fontSize: 12, color: "var(--ink3)" }}>
               Acceptance of the publish request does not mean every gateway applied the revision — watching per-region
               receipts until the rollout reaches a terminal state.
             </div>

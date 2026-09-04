@@ -14,7 +14,7 @@ const inputStyle: CSSProperties = {
   fontSize: 12,
 };
 
-const monoInputStyle: CSSProperties = { ...inputStyle, fontFamily: "var(--font-mono)", fontSize: 11.5 };
+const monoInputStyle: CSSProperties = { ...inputStyle, fontFamily: "var(--font-mono)", fontSize: 12 };
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (

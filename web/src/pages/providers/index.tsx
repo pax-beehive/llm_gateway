@@ -287,7 +287,7 @@ function ConnectionList() {
                   >
                     <Td>
                       <div style={{ fontWeight: 600 }}>{conn.display_name}</div>
-                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
+                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
                         {conn.id}
                       </div>
                     </Td>
@@ -318,7 +318,7 @@ function ConnectionList() {
           </>
         )}
       </Card>
-      <div style={{ marginTop: 10, fontSize: 11.5, color: "var(--ink2)", display: "flex", gap: 16, flexWrap: "wrap" }}>
+      <div style={{ marginTop: 10, fontSize: 12, color: "var(--ink2)", display: "flex", gap: 16, flexWrap: "wrap" }}>
         <span>· Enabled does not imply healthy</span>
         <span>· Disabled is not a provider failure</span>
         <span>· Credentials are write-only — only the version number is visible</span>

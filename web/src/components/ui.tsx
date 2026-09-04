@@ -23,7 +23,7 @@ export function Button({ variant = "ghost", style, ...rest }: ButtonProps) {
       style={{
         padding: "6px 12px",
         borderRadius: "var(--radius)",
-        fontSize: 12,
+        fontSize: 13,
         fontWeight: 600,
         opacity: rest.disabled ? 0.5 : 1,
         cursor: rest.disabled ? "not-allowed" : "pointer",
@@ -57,7 +57,7 @@ export function Badge({ tone = "neutral", children }: { tone?: BadgeTone; childr
         alignItems: "center",
         padding: "2px 8px",
         borderRadius: "var(--radius-pill)",
-        fontSize: 11,
+        fontSize: 12,
         fontWeight: 600,
         whiteSpace: "nowrap",
         ...badgeTones[tone],
@@ -96,7 +96,7 @@ export function Card({
     >
       {(title || actions) && (
         <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <h2 style={{ fontSize: 13, fontWeight: 600 }}>{title}</h2>
+          <h2 style={{ fontSize: 14, fontWeight: 600 }}>{title}</h2>
           {actions}
         </header>
       )}
@@ -108,11 +108,11 @@ export function Card({
 export function StatCard({ label, value, sub }: { label: string; value: ReactNode; sub?: ReactNode }) {
   return (
     <Card>
-      <div style={{ fontSize: 11, color: "var(--ink3)", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".04em" }}>
+      <div style={{ fontSize: 12, color: "var(--ink3)", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".04em" }}>
         {label}
       </div>
       <div style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{value}</div>
-      {sub && <div style={{ fontSize: 11, color: "var(--ink2)", marginTop: 2 }}>{sub}</div>}
+      {sub && <div style={{ fontSize: 12, color: "var(--ink2)", marginTop: 2 }}>{sub}</div>}
     </Card>
   );
 }
@@ -144,7 +144,7 @@ export function Tabs({
               border: "none",
               background: "transparent",
               padding: "8px 12px",
-              fontSize: 12,
+              fontSize: 13,
               fontWeight: isActive ? 600 : 500,
               color: isActive ? "var(--blue)" : "var(--ink2)",
               borderBottom: isActive ? "2px solid var(--blue)" : "2px solid transparent",
@@ -168,7 +168,7 @@ export function Table({ children, ...rest }: TableHTMLAttributes<HTMLTableElemen
     <div style={{ overflowX: "auto" }}>
       <table
         {...rest}
-        style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, ...rest.style }}
+        style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, ...rest.style }}
       >
         {children}
       </table>
@@ -181,8 +181,8 @@ export function Th({ children }: { children?: ReactNode }) {
     <th
       style={{
         textAlign: "left",
-        padding: "8px 10px",
-        fontSize: 11,
+        padding: "9px 10px",
+        fontSize: 12,
         fontWeight: 600,
         color: "var(--ink3)",
         borderBottom: "1px solid var(--line)",
@@ -198,10 +198,10 @@ export function Td({ children, mono }: { children?: ReactNode; mono?: boolean })
   return (
     <td
       style={{
-        padding: "8px 10px",
+        padding: "9px 10px",
         borderBottom: "1px solid var(--line)",
         fontFamily: mono ? "var(--font-mono)" : undefined,
-        fontSize: mono ? 11 : undefined,
+        fontSize: mono ? 12 : undefined,
       }}
     >
       {children}
@@ -218,8 +218,8 @@ export function KeyValueList({ items }: { items: Array<{ key: string; value: Rea
     <dl style={{ margin: 0, display: "grid", gridTemplateColumns: "minmax(140px, auto) 1fr", rowGap: 8, columnGap: 16 }}>
       {items.map(({ key, value, mono }) => (
         <div key={key} style={{ display: "contents" }}>
-          <dt style={{ fontSize: 12, color: "var(--ink3)" }}>{key}</dt>
-          <dd style={{ margin: 0, fontSize: 12, fontFamily: mono ? "var(--font-mono)" : undefined }}>{value}</dd>
+          <dt style={{ fontSize: 13, color: "var(--ink3)" }}>{key}</dt>
+          <dd style={{ margin: 0, fontSize: 13, fontFamily: mono ? "var(--font-mono)" : undefined }}>{value}</dd>
         </div>
       ))}
     </dl>
@@ -255,14 +255,14 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
           padding: 12,
           background: "var(--chip)",
           borderRadius: "var(--radius)",
-          fontSize: 11,
+          fontSize: 12,
           lineHeight: 1.5,
           overflowX: "auto",
           fontFamily: "var(--font-mono)",
         }}
       >
         {lang && (
-          <span style={{ float: "right", color: "var(--ink3)", fontSize: 10, textTransform: "uppercase" }}>{lang}</span>
+          <span style={{ float: "right", color: "var(--ink3)", fontSize: 11, textTransform: "uppercase" }}>{lang}</span>
         )}
         <code>{code}</code>
       </pre>
@@ -280,8 +280,8 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
 export function EmptyState({ title, hint, action }: { title: string; hint?: string; action?: ReactNode }) {
   return (
     <div style={{ textAlign: "center", padding: "48px 16px", color: "var(--ink2)" }}>
-      <div style={{ fontSize: 13, fontWeight: 600, color: "var(--ink)" }}>{title}</div>
-      {hint && <div style={{ fontSize: 12, marginTop: 4 }}>{hint}</div>}
+      <div style={{ fontSize: 14, fontWeight: 600, color: "var(--ink)" }}>{title}</div>
+      {hint && <div style={{ fontSize: 13, marginTop: 4 }}>{hint}</div>}
       {action && <div style={{ marginTop: 12 }}>{action}</div>}
     </div>
   );

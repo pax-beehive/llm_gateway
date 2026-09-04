@@ -60,7 +60,7 @@ export function Drawer({
             borderBottom: "1px solid var(--line)",
           }}
         >
-          <h2 style={{ fontSize: 13, fontWeight: 600 }}>{title}</h2>
+          <h2 style={{ fontSize: 14, fontWeight: 600 }}>{title}</h2>
           <Button onClick={onClose} aria-label="Close drawer">
             ✕
           </Button>
@@ -125,7 +125,7 @@ export function Modal({
             borderBottom: "1px solid var(--line)",
           }}
         >
-          <h2 style={{ fontSize: 13, fontWeight: 600 }}>{title}</h2>
+          <h2 style={{ fontSize: 14, fontWeight: 600 }}>{title}</h2>
           <Button onClick={onClose} aria-label="Close dialog">
             ✕
           </Button>
@@ -191,8 +191,8 @@ export function ConfirmDialog({
         </>
       }
     >
-      {description && <p style={{ fontSize: 12, color: "var(--ink2)", marginBottom: 12 }}>{description}</p>}
-      <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--ink3)", marginBottom: 4 }}>
+      {description && <p style={{ fontSize: 13, color: "var(--ink2)", marginBottom: 12 }}>{description}</p>}
+      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "var(--ink3)", marginBottom: 4 }}>
         Reason (required)
       </label>
       <textarea
@@ -207,7 +207,7 @@ export function ConfirmDialog({
           borderRadius: "var(--radius)",
           border: "1px solid var(--line)",
           background: "var(--bg)",
-          fontSize: 12,
+          fontSize: 13,
         }}
       />
     </Modal>
@@ -251,7 +251,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             style={{
               padding: "10px 14px",
               borderRadius: "var(--radius)",
-              fontSize: 12,
+              fontSize: 13,
               fontWeight: 600,
               color: toneColor[toast.tone],
               background: toneBg[toast.tone],
@@ -290,7 +290,7 @@ export function ErrorBanner({ error, retry }: { error: ApiError; retry?: () => v
           borderRadius: "var(--radius)",
           background: "var(--amber-bg)",
           color: "var(--amber)",
-          fontSize: 12,
+          fontSize: 13,
           fontWeight: 600,
         }}
       >
@@ -309,7 +309,7 @@ export function ErrorBanner({ error, retry }: { error: ApiError; retry?: () => v
         borderRadius: "var(--radius)",
         background: "var(--red-bg)",
         color: "var(--red)",
-        fontSize: 12,
+        fontSize: 13,
       }}
     >
       <span style={{ fontWeight: 700 }}>{error.code}</span>

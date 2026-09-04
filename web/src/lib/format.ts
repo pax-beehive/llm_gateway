@@ -45,6 +45,17 @@ export function formatDateTime(iso: string): string {
   });
 }
 
+/** Seconds → "41s" / "3m" / "2h" / "5d". */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const minutes = Math.floor(s / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
 /** "tn_9f3kQm2W8Lp4" → "tn_9f3k…8Lp4". */
 export function truncateId(id: string, head = 8, tail = 4): string {
   if (id.length <= head + tail + 1) return id;

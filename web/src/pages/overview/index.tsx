@@ -10,7 +10,7 @@ import { PERMISSIONS } from "../../auth/permissions";
 import { BarChart, LineChart } from "../../components/charts";
 import { ErrorBanner } from "../../components/feedback";
 import { Badge, Button, Card, EmptyState, Spinner, StatCard, Table, Td, Th } from "../../components/ui";
-import { formatMicrosUSD, formatNumber, timeAgo } from "../../lib/format";
+import { formatDuration, formatMicrosUSD, formatNumber, timeAgo } from "../../lib/format";
 import { navigate } from "../../router";
 import {
   aggregateUsageSeries24h,
@@ -370,8 +370,8 @@ function GatewayStatusCard({ res, allowed }: { res: Resource<GatewayPage>; allow
                       <Td mono>{g.region}</Td>
                       <Td>
                         <Badge tone={statusTone(g.heartbeat_status)}>{g.heartbeat_status}</Badge>{" "}
-                        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
-                          {Math.round(g.heartbeat_lag_seconds)}s
+                        <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
+                          {formatDuration(g.heartbeat_lag_seconds)}
                         </span>
                       </Td>
                       <Td>
@@ -416,20 +416,20 @@ function PublicationCard({ res, allowed }: { res: Resource<PublicationPage>; all
                 </span>
                 <Badge tone={statusTone(latest.status)}>{latest.status.replace(/_/g, " ")}</Badge>
               </div>
-              <div style={{ fontSize: 11.5, color: "var(--ink2)", margin: "6px 0 10px" }}>
+              <div style={{ fontSize: 12, color: "var(--ink2)", margin: "6px 0 10px" }}>
                 Publication <span style={{ fontFamily: "var(--font-mono)" }}>{latest.id}</span> · created {timeAgo(latest.created_at)} · regions:{" "}
                 <span style={{ fontFamily: "var(--font-mono)" }}>{latest.required_regions.join(", ") || "—"}</span>
               </div>
               {(latest.receipts ?? []).length === 0 ? (
-                <div style={{ fontSize: 11.5, color: "var(--ink3)" }}>No rollout receipts yet</div>
+                <div style={{ fontSize: 12, color: "var(--ink3)" }}>No rollout receipts yet</div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                   {(latest.receipts ?? []).map((r, i) => (
-                    <div key={`${r.gateway_id}-${i}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5 }}>
+                    <div key={`${r.gateway_id}-${i}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                       <span style={{ fontFamily: "var(--font-mono)", width: 100, color: "var(--ink2)" }}>{r.region}</span>
                       <Badge tone={statusTone(r.status)}>{r.status}</Badge>
                       <span style={{ flex: 1 }} />
-                      <span style={{ fontFamily: "var(--font-mono)", color: "var(--ink3)", fontSize: 10.5 }}>{timeAgo(r.applied_at)}</span>
+                      <span style={{ fontFamily: "var(--font-mono)", color: "var(--ink3)", fontSize: 11 }}>{timeAgo(r.applied_at)}</span>
                     </div>
                   ))}
                 </div>
@@ -455,7 +455,7 @@ function PublicationCard({ res, allowed }: { res: Resource<PublicationPage>; all
 function MeteringNode({ node }: { node: MeteringSummary }) {
   const rows: Array<[string, ReactNode, boolean?]> = [
     ["Projection cutoff", node.projection_cutoff ? timeAgo(node.projection_cutoff) : "—"],
-    ["Heartbeat", `${node.heartbeat_status} · ${Math.round(node.heartbeat_lag_seconds)}s`],
+    ["Heartbeat", `${node.heartbeat_status} · ${formatDuration(node.heartbeat_lag_seconds)}`],
     ["Pending events", formatNumber(node.pending_events)],
     ["Poison events", formatNumber(node.poison_events), node.poison_events > 0],
     ["Queued exports", formatNumber(node.queued_exports)],
@@ -494,7 +494,7 @@ function MeteringProjectionCard({ res, allowed }: { res: Resource<MeteringPage>;
                   <MeteringNode key={n.metering_id} node={n} />
                 ))}
               </div>
-              <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 8, background: "var(--chip)", fontSize: 11.5, color: "var(--ink2)" }}>
+              <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 8, background: "var(--chip)", fontSize: 12, color: "var(--ink2)" }}>
                 Spend figures on this page are projections and may trail the immutable Usage Ledger.
               </div>
             </>
@@ -533,7 +533,7 @@ function ModelsCard({ res, allowed }: { res: Resource<LLMModelList>; allowed: bo
                     key={m.id}
                     style={{
                       fontFamily: "var(--font-mono)",
-                      fontSize: 10.5,
+                      fontSize: 11,
                       padding: "1px 7px",
                       borderRadius: "var(--radius-pill)",
                       background: "var(--purple-bg)",
@@ -586,12 +586,12 @@ export default function OverviewPage() {
       <div style={{ display: "flex", alignItems: "flex-start", gap: 16, marginBottom: 16 }}>
         <div style={{ flex: 1 }}>
           <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Overview</h1>
-          <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 12.5 }}>
+          <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 13 }}>
             Operational readiness across gateways, providers, and metering. Liveness and readiness are separate signals.
           </div>
         </div>
         {observedAt && (
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--ink3)", paddingTop: 4 }}>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink3)", paddingTop: 4 }}>
             observed {observedAt.toISOString().slice(11, 19)} UTC
           </span>
         )}

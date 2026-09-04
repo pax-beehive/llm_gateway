@@ -189,6 +189,7 @@ truncateId("tn_9f3kQm2W8Lp4") // "tn_9f3k…8Lp4"
 
 - Inline `style={{}}` with token vars is the house style (matches the mockup); no CSS
   modules, no Tailwind. Reuse the components above instead of hand-rolling.
-- Compact density: base font 13px, labels 11px, headings 13–18px; radii 6–10px.
+- Compact density: base font 14px, labels 11–12px, headings 13–18px; radii 6–10px.
+  Use integer px font sizes only — fractional px blurs on non-retina displays.
 - Keep components small and typed; add new shared ones to `ui.tsx`, `feedback.tsx`,
   or `charts.tsx` by concern.

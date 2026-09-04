@@ -120,14 +120,14 @@ function EventsLog({ events }: { events: EventLogEntry[] }) {
             background: "var(--panel)",
           }}
         >
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
             {e.seq ?? "—"}
           </span>
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 600, overflowWrap: "anywhere" }}>
             {e.event}
           </span>
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink3)" }}>{e.at}</span>
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink2)", overflowWrap: "anywhere" }}>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink2)", overflowWrap: "anywhere" }}>
             {e.payload}
           </span>
         </div>
@@ -224,7 +224,7 @@ export function InspectorPanel({
               </option>
             ))}
           </select>
-          <div style={{ fontSize: 10.5, color: "var(--ink3)", marginTop: 3 }}>
+          <div style={{ fontSize: 11, color: "var(--ink3)", marginTop: 3 }}>
             Chat Completions, Embeddings, Moderations, Rerank — {NOT_EXPOSED.toLowerCase()}.
           </div>
         </div>
@@ -236,7 +236,7 @@ export function InspectorPanel({
             value={model}
             onChange={(e) => onModelChange(e.target.value)}
             aria-label="Model"
-            style={{ ...selectStyle, fontFamily: "var(--font-mono)", fontSize: 11.5 }}
+            style={{ ...selectStyle, fontFamily: "var(--font-mono)", fontSize: 12 }}
           >
             {modelMissing && (
               <option value={model} disabled>
@@ -341,7 +341,7 @@ export function InspectorPanel({
         </div>
 
         {metaParts.length > 0 && (
-          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
             {metaParts.join(" · ")}
           </div>
         )}

@@ -72,7 +72,7 @@ export function ChatPanel({
       >
         <div style={{ flex: 1, minWidth: 200 }}>
           <h1 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Playground</h1>
-          <div style={{ color: "var(--ink3)", fontSize: 11.5 }}>
+          <div style={{ color: "var(--ink3)", fontSize: 12 }}>
             Chats run through the gateway as a tenant workload — metered and quota-checked.
           </div>
         </div>
@@ -105,7 +105,7 @@ export function ChatPanel({
         style={{ flex: 1, overflowY: "auto", minHeight: 0, padding: "16px 2px", display: "flex", flexDirection: "column", gap: 14 }}
       >
         {messages.length === 0 ? (
-          <div style={{ margin: "auto", textAlign: "center", color: "var(--ink3)", fontSize: 12.5, padding: "30px 0" }}>
+          <div style={{ margin: "auto", textAlign: "center", color: "var(--ink3)", fontSize: 13, padding: "30px 0" }}>
             <div
               style={{
                 width: 38,
@@ -198,7 +198,7 @@ export function ChatPanel({
                   )}
                 </div>
                 {m.meta && (
-                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)", marginTop: 5 }}>
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)", marginTop: 5 }}>
                     {m.meta}
                   </div>
                 )}
@@ -287,7 +287,7 @@ export function ChatPanel({
             </button>
           )}
         </div>
-        <div style={{ display: "flex", gap: 12, marginTop: 6, fontSize: 10.5, color: "var(--ink3)", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 12, marginTop: 6, fontSize: 11, color: "var(--ink3)", flexWrap: "wrap" }}>
           <span>Enter to send · Shift+Enter for a new line</span>
           <span>store:false enforced · single-turn · history is client-side only</span>
         </div>

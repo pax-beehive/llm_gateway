@@ -276,7 +276,7 @@ function TenantList() {
                   >
                     <Td>
                       <div style={{ fontWeight: 600 }}>{tenant.display_name}</div>
-                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
+                      <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
                         {tenant.id}
                       </div>
                     </Td>

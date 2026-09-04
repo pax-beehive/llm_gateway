@@ -46,7 +46,7 @@ const capLabels: Record<CapabilitySupport, string> = {
 };
 
 function CapBadge({ support, prefix }: { support: CapabilitySupport | undefined; prefix?: string }) {
-  const base: CSSProperties = { fontSize: 10.5, fontWeight: 500, padding: "1px 7px", borderRadius: "var(--radius-pill)", whiteSpace: "nowrap" };
+  const base: CSSProperties = { fontSize: 11, fontWeight: 500, padding: "1px 7px", borderRadius: "var(--radius-pill)", whiteSpace: "nowrap" };
   if (!support) {
     return <span style={{ ...base, border: "1px dashed var(--line)", color: "var(--ink3)" }}>{prefix ? `${prefix} ` : ""}Not declared</span>;
   }
@@ -110,7 +110,7 @@ function FilterBar({
             style={{
               border: "none",
               padding: "5px 12px",
-              fontSize: 11.5,
+              fontSize: 12,
               cursor: "pointer",
               background: view === v ? "var(--blue)" : "transparent",
               color: view === v ? "#fff" : "var(--ink2)",
@@ -175,7 +175,7 @@ function ModelsTable({
                 <Td mono>
                   <span style={{ fontWeight: 600, color: "var(--purple)" }}>{row.publicModel}</span>
                   {row.routes.length > 1 && (
-                    <span style={{ color: "var(--ink3)", fontSize: 10.5 }}> · {row.routes.length} routes</span>
+                    <span style={{ color: "var(--ink3)", fontSize: 11 }}> · {row.routes.length} routes</span>
                   )}
                 </Td>
                 <Td>{providerOf(route, connById)}</Td>
@@ -254,7 +254,7 @@ function ModelsCards({
                 <Badge tone="neutral">no route visible</Badge>
               )}
             </div>
-            <div style={{ fontSize: 11.5, color: "var(--ink2)", fontFamily: "var(--font-mono)" }}>
+            <div style={{ fontSize: 12, color: "var(--ink2)", fontFamily: "var(--font-mono)" }}>
               {route ? `${providerOf(route, connById)} · ${route.provider_model} · ${route.execution_region}` : "No route visible in the current catalog"}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
@@ -423,7 +423,7 @@ function ModelDrawer({
             </div>
           )}
           {route && <RouteDetail route={route} connById={connById} revision={revision} />}
-          <div style={{ padding: "9px 11px", borderRadius: 8, background: "var(--chip)", fontSize: 11.5, color: "var(--ink2)" }}>
+          <div style={{ padding: "9px 11px", borderRadius: 8, background: "var(--chip)", fontSize: 12, color: "var(--ink2)" }}>
             Provider credentials and secret references are never shown here. Route internals live in the Routing Catalog.
           </div>
         </div>
@@ -451,7 +451,7 @@ function HiddenRoutesSection({
     <Card style={{ marginTop: 14 }}>
       <button
         onClick={() => setOpen(!open)}
-        style={{ border: "none", background: "transparent", padding: 0, cursor: "pointer", fontSize: 12.5, fontWeight: 600, color: "var(--ink)" }}
+        style={{ border: "none", background: "transparent", padding: 0, cursor: "pointer", fontSize: 13, fontWeight: 600, color: "var(--ink)" }}
       >
         {open ? "▾" : "▸"} Routes not currently visible to this tenant ({formatNumber(routes.length)})
       </button>
@@ -531,13 +531,13 @@ export default function ModelsPage() {
       <div style={{ display: "flex", alignItems: "flex-start", gap: 16, marginBottom: 14 }}>
         <div style={{ flex: 1 }}>
           <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Models &amp; Capabilities</h1>
-          <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 12.5 }}>
+          <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 13 }}>
             Public models routable on the active catalog revision. Capability states: Native, Translated by the gateway, Unsupported, or Not
             declared.
           </div>
         </div>
         {revision !== null && (
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--purple)", paddingTop: 4 }}>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--purple)", paddingTop: 4 }}>
             {formatRevision(revision)}
           </span>
         )}
@@ -581,7 +581,7 @@ export default function ModelsPage() {
             <ModelsCards rows={visible} capabilities={options.capabilities} connById={connById} onOpen={setSelected} />
           )}
           {rows.length > 0 && (
-            <div style={{ marginTop: 8, fontSize: 11.5, color: "var(--ink3)" }}>
+            <div style={{ marginTop: 8, fontSize: 12, color: "var(--ink3)" }}>
               Showing {formatNumber(visible.length)} of {formatNumber(rows.length)} models
             </div>
           )}

@@ -76,14 +76,14 @@ export function ValidationReportView({ report, hash }: { report: ValidationRepor
         <div style={{ fontSize: 11, fontWeight: 600, color: "var(--red)", marginBottom: 4 }}>
           ERRORS · {errors.length}
         </div>
-        {errors.length === 0 ? <div style={{ color: "var(--ink3)", fontSize: 11.5 }}>None.</div> : <IssueTable issues={errors} />}
+        {errors.length === 0 ? <div style={{ color: "var(--ink3)", fontSize: 12 }}>None.</div> : <IssueTable issues={errors} />}
       </div>
       <div>
         <div style={{ fontSize: 11, fontWeight: 600, color: "var(--amber)", marginBottom: 4 }}>
           WARNINGS · {warnings.length}
         </div>
         {warnings.length === 0 ? (
-          <div style={{ color: "var(--ink3)", fontSize: 11.5 }}>None.</div>
+          <div style={{ color: "var(--ink3)", fontSize: 12 }}>None.</div>
         ) : (
           <IssueTable issues={warnings} />
         )}
@@ -98,7 +98,7 @@ export function ValidationReportView({ report, hash }: { report: ValidationRepor
 
 export function ReceiptsTable({ receipts }: { receipts: RolloutReceipt[] }) {
   if (receipts.length === 0) {
-    return <div style={{ color: "var(--ink3)", fontSize: 11.5 }}>No receipts yet — gateways confirm asynchronously.</div>;
+    return <div style={{ color: "var(--ink3)", fontSize: 12 }}>No receipts yet — gateways confirm asynchronously.</div>;
   }
   return (
     <Table>

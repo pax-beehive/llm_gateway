@@ -163,7 +163,7 @@ function ConfigurationCard({
           padding: "9px 11px",
           borderRadius: 8,
           background: "var(--chip)",
-          fontSize: 11.5,
+          fontSize: 12,
           color: "var(--ink2)",
         }}
       >
@@ -203,7 +203,7 @@ function OperationRow({ operation }: { operation: ProviderOperation }) {
         <span style={{ fontWeight: 500 }}>{OPERATION_TYPE_LABEL[operation.type] ?? operation.type}</span>
         {pending && <span style={{ fontSize: 11, color: "var(--ink3)" }}>polling…</span>}
         <span style={{ flex: 1 }} />
-        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>
           {operation.started_at ? formatDateTime(operation.started_at) : "queued"} →{" "}
           {operation.completed_at ? formatDateTime(operation.completed_at) : "—"}
         </span>
@@ -220,7 +220,7 @@ function OperationRow({ operation }: { operation: ProviderOperation }) {
                 borderRadius: 8,
                 background: "var(--amber-bg)",
                 color: "var(--amber)",
-                fontSize: 11.5,
+                fontSize: 12,
                 fontWeight: 600,
                 marginBottom: 6,
               }}
@@ -236,7 +236,7 @@ function OperationRow({ operation }: { operation: ProviderOperation }) {
                 borderRadius: 8,
                 background: "var(--red-bg)",
                 color: "var(--red)",
-                fontSize: 11.5,
+                fontSize: 12,
                 fontFamily: "var(--font-mono)",
                 marginBottom: 6,
               }}
@@ -413,7 +413,7 @@ export default function ProviderDetail({ connectionId }: { connectionId: string 
             <Badge tone="purple">{connection.provider}</Badge>
             <Badge tone={statusTone(connection.administrative_status)}>{connection.administrative_status}</Badge>
           </div>
-          <div style={{ marginTop: 3, fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--ink3)" }}>
+          <div style={{ marginTop: 3, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink3)" }}>
             {connection.id}
           </div>
         </div>
@@ -464,7 +464,7 @@ export default function ProviderDetail({ connectionId }: { connectionId: string 
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {Object.entries(features).map(([feature, support]) => (
                 <div key={feature} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-                  <span style={{ fontFamily: "var(--font-mono)", fontSize: 11.5 }}>{feature}</span>
+                  <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{feature}</span>
                   <span style={{ flex: 1 }} />
                   <Badge tone={statusTone(support)}>{support}</Badge>
                 </div>

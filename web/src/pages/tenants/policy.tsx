@@ -584,7 +584,7 @@ function BalanceBar({ balance }: { balance: QuotaBalance }) {
       <div style={{ flex: 1, height: 6, borderRadius: 99, background: "var(--chip)", overflow: "hidden" }}>
         <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 99 }} />
       </div>
-      <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--ink3)" }}>{pct}%</span>
+      <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink3)" }}>{pct}%</span>
     </div>
   );
 }
@@ -668,7 +668,7 @@ export function QuotaSnapshotPanel({ path }: { path: string }) {
           padding: "9px 11px",
           borderRadius: 8,
           background: "var(--chip)",
-          fontSize: 11.5,
+          fontSize: 12,
           color: "var(--ink2)",
         }}
       >

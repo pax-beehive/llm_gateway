@@ -1,14 +1,15 @@
 /* Design tokens — Universal LLM Gateway Operations console.
  * Light theme is the default on :root; dark theme activates via
  * body[data-theme="dark"] (toggled from the header, persisted to localStorage).
- * Values mirror docs/design/fe1.html exactly.
+ * Values derive from docs/design/fe1.html; muted text colors are deepened
+ * beyond the mockup to meet WCAG AA contrast at small sizes.
  */
 :root {
   --bg: #f3f4f6;
   --panel: #ffffff;
   --ink: #1a2230;
-  --ink2: #5a6474;
-  --ink3: #8a94a3;
+  --ink2: #4d5665;
+  --ink3: #66707f;
   --line: #e4e7ec;
   --chip: #eef0f4;
   --on-accent: #ffffff;
@@ -43,8 +44,8 @@ body[data-theme="dark"] {
   --bg: #0c1017;
   --panel: #141a24;
   --ink: #e7ebf2;
-  --ink2: #9aa5b5;
-  --ink3: #6b7688;
+  --ink2: #a5b0c0;
+  --ink3: #8d98ab;
   --line: #28303e;
   --chip: #232b39;
 

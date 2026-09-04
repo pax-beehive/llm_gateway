@@ -181,7 +181,7 @@ export default function TenantDetail({ tenantId }: { tenantId: string }) {
             <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>{tenant.display_name}</h1>
             <Badge tone={statusTone(tenant.status)}>{tenant.status}</Badge>
           </div>
-          <div style={{ marginTop: 3, fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--ink3)" }}>
+          <div style={{ marginTop: 3, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink3)" }}>
             {tenant.id} · slug {tenant.slug}
           </div>
         </div>
