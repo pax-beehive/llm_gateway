@@ -1,9 +1,10 @@
 /** Small shared render pieces for the Routing Catalog page. */
-import { Badge, CopyButton, Table, Td, Th } from "../../components/ui";
+import { Badge, Button, CopyButton, Table, Td, Th } from "../../components/ui";
 import { formatDateTime, formatNumber, truncateId } from "../../lib/format";
 import {
   capabilityTone,
   receiptTone,
+  type ManagedRoute,
   type CapabilitySupport,
   type RolloutReceipt,
   type ValidationIssue,
@@ -32,7 +33,15 @@ export function CapabilityBadges({ capabilities }: { capabilities: Record<string
 /* Validation report                                                   */
 /* ------------------------------------------------------------------ */
 
-function IssueTable({ issues }: { issues: ValidationIssue[] }) {
+const issueHelp: Record<string, string> = {
+  capability_profile_required: "Confirm this model’s capabilities in Finish model setup.",
+  price_snapshot_required: "Enter prices and their source in Finish model setup.",
+  tenant_visibility_required: "Choose who can use this model in Finish model setup.",
+  limit_policy_reference_required: "Edit the route and select a Limit Policy revision for each tenant.",
+  public_model_unavailable: "Each public model needs an active native-text route. Complete setup or remove non-text models from this draft.",
+};
+
+function IssueTable({ issues, routes, onEdit }: { issues: ValidationIssue[]; routes?: ManagedRoute[]; onEdit?: (index: number) => void }) {
   return (
     <Table>
       <thead>
@@ -43,19 +52,26 @@ function IssueTable({ issues }: { issues: ValidationIssue[] }) {
         </tr>
       </thead>
       <tbody>
-        {issues.map((issue, i) => (
-          <tr key={`${issue.code}-${issue.path}-${i}`}>
+        {issues.map((issue, i) => {
+          const match = /^routes\[(\d+)\]/.exec(issue.path);
+          const model = issue.code === "public_model_unavailable" ? /^public model "([^"]+)"/.exec(issue.message)?.[1] : undefined;
+          const index = match ? Number(match[1]) : model ? (routes?.findIndex(route => route.public_model === model) ?? -1) : -1;
+          const route = routes?.[index];
+          return <tr key={`${issue.code}-${issue.path}-${i}`}>
             <Td mono>{issue.code}</Td>
             <Td mono>{issue.path}</Td>
-            <Td>{issue.message}</Td>
-          </tr>
-        ))}
+            <Td>{route && <strong>{route.public_model}: </strong>}{issueHelp[issue.code] ?? issue.message}
+              {route && onEdit && <Button onClick={() => onEdit(index)}>Edit model</Button>}
+              {issueHelp[issue.code] && <details><summary>Technical details</summary>{issue.message}</details>}
+            </Td>
+          </tr>;
+        })}
       </tbody>
     </Table>
   );
 }
 
-export function ValidationReportView({ report, hash }: { report: ValidationReport; hash?: string }) {
+export function ValidationReportView({ report, hash, routes, onEdit }: { report: ValidationReport; hash?: string; routes?: ManagedRoute[]; onEdit?: (index: number) => void }) {
   const errors = report.errors ?? [];
   const warnings = report.warnings ?? [];
   const validationHash = hash ?? report.hash;
@@ -76,7 +92,7 @@ export function ValidationReportView({ report, hash }: { report: ValidationRepor
         <div style={{ fontSize: 11, fontWeight: 600, color: "var(--red)", marginBottom: 4 }}>
           ERRORS · {errors.length}
         </div>
-        {errors.length === 0 ? <div style={{ color: "var(--ink3)", fontSize: 12 }}>None.</div> : <IssueTable issues={errors} />}
+        {errors.length === 0 ? <div style={{ color: "var(--ink3)", fontSize: 12 }}>None.</div> : <IssueTable issues={errors} routes={routes} onEdit={onEdit} />}
       </div>
       <div>
         <div style={{ fontSize: 11, fontWeight: 600, color: "var(--amber)", marginBottom: 4 }}>

@@ -4,6 +4,7 @@
  * catalog and provider connections; all filtering is client-side over the join.
  */
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { SavedModelDrafts } from "./savedDrafts";
 import { ImportModels } from "./import";
 import { useAuth } from "../../auth/AuthProvider";
 import { PERMISSIONS } from "../../auth/permissions";
@@ -510,6 +511,7 @@ function HiddenRoutesSection({
 export default function ModelsPage() {
   const { can } = useAuth();
   const [importOpen, setImportOpen] = useState(false);
+  const [savedDraftsOpen, setSavedDraftsOpen] = useState(false);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [publicationId, setPublicationId] = useState<string | null>(null);
   const modelsRes: Resource<LLMModelList> = useResource(() => apiGet<LLMModelList>("/llm/models"), []);
@@ -546,6 +548,7 @@ export default function ModelsPage() {
             declared.
           </div>
         </div>
+        {can(PERMISSIONS.routingRead) && <Button onClick={() => setSavedDraftsOpen(true)}>Continue saved draft</Button>}
         {can(PERMISSIONS.providersWrite) && can(PERMISSIONS.routingWrite) && <Button variant="primary" onClick={() => setImportOpen(true)}>Import from provider</Button>}
         {revision !== null && (
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--purple)", paddingTop: 4 }}>
@@ -555,6 +558,7 @@ export default function ModelsPage() {
       </div>
 
       {importOpen && <ImportModels onClose={() => setImportOpen(false)} onCreated={d => { setDraft(d); setImportOpen(false); }} />}
+      {savedDraftsOpen && <SavedModelDrafts onClose={() => setSavedDraftsOpen(false)} onOpen={d => { setDraft(d); setSavedDraftsOpen(false); }} />}
       {draft && <DraftEditor key={draft.id} draft={draft} onDraftChange={setDraft} onClose={() => setDraft(null)} onHeadChanged={catalogRes.reload} onPublished={id => { setDraft(null); setPublicationId(id); catalogRes.reload(); }} />}
       {publicationId && <PublicationTracker publicationId={publicationId} onClose={() => setPublicationId(null)} onTerminal={() => { modelsRes.reload(); catalogRes.reload(); }} />}
       {[modelsRes, catalogRes, connsRes]

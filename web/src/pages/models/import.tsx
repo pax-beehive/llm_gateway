@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { apiGet, apiSend, ApiError } from "../../api/client";
-import { Modal, ErrorBanner } from "../../components/feedback";
+import { Modal, ErrorBanner, useToast } from "../../components/feedback";
 import { Button, Spinner } from "../../components/ui";
-import { createDraft, getCurrentRevision } from "../routing/api";
+import { createDraft, getCurrentRevision, validateDraft } from "../routing/api";
 import { blankRoute } from "../routing/routeForm";
 import type { Draft, ManagedRoute } from "../routing/types";
+import { ModelSetup } from "./setupForm";
+import { modalityWarning } from "./setup";
 import type { ProviderConnection, ProviderOperation } from "../providers/types";
 
 interface Model { id: string; owned_by: string }
@@ -25,6 +27,8 @@ export function importedRoute(connection: ProviderConnection, model: Model): Man
 }
 
 export function ImportModels({ onClose, onCreated }: { onClose: () => void; onCreated: (draft: Draft) => void }) {
+  const toast = useToast();
+  const [setup, setSetup] = useState<{ additions: ManagedRoute[]; existing: ManagedRoute[]; revision: number } | null>(null);
   const [draftId] = useState(() => `rcd_${crypto.randomUUID()}`);
   const [connections, setConnections] = useState<ProviderConnection[]>([]);
   const [connectionId, setConnectionId] = useState("");
@@ -53,7 +57,7 @@ export function ImportModels({ onClose, onCreated }: { onClose: () => void; onCr
           const page = await apiGet<{ data: ProviderConnection[]; next_cursor?: string }>(`/control/v1/provider-connections?limit=100&cursor=${encodeURIComponent(next)}`);
           all.push(...page.data); next = page.next_cursor ?? "";
         } while (next && !cancelled);
-        if (!cancelled) setConnections(all);
+        if (!cancelled) { setConnections(all); const enabled = all.filter(c => c.administrative_status === "enabled"); if (enabled.length === 1) setConnectionId(enabled[0].id); }
       } catch (err) { if (!cancelled) fail(err); }
       finally { if (!cancelled) setLoading(false); }
     })();
@@ -111,38 +115,51 @@ export function ImportModels({ onClose, onCreated }: { onClose: () => void; onCr
       if (fresh.revision !== operation.expected_revision) throw new ApiError(409, "revision_conflict", "Connection changed since discovery. Fetch models again.");
       const additions = Object.values(selected).filter(model => !head.document.routes.some(route => route.provider_connection_id === connection.id && route.provider_model === model.id && route.execution_region === fresh.region));
       if (!additions.length) { setMessage("The selected models already have routes in the active catalog."); return; }
-      onCreated(await createDraft({ id: draftId, base_revision: head.revision,
-        document: { ...head.document, routes: [...head.document.routes, ...additions.map(model => importedRoute(fresh, model))] },
-        reason: `${reason.trim()} (discovery ${operation.id})`,
-      }));
+      setSetup({ additions: additions.map(model => importedRoute(fresh, model)), existing: head.document.routes, revision: head.revision });
     } catch (err) { fail(err); } finally { setBusy(false); }
   };
+  const createConfigured = async (routes: ManagedRoute[]) => {
+    if (!setup || !connection || !operation) return;
+    setBusy(true);
+    try {
+      const fresh = await apiGet<ProviderConnection>(`/control/v1/provider-connections/${encodeURIComponent(connection.id)}`);
+      if (fresh.revision !== operation.expected_revision) throw new ApiError(409, "revision_conflict", "Connection changed since discovery. Go back and fetch models again.");
+      let draft = await createDraft({ id: draftId, base_revision: setup.revision,
+        document: { routes: [...setup.existing, ...routes] },
+        reason: `${reason.trim() || "Import configured text models"} (discovery ${operation.id})`,
+      });
+      try { draft = await validateDraft(draft.id, { expected_revision: draft.revision, reason: "Validate configured model import" }); }
+      catch { toast("Draft created, but validation could not complete. Run Validate in the draft.", "error"); }
+      onCreated(draft);
+    } finally { setBusy(false); }
+  };
+  if (setup) return <ModelSetup routes={setup.additions} templates={setup.existing} busy={busy} submitLabel="Create and validate draft" onClose={() => setSetup(null)} onApply={createConfigured} />;
   return <Modal open title="Import models from provider" onClose={() => { if (!busy) onClose(); }} footer={<>
     <Button disabled={busy} onClick={onClose}>Cancel</Button>
-    <Button variant="primary" disabled={busy || running || operation?.status !== "succeeded" || !Object.keys(selected).length || !reason.trim()} onClick={() => void submit()}>Create draft ({Object.keys(selected).length})</Button>
+    <Button variant="primary" disabled={busy || running || operation?.status !== "succeeded" || !Object.keys(selected).length} onClick={() => void submit()}>Configure selected models ({Object.keys(selected).length})</Button>
   </>}>
     <div style={{ display: "grid", gap: 12 }}>
       {error && <ErrorBanner error={error} retry={running ? () => { setError(null); setPollRetry(n => n + 1); } : undefined} />}
       <label>Provider connection<select aria-label="Provider connection" style={style} value={connectionId} disabled={busy || running} onChange={e => { setConnectionId(e.target.value); setModels([]); setSelected({}); setOperation(null); setCursor(undefined); setMessage(""); setError(null); }}>
         <option value="">{loading ? "Loading connections…" : "Select a connection"}</option>
-        {connections.map(c => <option key={c.id} value={c.id}>{c.display_name || c.id} · {c.provider} · {c.region}</option>)}
+        {connections.map(c => <option key={c.id} value={c.id} disabled={c.administrative_status !== "enabled"}>{c.display_name || c.id} · {c.provider} · {c.region}</option>)}
       </select></label>
       {!loading && !connections.length && <p>No connections found. Add one in Provider Connections first.</p>}
       <Button disabled={!connection || busy || running} onClick={() => void discover()}>{busy || running ? <Spinner size={12} /> : null} {running ? "Fetching models…" : "Fetch provider models"}</Button>
-      <div style={{ fontSize: 12, color: "var(--ink2)" }}>Uses the connection’s credentials on the server to fetch model names. Review capabilities, pricing, visibility and status in the draft before publishing.</div>
+      <div style={{ fontSize: 12, color: "var(--ink2)" }}>Uses the connection’s credentials on the server to fetch model names. Next, configure capabilities, prices and tenant access before creating a draft.</div>
       {message && <p role="status">{message}</p>}
       {operation?.status === "succeeded" && <>
         <div>{models.length} models loaded{cursor ? " · more available" : ""}</div>
         <input aria-label="Filter discovered models" style={style} placeholder="Filter loaded models…" value={filter} onChange={e => setFilter(e.target.value)} />
         <div style={{ maxHeight: 260, overflow: "auto" }}>
           {models.filter(m => m.id.toLowerCase().includes(filter.toLowerCase())).map(m => <label key={m.id} style={{ display: "flex", gap: 8, padding: "6px 0", overflowWrap: "anywhere" }}>
-            <input type="checkbox" checked={!!selected[m.id]} onChange={e => setSelected(prev => { const next = { ...prev }; if (e.target.checked) next[m.id] = m; else delete next[m.id]; return next; })} />{m.id}
+            <input type="checkbox" checked={!!selected[m.id]} onChange={e => setSelected(prev => { const next = { ...prev }; if (e.target.checked) next[m.id] = m; else delete next[m.id]; return next; })} />{m.id}{modalityWarning(m.id) && <small style={{ color: "var(--amber)" }}> · Separate capability setup required</small>}
           </label>)}
           {!models.length && <p>The provider returned no models.</p>}
         </div>
         {cursor && <Button disabled={busy} onClick={() => void more()}>Load more models</Button>}
-        <label>Reason<input aria-label="Import reason" style={style} value={reason} onChange={e => setReason(e.target.value)} placeholder="Why are these models being added?" /></label>
-        <div style={{ fontSize: 12 }}>Imported routes start disabled. Existing routes are preserved; duplicates on this connection and region are skipped.</div>
+        <label>Reason (optional)<input aria-label="Import reason" style={style} value={reason} onChange={e => setReason(e.target.value)} placeholder="Why are these models being added?" /></label>
+        <div style={{ fontSize: 12 }}>Next: review each model and configure prices. Existing routes are preserved; duplicates on this connection and region are skipped.</div>
       </>}
     </div>
   </Modal>;

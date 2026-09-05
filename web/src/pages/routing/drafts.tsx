@@ -22,6 +22,7 @@ import {
 import { blankRoute, RouteFormDrawer } from "./routeForm";
 import {
   draftStatusTone,
+  hasValidationReport,
   formatRevision,
   isTerminalOperation,
   newDraftId,
@@ -33,6 +34,8 @@ import {
   type Revision,
   type RoutingDocument,
 } from "./types";
+import { ModelSetup } from "../models/setupForm";
+import { needsModelSetup } from "../models/setup";
 import { CapabilityBadges, ValidationReportView } from "./widgets";
 
 const inputStyle = {
@@ -336,6 +339,7 @@ export function DraftEditor({
   const [pending, setPending] = useState<PendingAction>(null);
   const [busy, setBusy] = useState(false);
   const [publishRegions, setPublishRegions] = useState("");
+  const [setupRoutes, setSetupRoutes] = useState<ManagedRoute[] | null>(null);
   const [probeOps, setProbeOps] = useState<Operation[] | null>(null);
 
   const report = draft.validation_report;
@@ -385,7 +389,9 @@ export function DraftEditor({
         setDirty(false);
         toast("Draft saved", "success");
       } else if (action === "validate") {
-        const updated = await validateDraft(draft.id, { expected_revision: draft.revision, reason });
+        const saved = dirty ? await updateDraft(draft.id, { document: doc, expected_revision: draft.revision, reason }) : draft;
+        if (dirty) { onDraftChange(saved); setDirty(false); }
+        const updated = await validateDraft(draft.id, { expected_revision: saved.revision, reason });
         onDraftChange(updated);
         const errors = (updated.validation_report.errors ?? []).length;
         const warns = (updated.validation_report.warnings ?? []).length;
@@ -427,12 +433,13 @@ export function DraftEditor({
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           <Button disabled={!canWrite || busy || !dirty} title={canWrite ? undefined : "Requires platform:routing:write"} onClick={() => setPending("save")}>Save</Button>
           <Button
-            disabled={!canWrite || busy || dirty}
-            title={!canWrite ? "Requires platform:routing:write" : dirty ? "Save before validating" : undefined}
+            disabled={!canWrite || busy}
+            title={!canWrite ? "Requires platform:routing:write" : undefined}
             onClick={() => setPending("validate")}
           >
-            Validate
+            {dirty ? "Save and validate" : "Validate"}
           </Button>
+          {doc.routes.some(needsModelSetup) && <Button disabled={!canWrite || busy} onClick={() => setSetupRoutes(doc.routes.filter(needsModelSetup))}>Finish model setup</Button>}
           <Button
             disabled={!canWrite || busy || dirty}
             title={!canWrite ? "Requires platform:routing:write" : dirty ? "Save before probing" : undefined}
@@ -617,11 +624,29 @@ export function DraftEditor({
           )}
         </div>
 
+        {setupRoutes && <ModelSetup routes={setupRoutes} templates={doc.routes.filter(r => !setupRoutes.some(s => s.route_id === r.route_id))} busy={busy}
+          onClose={() => setSetupRoutes(null)} submitLabel="Save and validate"
+          onApply={async configured => {
+            setBusy(true);
+            try {
+              const replacements = new Map(configured.map(r => [r.route_id, r]));
+              const next = { ...doc, routes: doc.routes.flatMap(r => setupRoutes.some(s => s.route_id === r.route_id) ? (replacements.has(r.route_id) ? [replacements.get(r.route_id)!] : []) : [r]) };
+              const saved = await updateDraft(draft.id, { document: next, expected_revision: draft.revision, reason: "Complete model capabilities, prices and tenant access" });
+              setDoc(next); setDirty(false); onDraftChange(saved); setSetupRoutes(null);
+              try {
+                const validated = await validateDraft(saved.id, { expected_revision: saved.revision, reason: "Validate completed model setup" });
+                onDraftChange(validated);
+                toast(validated.validation_report.valid ? "Models configured — ready to publish" : "Review the validation report for remaining issues", validated.validation_report.valid ? "success" : "error");
+              } catch { toast("Setup saved. Validation could not complete; run Validate again.", "error"); }
+            } finally { setBusy(false); }
+          }} />}
+
         {/* ---- side column: validation report + probe + lifecycle ---- */}
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <Card title="Validation report">
-            {draft.status === "validated" ? (
-              <ValidationReportView report={report} hash={draft.validation_hash} />
+            {dirty && <p role="status">Routes have changed. Save and validate to refresh this report.</p>}
+            {hasValidationReport(draft) ? (
+              <ValidationReportView report={report} hash={draft.validation_hash} routes={dirty ? undefined : doc.routes} onEdit={canWrite && !busy && !dirty ? index => { setEditIndex(index); setFormOpen(true); } : undefined} />
             ) : (
               <div style={{ fontSize: 12, color: "var(--ink3)" }}>Not validated yet — run Validate.</div>
             )}

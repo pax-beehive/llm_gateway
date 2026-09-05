@@ -118,6 +118,7 @@ export function RouteFormDrawer({
       capabilities,
       tenant_visibility_policy: {
         all_tenants: form.tenant_visibility_policy.all_tenants,
+        limit_policy_revisions: form.tenant_visibility_policy.all_tenants ? undefined : Object.fromEntries(tenantIds.split(",").map(s => s.trim()).filter(Boolean).map(id => [id, form.tenant_visibility_policy.limit_policy_revisions?.[id] ?? 0])),
         tenant_ids: form.tenant_visibility_policy.all_tenants
           ? undefined
           : tenantIds.split(",").map((s) => s.trim()).filter(Boolean),
@@ -241,6 +242,10 @@ export function RouteFormDrawer({
               <Field label="Tenant IDs (comma-separated)">
                 <input style={monoInputStyle} value={tenantIds} onChange={(e) => setTenantIds(e.target.value)} placeholder="tn_…, tn_…" />
               </Field>
+              {[...new Set(tenantIds.split(",").map(s => s.trim()).filter(Boolean))].map(id => <Field key={id} label={`${id} Limit Policy revision (required)`}>
+                <input style={monoInputStyle} type="number" min={1} step={1} value={form.tenant_visibility_policy.limit_policy_revisions?.[id] ?? ""}
+                  onChange={e => patch({ tenant_visibility_policy: { ...form.tenant_visibility_policy, limit_policy_revisions: { ...form.tenant_visibility_policy.limit_policy_revisions, [id]: num(e.target.value) } } })} />
+              </Field>)}
             </div>
           )}
         </div>

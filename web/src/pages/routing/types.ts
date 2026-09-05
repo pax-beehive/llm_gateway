@@ -227,3 +227,8 @@ export function receiptTone(s: string): BadgeTone {
   if (s === "failed") return "red";
   return "amber";
 }
+
+/** Failed validation remains status=draft, but still has a persisted report. */
+export function hasValidationReport(draft: Draft): boolean {
+  return Boolean(draft.validation_hash || draft.validation_report?.hash);
+}
