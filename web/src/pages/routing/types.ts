@@ -8,6 +8,8 @@ import type { BadgeTone } from "../../components/ui";
 export type CapabilitySupport = "native" | "translated" | "unsupported";
 
 export interface PriceSnapshot {
+  source?: string;
+  effective_at?: number;
   id: string;
   provider: string;
   model: string;

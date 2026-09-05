@@ -99,6 +99,7 @@ type RoutingCatalogAdministration interface {
 }
 
 type ProviderConnectionAdministration interface {
+	ListDiscoveredModels(context.Context, tenantadmin.ActorEnvelope, string, string, int) (providerconnection.DiscoveredModelPage, error)
 	Register(context.Context, tenantadmin.ActorEnvelope, string, providerconnection.RegisterCommand) (providerconnection.MutationResult, error)
 	Get(context.Context, tenantadmin.ActorEnvelope, string) (providerconnection.ProviderConnection, error)
 	List(context.Context, tenantadmin.ActorEnvelope, providerconnection.ConnectionFilter) (providerconnection.ConnectionPage, error)

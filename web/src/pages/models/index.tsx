@@ -4,6 +4,12 @@
  * catalog and provider connections; all filtering is client-side over the join.
  */
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { ImportModels } from "./import";
+import { useAuth } from "../../auth/AuthProvider";
+import { PERMISSIONS } from "../../auth/permissions";
+import { DraftEditor } from "../routing/drafts";
+import { PublicationTracker } from "../routing/publication";
+import type { Draft } from "../routing/types";
 import { apiGet } from "../../api/client";
 import { Drawer, ErrorBanner, Loading } from "../../components/feedback";
 import { Badge, Button, Card, CodeBlock, CopyButton, EmptyState, KeyValueList, Table, Td, Th } from "../../components/ui";
@@ -502,6 +508,10 @@ function HiddenRoutesSection({
 /* ------------------------------------------------------------------ */
 
 export default function ModelsPage() {
+  const { can } = useAuth();
+  const [importOpen, setImportOpen] = useState(false);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [publicationId, setPublicationId] = useState<string | null>(null);
   const modelsRes: Resource<LLMModelList> = useResource(() => apiGet<LLMModelList>("/llm/models"), []);
   const catalogRes: Resource<CatalogRevision> = useResource(() => apiGet<CatalogRevision>("/control/v1/routing-catalog"), []);
   const connsRes: Resource<ProviderConnectionPage> = useResource(
@@ -528,7 +538,7 @@ export default function ModelsPage() {
 
   return (
     <div style={{ padding: "20px 24px", maxWidth: 1360, margin: "0 auto" }}>
-      <div style={{ display: "flex", alignItems: "flex-start", gap: 16, marginBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", flexWrap: "wrap", gap: 16, marginBottom: 14 }}>
         <div style={{ flex: 1 }}>
           <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Models &amp; Capabilities</h1>
           <div style={{ color: "var(--ink2)", marginTop: 2, fontSize: 13 }}>
@@ -536,6 +546,7 @@ export default function ModelsPage() {
             declared.
           </div>
         </div>
+        {can(PERMISSIONS.providersWrite) && can(PERMISSIONS.routingWrite) && <Button variant="primary" onClick={() => setImportOpen(true)}>Import from provider</Button>}
         {revision !== null && (
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--purple)", paddingTop: 4 }}>
             {formatRevision(revision)}
@@ -543,6 +554,9 @@ export default function ModelsPage() {
         )}
       </div>
 
+      {importOpen && <ImportModels onClose={() => setImportOpen(false)} onCreated={d => { setDraft(d); setImportOpen(false); }} />}
+      {draft && <DraftEditor key={draft.id} draft={draft} onDraftChange={setDraft} onClose={() => setDraft(null)} onHeadChanged={catalogRes.reload} onPublished={id => { setDraft(null); setPublicationId(id); catalogRes.reload(); }} />}
+      {publicationId && <PublicationTracker publicationId={publicationId} onClose={() => setPublicationId(null)} onTerminal={() => { modelsRes.reload(); catalogRes.reload(); }} />}
       {[modelsRes, catalogRes, connsRes]
         .filter((r) => r.error?.isUpstreamNotConfigured)
         .map((r, i) => (

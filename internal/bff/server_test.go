@@ -375,6 +375,8 @@ func TestBusinessRoutePermissionMatrix(t *testing.T) {
 		{"playground lists models", "gateway:playground:use", http.MethodGet, "/api/llm/models", http.StatusOK},
 		{"models reads provider metadata", "gateway:models:read", http.MethodGet, "/api/control/v1/provider-connections", http.StatusOK},
 		{"models reads routing metadata", "gateway:models:read", http.MethodGet, "/api/control/v1/routing-catalog", http.StatusOK},
+		{"providers read model inventory", "platform:providers:read", http.MethodGet, "/api/control/v1/provider-operations/op_1/models", http.StatusOK},
+		{"model catalog cannot read provider inventory", "gateway:models:read", http.MethodGet, "/api/control/v1/provider-operations/op_1/models", http.StatusForbidden},
 		{"providers read operations", "platform:providers:read", http.MethodGet, "/api/control/v1/provider-operations/op_1", http.StatusOK},
 		{"routing reads provider operations", "platform:routing:read", http.MethodGet, "/api/control/v1/provider-operations/op_1", http.StatusOK},
 		{"operations reads audit", "platform:operations:read", http.MethodGet, "/api/control/v1/audit", http.StatusOK},

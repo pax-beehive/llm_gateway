@@ -170,9 +170,9 @@ type ProbeResult struct {
 }
 
 type ObservedModel struct {
-	ID           string
-	OwnedBy      string
-	Capabilities map[string]provider.CapabilitySupport
+	ID           string                                `json:"id"`
+	OwnedBy      string                                `json:"owned_by"`
+	Capabilities map[string]provider.CapabilitySupport `json:"capabilities,omitempty"`
 }
 
 type DiscoveryResult struct {

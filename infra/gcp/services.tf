@@ -129,7 +129,15 @@ resource "google_cloud_run_v2_service" "control_plane" {
       }
       env {
         name  = "CONTROL_PROVIDER_LIVE_OPERATIONS"
-        value = "disabled"
+        value = "explicitly-authorized"
+      }
+      env {
+        name  = "CONTROL_PROVIDER_LIVE_AUTHORIZATION_ID"
+        value = "operator-model-discovery"
+      }
+      env {
+        name  = "CONTROL_PROVIDER_DISCOVERY_MAX_REQUESTS"
+        value = "10"
       }
       env {
         name  = "CONTROL_GATEWAY_REGIONS_JSON"

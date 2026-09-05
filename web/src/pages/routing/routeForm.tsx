@@ -276,6 +276,12 @@ export function RouteFormDrawer({
 
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: "var(--ink3)", marginBottom: 6 }}>COST SNAPSHOT (USD micros per 1M units)</div>
+          <Field label="Price source (URL or reference)">
+            <input style={monoInputStyle} value={form.provider_cost_snapshot.source ?? ""} onChange={e => patchCost({ source: e.target.value })} />
+          </Field>
+          <Field label="Effective at (Unix seconds)">
+            <input style={monoInputStyle} type="number" min={1} value={form.provider_cost_snapshot.effective_at ?? ""} onChange={e => patchCost({ effective_at: num(e.target.value) })} />
+          </Field>
           <Field label="Snapshot ID">
             <input style={monoInputStyle} value={form.provider_cost_snapshot.id} onChange={(e) => patchCost({ id: e.target.value })} placeholder="price_…" />
           </Field>

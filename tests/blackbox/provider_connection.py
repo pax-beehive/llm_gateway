@@ -80,6 +80,16 @@ discovery = run_operation(f"/control/v1/provider-connections/{connection_id}/mod
     "expected_revision": 2, "reason": "deterministic discovery",
 }, "discovery-" + connection_id)
 assert discovery["result"]["model_count"] == 2
+models_path = f"/control/v1/provider-operations/{discovery['id']}/models"
+_, _, first = call("GET", models_path + "?limit=1")
+assert len(first["data"]) == 1 and first["next_cursor"]
+_, _, second = call("GET", models_path + "?limit=1&cursor=" + first["next_cursor"])
+assert len(second["data"]) == 1 and not second.get("next_cursor")
+assert first["data"][0]["id"] != second["data"][0]["id"]
+assert secret not in json.dumps(first)
+call("GET", models_path + "?limit=101", expected=(400,))
+call("GET", models_path + "?cursor=invalid!", expected=(400,))
+call("GET", f"/control/v1/provider-operations/{probe['id']}/models", expected=(400,))
 
 rotation = run_operation(f"/control/v1/provider-connections/{connection_id}/credential-rotations", {
     "expected_revision": 2, "secret": "rotated-blackbox-provider-secret", "reason": "black-box rotation",

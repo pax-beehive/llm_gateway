@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -629,4 +630,19 @@ func jsonBody(t *testing.T, value any) *bytes.Reader {
 		t.Fatal(err)
 	}
 	return bytes.NewReader(payload)
+}
+
+func (*fakeProviderConnectionAdministration) ListDiscoveredModels(context.Context, tenantadmin.ActorEnvelope, string, string, int) (providerconnection.DiscoveredModelPage, error) {
+	return providerconnection.DiscoveredModelPage{Data: []providerconnection.ObservedModel{{ID: "model-a", OwnedBy: "openai"}}}, nil
+}
+
+func TestDiscoveredModelsHTTP(t *testing.T) {
+	handler := controlapi.New(controlapi.Config{Administration: &fakeAdministration{}, ProviderConnections: &fakeProviderConnectionAdministration{}, Verifier: fixedVerifier(controlapi.VerifiedIdentity{ActorType: "human", ActorID: "user-1", Scopes: []string{providerconnection.ScopePlatformRead}})})
+	request := httptest.NewRequest(http.MethodGet, "/control/v1/provider-operations/pop-test/models?limit=1", nil)
+	request.Header.Set("Authorization", "Bearer test")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"id":"model-a"`) {
+		t.Fatalf("response %d %s", response.Code, response.Body.String())
+	}
 }

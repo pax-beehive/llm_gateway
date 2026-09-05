@@ -250,6 +250,23 @@ func TestAsyncProviderOperationsAreSecretSafeAndDoNotPublishRoutes(t *testing.T)
 	if err != nil || completedDiscovery.Status != providerconnection.OperationSucceeded || completedDiscovery.Result["model_count"] != float64(2) {
 		t.Fatalf("completed discovery = %#v err=%v", completedDiscovery, err)
 	}
+	first, err := service.ListDiscoveredModels(ctx, actor, discovery.Operation.ID, "", 1)
+	if err != nil || len(first.Data) != 1 || first.Data[0].ID != "gpt-test" || first.NextCursor == "" {
+		t.Fatalf("first model page = %#v err=%v", first, err)
+	}
+	second, err := service.ListDiscoveredModels(ctx, actor, discovery.Operation.ID, first.NextCursor, 1)
+	if err != nil || len(second.Data) != 1 || second.Data[0].ID != "gpt-test-mini" || second.NextCursor != "" {
+		t.Fatalf("second model page = %#v err=%v", second, err)
+	}
+	if _, err := service.ListDiscoveredModels(ctx, tenantadmin.ActorEnvelope{Type: "human", ID: "denied"}, discovery.Operation.ID, "", 1); !errors.Is(err, providerconnection.ErrPolicyDenied) {
+		t.Fatalf("unauthorized inventory read = %v", err)
+	}
+	if _, err := service.ListDiscoveredModels(ctx, actor, discovery.Operation.ID, "invalid!", 1); !errors.Is(err, providerconnection.ErrInvalidArgument) {
+		t.Fatalf("invalid model cursor = %v", err)
+	}
+	if _, err := service.ListDiscoveredModels(ctx, actor, completedProbe.ID, first.NextCursor, 1); !errors.Is(err, providerconnection.ErrInvalidArgument) {
+		t.Fatalf("non-discovery model read = %v", err)
+	}
 	var observations, routePublications int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM provider_model_observations WHERE operation_id=$1`, discovery.Operation.ID).Scan(&observations); err != nil {
 		t.Fatal(err)

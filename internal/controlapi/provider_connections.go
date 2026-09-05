@@ -35,6 +35,22 @@ func (server *Server) routeProviderConnections(writer http.ResponseWriter, reque
 			methodNotAllowed(writer, http.MethodGet)
 			return true
 		}
+		tail := strings.TrimPrefix(request.URL.Path, operations+"/")
+		if strings.HasSuffix(tail, "/models") {
+			id, err := onePathID(strings.TrimSuffix(tail, "/models"))
+			limit, limitErr := optionalInt(request.URL.Query().Get("limit"))
+			if err != nil || limitErr != nil {
+				writeAPIError(writer, http.StatusBadRequest, "invalid_request", "invalid discovery query")
+				return true
+			}
+			page, err := server.providerConnections.ListDiscoveredModels(request.Context(), actor, id, request.URL.Query().Get("cursor"), limit)
+			if err != nil {
+				writeProviderConnectionError(writer, err)
+			} else {
+				writeJSON(writer, http.StatusOK, page)
+			}
+			return true
+		}
 		operationID, err := onePathID(strings.TrimPrefix(request.URL.Path, operations+"/"))
 		if err != nil {
 			writeAPIError(writer, http.StatusBadRequest, "invalid_request", "invalid Provider operation ID")

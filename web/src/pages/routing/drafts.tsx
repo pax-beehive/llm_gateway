@@ -310,7 +310,7 @@ function CreateDraftModal({
 
 type PendingAction = "save" | "validate" | "probe" | "publish" | null;
 
-function DraftEditor({
+export function DraftEditor({
   draft,
   onDraftChange,
   onPublished,
